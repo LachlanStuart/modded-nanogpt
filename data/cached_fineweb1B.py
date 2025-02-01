@@ -4,9 +4,9 @@ from huggingface_hub import hf_hub_download
 # Download 10% of the GPT-2 tokens of Fineweb10B from huggingface. This
 # saves about an hour of startup time compared to regenerating them.
 def get(fname):
-    local_dir = os.path.join(os.path.dirname(__file__), 'fineweb10B')
+    local_dir = os.path.join(os.path.dirname(__file__), 'fineweb1B')
     if not os.path.exists(os.path.join(local_dir, fname)):
-        hf_hub_download(repo_id="kjj0/fineweb10B-gpt2", filename=fname,
+        hf_hub_download(repo_id="kjj0/fineweb1B-gpt2", filename=fname,
                         repo_type="dataset", local_dir=local_dir)
 get("fineweb_val_%06d.bin" % 0)
 num_chunks = 10 # first 10% of fineweb10B. Each chunk is 100M tokens

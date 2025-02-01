@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import atexit
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -20,14 +21,15 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 # -----------------------------------------------------------------------------
 # Custom operators : FP8 matmul by @YouJiacheng
-
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
     @torch.compile
     def impl(x: Tensor, w: Tensor):
         assert x.is_contiguous() and w.is_contiguous()
-        x_f8 = x.mul(x_s).to(torch.float8_e4m3fn)
-        w_f8 = w.mul(w_s).to(torch.float8_e4m3fn)
+        # x_f8 = x.mul(x_s).to(torch.float8_e4m3fn)
+        x_f8 = x.mul(x_s).to(torch.float8_e5m2)
+        # w_f8 = w.mul(w_s).to(torch.float8_e4m3fn)
+        w_f8 = w.mul(w_s).to(torch.float8_e5m2)
         out = torch._scaled_mm(
             x_f8,
             w_f8.t(),
@@ -46,7 +48,8 @@ def _(x: Tensor, w: Tensor, *_):
     assert x.shape[1] == w.shape[1]
     assert x.device == w.device
     assert x.is_contiguous() and w.is_contiguous()
-    return x @ w.t(), x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+    # return x @ w.t(), x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+    return x @ w.t(), x.to(torch.float8_e5m2), w.to(torch.float8_e5m2)
 
 @torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
 def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
@@ -306,6 +309,7 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+@torch.compile()
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, layer_idx: int, max_seq_len: int):
         super().__init__()
@@ -354,7 +358,8 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
+        # self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
         self.lm_head.weight.detach().zero_() # @Grad62304977
 
     def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
@@ -397,6 +402,7 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
+
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
@@ -413,15 +419,20 @@ class GPT(nn.Module):
         # Encoder pass - process only the first half of the blocks
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
         assert len(block_masks) == self.num_encoder_layers
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, ve_enc[i], x0, block_masks[i])
+        for i, block in enumerate(self.blocks[:self.num_encoder_layers]):
+            x = block(x, ve_enc[i], x0, block_masks[i])
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
         block_masks.reverse()
         assert len(block_masks) == self.num_decoder_layers
-        for i in range(self.num_decoder_layers):
+        for i, block in enumerate(self.blocks[self.num_encoder_layers:]):
             x = x + self.skip_weights[i] * skip_connections.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_masks[i])
+            x = block(x, ve_dec[i], x0, block_masks[i])
+        loss = self.forward_decode(target_seq, x)
+        return loss
+
+    @torch.compile()
+    def forward_decode(self, target_seq, x):
         x = norm(x)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
@@ -462,24 +473,53 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
 # -----------------------------------------------------------------------------
 # int main
 
-@dataclass
+def print0(s, console=True):
+    if master_process:
+        timestamp = time.strftime("%H:%M:%S.") + f"{time.time() % 1:.3f}"[2:]
+        s = f"{timestamp}: {s}"
+        with open(logfile, "a") as f:
+            if console:
+                print(s)
+            print(s, file=f)
+
+def log_mem():
+    print0(
+        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB",
+        console=True,
+    )
+
+@dataclass(frozen=True, kw_only=True)
 class Hyperparameters:
     # data
-    train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
-    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # optimization
-    num_iterations = 1770 # number of iterations to run
-    cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
+    num_iterations: int = 1770 # number of iterations to run
+    cooldown_frac: float = 0.4 # fraction of training spent cooling down the learning rate
     # evaluation and logging
-    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     # implementation
-    seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
-    save_checkpoint = False
+    seq_len: int = 48*1024 # FlexAttention sequence length
+    val_seq_len: int = 4*64*1024 # FlexAttention sequence length for validation
+    save_checkpoint: bool = False
 
-def main(args = Hyperparameters()):
-
+TEST_HPARAMS = Hyperparameters(
+    train_files = "data/fineweb1B/fineweb_train_*.bin",
+    val_files = "data/fineweb1B/fineweb_val_*.bin",
+    val_tokens = 1048576,
+    num_iterations = 20, #770,
+    cooldown_frac = 0.4,
+    val_loss_every = 0, #125,
+    seq_len = 24*1024,
+    val_seq_len = 4*32*1024,
+    save_checkpoint = False,
+)
+master_process = None
+logfile = None
+def main(args = TEST_HPARAMS):
+    global master_process, logfile
     # torchrun sets these env variables
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -487,6 +527,7 @@ def main(args = Hyperparameters()):
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     dist.init_process_group(backend="nccl", device_id=device)
+    atexit.register(dist.destroy_process_group)
     dist.barrier()
     master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
@@ -497,36 +538,42 @@ def main(args = Hyperparameters()):
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{run_id}.txt"
         print(logfile)
-    def print0(s, console=False):
-        if master_process:
-            with open(logfile, "a") as f:
-                if console:
-                    print(s)
-                print(s, file=f)
+
 
     # begin by printing this file (the Python code)
-    print0(code)
-    print0("="*100)
+    print0(code, console=False)
+    print0("="*100, console=False)
     # log information about the hardware/software environment this is running on
-    print0(f"Running Python {sys.version}")
-    print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+    print0(f"Running Python {sys.version}", console=False)
+    print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}", console=False)
     def nvidia_smi():
         import subprocess  # avoid top level import
         return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
-    print0(nvidia_smi())
-    print0("="*100)
+    print0(nvidia_smi(), console=False)
+    print0("="*100, console=False)
+    atexit.register(log_mem)
 
+    torch.cuda.synchronize()
+    print0("Init data")
     # load data
     train_batch_size = world_size * args.seq_len
     train_loader = distributed_data_generator(args.train_files, train_batch_size, rank, world_size)
 
-    model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    torch.cuda.synchronize()
+    print0("Init model")
+    # REF: model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=3, model_dim=384, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
     for m in model.modules():
         if isinstance(m, nn.Embedding):
             m.bfloat16()
+    n_params = 0
     for param in model.parameters():
         dist.broadcast(param.detach(), 0)
+        n_params += param.numel()
+    print0(f"{n_params/1024/1024:.3f}Mi params")
 
+    torch.cuda.synchronize()
+    print0("Init optimizers")
     # collect the parameters to optimize
     hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
     embed_params = [p for n, p in model.named_parameters() if "embed" in n]
@@ -552,13 +599,15 @@ def main(args = Hyperparameters()):
     def sw_num_blks(window_size: int):
         return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
-    model: nn.Module = torch.compile(model, dynamic=False)
+    # Compiling only on layers & output head saves startup time but slows by ~6%, uses ~10% more VRAM
+    # model: nn.Module = torch.compile(model, dynamic=False)
 
     training_time_ms = 0
     # start the clock
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     # begin training
+    print0("Starting train loop")
     train_steps = args.num_iterations
     for step in range(train_steps + 1):
         last_step = (step == train_steps)
@@ -586,7 +635,7 @@ def main(args = Hyperparameters()):
             val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
             val_loss = 0
             with torch.no_grad():
-                for _ in range(val_steps):
+                for i in range(val_steps):
                     x, y = next(val_loader)
                     val_loss += model(x, y, sw_num_blks(window_size))
             val_loss /= val_steps
@@ -608,8 +657,12 @@ def main(args = Hyperparameters()):
 
         # --------------- TRAINING SECTION -----------------
         inputs, targets = next(train_loader)
+        train_loss = 0
         for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
-            model(input_seq, target_seq, sw_num_blks(window_size)).backward()
+            loss = model(input_seq, target_seq, sw_num_blks(window_size))
+            train_loss += loss.item()
+            loss.backward()
+        train_loss /= len(inputs.split(args.seq_len))
         for param in model.parameters():
             dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
         # momentum warmup for Muon
@@ -624,14 +677,9 @@ def main(args = Hyperparameters()):
         model.zero_grad(set_to_none=True)
         # logging
         approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms", console=True)
+        print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms", console=True)
 
-    print0(
-        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB",
-        console=True,
-    )
-    dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     main()

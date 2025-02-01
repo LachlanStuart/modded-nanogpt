@@ -314,6 +314,7 @@ dependencies = [
     { name = "pip", marker = "sys_platform == 'linux'" },
     { name = "pytorch-triton", marker = "sys_platform == 'linux'" },
     { name = "torch", marker = "sys_platform == 'linux'" },
+    { name = "torchao", marker = "sys_platform == 'linux'" },
     { name = "tqdm", marker = "sys_platform == 'linux'" },
 ]
 
@@ -332,6 +333,7 @@ requires-dist = [
     { name = "pip", specifier = ">=24.3.1" },
     { name = "pytorch-triton", specifier = ">=3.2.0", index = "https://download.pytorch.org/whl/nightly/cu126" },
     { name = "torch", url = "https://download.pytorch.org/whl/nightly/cu126/torch-2.7.0.dev20250110%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl" },
+    { name = "torchao", specifier = ">=0.8.0" },
     { name = "tqdm", specifier = ">=4.67.0" },
 ]
 
@@ -806,6 +808,15 @@ requires-dist = [
     { name = "setuptools", marker = "python_full_version >= '3.12'" },
     { name = "sympy", marker = "python_full_version >= '3.9'", specifier = "==1.13.1" },
     { name = "typing-extensions", specifier = ">=4.10.0" },
+]
+
+[[package]]
+name = "torchao"
+version = "0.8.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/14/9a/74d00ac123b507dd6e4f589bab4a7872f981f32627fb3851e2670575b1ca/torchao-0.8.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:372c071869d4ebca527055bb2e5d889ca6762fcadee1c562609a47ff48fc14da", size = 4748885 },
+    { url = "https://files.pythonhosted.org/packages/d4/d7/151e05197fe24e5f00eec2720c91876626bccbc4d7e51f1c992413128dbf/torchao-0.8.0-py3-none-any.whl", hash = "sha256:ae0640aae719f041eb3a814d0a03fcfe504cf40a9de58daca656933136ca70f4", size = 676033 },
 ]
 
 [[package]]

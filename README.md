@@ -13,6 +13,8 @@ Plan:
 * Stochastic Rounding
 
 
+Licenses: This repository combines several independently-licensed sources, each of which requires its own notice to be distributed - see the `LICENSE` files.
+
 # Original README.md below
 
 # Modded-NanoGPT

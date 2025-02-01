@@ -30,3 +30,11 @@ pytorch-triton = [
 name = "pytorch-nightly-cu126"
 url = "https://download.pytorch.org/whl/nightly/cu126"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "ipython>=8.32.0",
+    "lovely-tensors>=0.1.18",
+    "pandas>=2.2.3",
+    "py-spy>=0.4.0",
+]

@@ -12,6 +12,7 @@ dependencies = [
     "tqdm>=4.67.0",
     "pip>=24.3.1",
     "torchao>=0.8.0",
+    "cut-cross-entropy",
 ]
 
 [tool.uv]
@@ -26,6 +27,7 @@ torch = [
 pytorch-triton = [
     { index = "pytorch-nightly-cu126" },
 ]
+cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git" }
 
 [[tool.uv.index]]
 name = "pytorch-nightly-cu126"

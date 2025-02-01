@@ -1,3 +1,4 @@
+from collections import defaultdict
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -8,6 +9,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 import atexit
+from pprint import pprint
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -15,9 +17,11 @@ torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.profiler import profile, record_function, ProfilerActivity
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 # torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
+# from cut_cross_entropy import linear_cross_entropy
 
 # -----------------------------------------------------------------------------
 # Custom operators : FP8 matmul by @YouJiacheng
@@ -279,6 +283,8 @@ class CausalSelfAttention(nn.Module):
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
+        # self.k_sink = nn.Parameter(norm(torch.randn(1, num_heads, 1, head_dim)))
+        # self.v_sink = nn.Parameter(norm(torch.randn(1, num_heads, 1, head_dim)))
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -290,7 +296,18 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = self.lambdas[0] * v
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
+        # Attention sinks:  bypass
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
+        # y, lse = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale, return_lse=True)
+        # sink_v, sink_lse = flex_attention(q.transpose(1, 2), norm(self.k_sink.type_as(x)), norm(self.v_sink.type_as(x)), scale=self.attn_scale, return_lse=True)
+
+        # max_lse = torch.maximum(lse, sink_lse)
+        # lse = (lse - max_lse).exp2()
+        # sink_lse = (sink_lse - max_lse).exp2()
+        # frac_lse = sink_lse / (lse + sink_lse)
+
+        # y = y.lerp(sink_v, frac_lse.type_as(y).unsqueeze(-1))
+        y = y.transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -433,6 +450,10 @@ class GPT(nn.Module):
 
     @torch.compile()
     def forward_decode(self, target_seq, x):
+        # x = norm(x).view(-1, x.shape[-1])
+        # return linear_cross_entropy(x, self.lm_head.weight, target_seq, softcap=15)
+        # CCE didn't work
+        # Not sure if I translated the softcap properly but meh
         x = norm(x)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
@@ -509,11 +530,11 @@ TEST_HPARAMS = Hyperparameters(
     train_files = "data/fineweb1B/fineweb_train_*.bin",
     val_files = "data/fineweb1B/fineweb_val_*.bin",
     val_tokens = 1048576,
-    num_iterations = 20, #770,
+    num_iterations = 1000, #770,
     cooldown_frac = 0.4,
-    val_loss_every = 0, #125,
-    seq_len = 24*1024,
-    val_seq_len = 4*32*1024,
+    val_loss_every = 125,
+    seq_len = 16*1024,
+    val_seq_len = 4*16*1024,
     save_checkpoint = False,
 )
 master_process = None
@@ -553,6 +574,7 @@ def main(args = TEST_HPARAMS):
     print0("="*100, console=False)
     atexit.register(log_mem)
 
+    torch.random.manual_seed(0)
     torch.cuda.synchronize()
     print0("Init data")
     # load data
@@ -563,14 +585,20 @@ def main(args = TEST_HPARAMS):
     print0("Init model")
     # REF: model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
     model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=3, model_dim=384, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    model.bfloat16()
     for m in model.modules():
         if isinstance(m, nn.Embedding):
             m.bfloat16()
-    n_params = 0
-    for param in model.parameters():
+
+    # count parameters
+    n_params_by_dtype = defaultdict(lambda: 0)
+    for name, param in model.named_parameters():
         dist.broadcast(param.detach(), 0)
-        n_params += param.numel()
-    print0(f"{n_params/1024/1024:.3f}Mi params")
+        n_params_by_dtype[param.dtype] += param.numel()
+    for dt, n_params in n_params_by_dtype.items():
+        print0(f"{dt}: {n_params/1024/1024:.3f}Mi params")
+    print0(f"total: {sum(n_params_by_dtype.values())/1024/1024:.3f}Mi params")
+
 
     torch.cuda.synchronize()
     print0("Init optimizers")
@@ -581,11 +609,12 @@ def main(args = TEST_HPARAMS):
     head_params = [model.lm_head.weight]
 
     # init the optimizer(s)
-    adam_params = [dict(params=head_params, lr=0.008), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
+    lr_mod = (8*48/16) ** -0.5  # Correct LR based on difference in batch size vs 4
+    adam_params = [dict(params=head_params, lr=0.008*lr_mod), dict(params=embed_params, lr=0.6*lr_mod), dict(params=scalar_params, lr=0.04*lr_mod)]
     # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
     # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
     optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-    optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+    optimizer2 = Muon(hidden_matrix_params, lr=0.05*lr_mod, momentum=0.95, rank=rank, world_size=world_size)
     optimizers = [optimizer1, optimizer2]
 
     # learning rate schedule: stable then decay
@@ -600,7 +629,7 @@ def main(args = TEST_HPARAMS):
         return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
     # Compiling only on layers & output head saves startup time but slows by ~6%, uses ~10% more VRAM
-    # model: nn.Module = torch.compile(model, dynamic=False)
+    model: nn.Module = torch.compile(model) #, dynamic=False)
 
     training_time_ms = 0
     # start the clock
@@ -609,8 +638,21 @@ def main(args = TEST_HPARAMS):
     # begin training
     print0("Starting train loop")
     train_steps = args.num_iterations
+    prof = None
     for step in range(train_steps + 1):
         last_step = (step == train_steps)
+        # if step == 5:
+        #     prof = profile(record_shapes=True, profile_memory=True, with_stack=True)
+        #     prof.__enter__()
+        #     prof.start()
+        # if prof is not None:
+        #     if step == 9:
+        #         prof.__exit__(None, None, None)
+        #         prof.export_chrome_trace("trace.json")
+        #         prof = None
+        #     else:
+        #         prof.step()
+
         # This effectively ignores timing first 10 steps, which are slower for weird reasons.
         # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
         # steps with dummy data first, and then re-initialize the model and reset the loader.
@@ -657,14 +699,18 @@ def main(args = TEST_HPARAMS):
 
         # --------------- TRAINING SECTION -----------------
         inputs, targets = next(train_loader)
-        train_loss = 0
+        train_losses = []
         for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
             loss = model(input_seq, target_seq, sw_num_blks(window_size))
-            train_loss += loss.item()
             loss.backward()
-        train_loss /= len(inputs.split(args.seq_len))
+            dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+            train_losses.append(loss.item())
+            del loss
+        train_loss = sum(train_losses or [torch.nan]) / max(len(train_losses), 1)
         for param in model.parameters():
-            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        del param
         # momentum warmup for Muon
         frac = min(step / 300, 1)
         for group in optimizer2.param_groups:
@@ -675,9 +721,10 @@ def main(args = TEST_HPARAMS):
             sched.step()
         # null the gradients
         model.zero_grad(set_to_none=True)
+
         # logging
         approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms", console=True)
+        print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms {torch.cuda.memory_allocated()=}", console=True)
 
 
 

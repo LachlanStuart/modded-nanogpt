@@ -1,3 +1,20 @@
+# Fork README.md
+
+This is not a competition attempt! I'm just doing some small-scale experiments, and Modded-NanoGPT is a well-tuned, self-contained baseline.
+
+Plan:
+* Integrate [MoEUT](https://github.com/robertcsordas/moeut)
+* Profile memory usage and accordingly implement:
+    * Wrapping layers in autograd.Functions for fine-grained control over gradient checkpointing.
+    * [4-bit weights & activations](https://arxiv.org/abs/2501.17116)
+    * [GaLore](https://github.com/jiaweizzhao/GaLore?tab=readme-ov-file#save-weight-gradient-memory-using-per-layer-weight-updates)-style weight updates during backprop
+        * (With UT, updates need to be deferred, but it still likely saves memory)
+    * 8-bit/4-bit optimizers
+* Stochastic Rounding
+
+
+# Original README.md below
+
 # Modded-NanoGPT
 
 The purpose of this repository is to collaboratively determine the fastest way to train small-scale language models.
@@ -42,7 +59,7 @@ For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss 
 ## Alternative: Running with Docker (recommended for timing)
 
 For cases where CUDA or NCCL versions aren't compatible with your current system setup, Docker can be a helpful alternative.
-This approach standardizes versions for CUDA, NCCL, CUDNN, and Python, reducing dependency issues and simplifying setup. 
+This approach standardizes versions for CUDA, NCCL, CUDNN, and Python, reducing dependency issues and simplifying setup.
 Note: an NVIDIA driver must already be installed on the system (useful if only the NVIDIA driver and Docker are available).
 
 ```bash
@@ -179,13 +196,13 @@ def zeroth_power_via_newtonschulz5(G, steps=5, eps=1e-7):
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16() / (G.norm() + eps)
     if G.size(0) > G.size(1):
-        X = X.T 
+        X = X.T
     for _ in range(steps):
         A = X @ X.T
         B = b * A + c * A @ A
         X = a * X + B @ X
     if G.size(0) > G.size(1):
-        X = X.T 
+        X = X.T
     return X.to(G.dtype)
 ```
 

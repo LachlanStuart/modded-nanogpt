@@ -283,8 +283,8 @@ class CausalSelfAttention(nn.Module):
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
-        # self.k_sink = nn.Parameter(norm(torch.randn(1, num_heads, 1, head_dim)))
-        # self.v_sink = nn.Parameter(norm(torch.randn(1, num_heads, 1, head_dim)))
+        self.k_sink = nn.Parameter(norm(torch.randn(1, num_heads, 8, head_dim)))
+        self.v_sink = nn.Parameter(norm(torch.randn(1, num_heads, 8, head_dim)))
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -298,15 +298,15 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v
         # Attention sinks:  bypass
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
-        # y, lse = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale, return_lse=True)
-        # sink_v, sink_lse = flex_attention(q.transpose(1, 2), norm(self.k_sink.type_as(x)), norm(self.v_sink.type_as(x)), scale=self.attn_scale, return_lse=True)
+        y, lse = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale, return_lse=True)
+        sink_v, sink_lse = flex_attention(q.transpose(1, 2), norm(self.k_sink.type_as(x)), norm(self.v_sink.type_as(x)), scale=self.attn_scale, return_lse=True)
 
-        # max_lse = torch.maximum(lse, sink_lse)
-        # lse = (lse - max_lse).exp2()
-        # sink_lse = (sink_lse - max_lse).exp2()
-        # frac_lse = sink_lse / (lse + sink_lse)
+        max_lse = torch.maximum(lse, sink_lse)
+        lse = (lse - max_lse).exp2()
+        sink_lse = (sink_lse - max_lse).exp2()
+        frac_lse = sink_lse / (lse + sink_lse)
 
-        # y = y.lerp(sink_v, frac_lse.type_as(y).unsqueeze(-1))
+        y = y.lerp(sink_v, frac_lse.type_as(y).unsqueeze(-1))
         y = y.transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -603,13 +603,14 @@ def main(args = TEST_HPARAMS):
     torch.cuda.synchronize()
     print0("Init optimizers")
     # collect the parameters to optimize
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n and "sink" not in n]
     embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for p in model.parameters() if p.ndim < 2]
+    scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2 or "sink" in n]
     head_params = [model.lm_head.weight]
 
     # init the optimizer(s)
-    lr_mod = (8*48/16) ** -0.5  # Correct LR based on difference in batch size vs 4
+    lr_mod = (args.seq_len/Hyperparameters().seq_len) ** 0.5  # Correct LR based on difference in batch size vs 4
+    print(f"{lr_mod=}")
     adam_params = [dict(params=head_params, lr=0.008*lr_mod), dict(params=embed_params, lr=0.6*lr_mod), dict(params=scalar_params, lr=0.04*lr_mod)]
     # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
     # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094

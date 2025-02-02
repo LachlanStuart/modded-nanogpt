@@ -1,0 +1,1775 @@
+23:07:45.118: from collections import defaultdict
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import time
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+import atexit
+from pprint import pprint
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import torch
+torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+from torch import Tensor, nn
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.profiler import profile, record_function, ProfilerActivity
+# use of FlexAttention contributed by @KoszarskyB
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
+# torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
+# from cut_cross_entropy import linear_cross_entropy
+
+# -----------------------------------------------------------------------------
+# Custom operators : FP8 matmul by @YouJiacheng
+@torch.library.custom_op("nanogpt::mm", mutates_args=())
+def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
+    @torch.compile
+    def impl(x: Tensor, w: Tensor):
+        assert x.is_contiguous() and w.is_contiguous()
+        # x_f8 = x.mul(x_s).to(torch.float8_e4m3fn)
+        x_f8 = x.mul(x_s).to(torch.float8_e5m2)
+        # w_f8 = w.mul(w_s).to(torch.float8_e4m3fn)
+        w_f8 = w.mul(w_s).to(torch.float8_e5m2)
+        out = torch._scaled_mm(
+            x_f8,
+            w_f8.t(),
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(1 / x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(1 / w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+        return out, x_f8, w_f8
+
+    return impl(x, w)
+
+@mm_op.register_fake
+def _(x: Tensor, w: Tensor, *_):
+    assert x.ndim == w.ndim == 2
+    assert x.shape[1] == w.shape[1]
+    assert x.device == w.device
+    assert x.is_contiguous() and w.is_contiguous()
+    # return x @ w.t(), x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+    return x @ w.t(), x.to(torch.float8_e5m2), w.to(torch.float8_e5m2)
+
+@torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
+def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
+    @torch.compile
+    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
+        assert grad.is_contiguous()
+        x_inv_s = grad.new_tensor(1 / x_s, dtype=torch.float32)
+        w_inv_s = grad.new_tensor(1 / w_s, dtype=torch.float32)
+        grad_inv_s = grad.new_tensor(1 / grad_s, dtype=torch.float32)
+        grad_f8 = grad.mul(grad_s).to(torch.float8_e5m2)
+        grad_x = torch._scaled_mm(
+            grad_f8,
+            w_f8.t().contiguous().t(),
+            out_dtype=torch.bfloat16,
+            scale_a=grad_inv_s,
+            scale_b=w_inv_s,
+            use_fast_accum=False,
+        )
+        # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
+        grad_w = torch._scaled_mm(
+            x_f8.t().contiguous(),
+            grad_f8.t().contiguous().t(),
+            out_dtype=torch.float32,
+            scale_a=x_inv_s,
+            scale_b=grad_inv_s,
+            use_fast_accum=False,
+        ).t()
+        return grad_x, grad_w
+
+    return impl(g, x_f8, w_f8)
+
+@mm_backward_op.register_fake
+def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
+    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
+
+def backward(ctx, grad_out: Tensor, *_):
+    x_f8, w_f8 = ctx.saved_tensors
+    x_s, w_s, grad_s = ctx.scales
+    grad_x, grad_w = torch.ops.nanogpt.mm_backward(
+        grad_out, x_f8, w_f8, x_s, w_s, grad_s
+    )
+    return grad_x, grad_w, None, None, None
+
+def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+    *_, x_s, w_s, grad_s = inputs
+    _, x_f8, w_f8 = output
+    ctx.save_for_backward(x_f8, w_f8)
+    ctx.scales = x_s, w_s, grad_s
+    ctx.set_materialize_grads(False)
+
+mm_op.register_autograd(backward, setup_context=setup_context)
+
+# -----------------------------------------------------------------------------
+# Muon optimizer
+
+@torch.compile
+def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer assumes that all parameters passed in are 2D.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe it is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven"t tested this.
+    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        ns_steps: The number of Newton-Schulz iteration steps to use.
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
+        self.rank = rank
+        self.world_size = world_size
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        params: list[Tensor] = [*params]
+        assert all(isinstance(p, Tensor) for p in params)
+        sizes = {p.numel() for p in params}
+        def create_update_buffer(size: int):
+            b = torch.empty(self.world_size, size, dtype=torch.bfloat16, device="cuda")
+            return dict(update_buffer=b, update_buffer_views=[b[i] for i in range(self.world_size)])
+        param_groups = [
+            dict(params=[p for p in params if p.numel() == size], **create_update_buffer(size)) for size in sizes]
+        super().__init__(param_groups, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+            update_buffer = group["update_buffer"]
+            update_buffer_views: list[Tensor] = group["update_buffer_views"]
+            # generate weight updates in distributed fashion
+            params: list[Tensor] = group["params"]
+            handle = None
+            params_world = None
+            def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
+                if params_world is None:
+                    return
+                assert handle is not None
+                handle.wait()
+                for p_world, g_world in zip(params_world, update_buffer_views):
+                    p_world.add_(
+                        g_world.view_as(p_world),
+                        alpha=-lr * max(1, p_world.size(-2) / p_world.size(-1)) ** 0.5,
+                    )
+            for base_i in range(len(params))[::self.world_size]:
+                if base_i + self.rank < len(params):
+                    p = params[base_i + self.rank]
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf: Tensor = state["momentum_buffer"]
+                    buf.lerp_(g, 1 - momentum)
+                    g = g.lerp_(buf, momentum) if nesterov else buf
+                    g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
+                else:
+                    g = update_buffer_views[self.rank]
+                update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
+                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
+                params_world = params[base_i : base_i + self.world_size]
+            update_prev()
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the model
+
+def norm(x: Tensor):
+    return F.rms_norm(x, (x.size(-1),))
+
+class CastedLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, use_fp8: bool = False, x_s: float = 1.0, w_s: float = 1.0, grad_s: float = 1.0):
+        super().__init__(in_features, out_features, bias=False)
+        self.use_fp8 = use_fp8
+        self.x_s = x_s
+        self.w_s = w_s
+        self.grad_s = grad_s
+
+    def reset_parameters(self) -> None:
+        std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
+            self.weight.uniform_(-bound, bound)
+
+    def forward(self, x: Tensor):
+        if self.use_fp8 and self.training:
+            _x = x.flatten(0, -2)
+            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
+            return out.reshape(*x.shape[:-1], -1)
+        else:
+            return F.linear(x, self.weight.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int):
+        super().__init__()
+        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
+        self.cos = nn.Buffer(theta.cos(), persistent=False)
+        self.sin = nn.Buffer(theta.sin(), persistent=False)
+
+    def forward(self, x_BTHD: Tensor):
+        assert self.cos.size(0) >= x_BTHD.size(-3)
+        cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        hdim = num_heads * head_dim
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
+        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
+        # https://x.com/hi_tysam/status/1879699187107033311
+        self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.rotary = Rotary(head_dim, max_seq_len)
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
+        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        self.attn_scale = 0.12
+        # self.k_sink = nn.Parameter(norm(torch.randn(1, num_heads, 1, head_dim)))
+        # self.v_sink = nn.Parameter(norm(torch.randn(1, num_heads, 1, head_dim)))
+
+    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
+        B, T = x.size(0), x.size(1) # batch size, sequence length
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
+        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = self.rotary(q), self.rotary(k)
+        if ve is not None:
+            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = self.lambdas[0] * v
+        # Attention sinks:  bypass
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
+        # y, lse = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale, return_lse=True)
+        # sink_v, sink_lse = flex_attention(q.transpose(1, 2), norm(self.k_sink.type_as(x)), norm(self.v_sink.type_as(x)), scale=self.attn_scale, return_lse=True)
+
+        # max_lse = torch.maximum(lse, sink_lse)
+        # lse = (lse - max_lse).exp2()
+        # sink_lse = (sink_lse - max_lse).exp2()
+        # frac_lse = sink_lse / (lse + sink_lse)
+
+        # y = y.lerp(sink_v, frac_lse.type_as(y).unsqueeze(-1))
+        y = y.transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.c_fc = CastedLinear(dim, hdim)
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+
+    def forward(self, x: Tensor):
+        x = self.c_fc(x)
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = self.c_proj(x)
+        return x
+
+@torch.compile()
+class Block(nn.Module):
+    def __init__(self, dim: int, num_heads: int, layer_idx: int, max_seq_len: int):
+        super().__init__()
+        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
+        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
+        self.mlp = MLP(dim)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+
+    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        if self.attn is not None:
+            x = x + self.attn(norm(x), ve, block_mask)
+        x = x + self.mlp(norm(x))
+        return x
+
+class ValueEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, embedding_dim: int, num_layers: int, num_embeddings: int = 3):
+        super().__init__()
+        self.num_layers = num_layers
+        self.num_embeddings = num_embeddings
+        self.embed = nn.ModuleList([nn.Embedding(vocab_size, embedding_dim) for _ in range(num_embeddings)])
+
+    def forward(self, input_seq: Tensor) -> list[Tensor | None]:
+        ve = [emb(input_seq) for emb in self.embed]
+        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
+        ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 2 * self.num_embeddings) + [ve[0], ve[1], ve[2]]
+        return ve
+
+# -----------------------------------------------------------------------------
+# The main model
+
+def next_multiple_of_n(v: float | int, *, n: int):
+    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
+        self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers)
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx, max_seq_len) for layer_idx in range(num_layers)])
+        # U-net design by @brendanh0gan
+        self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
+        self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
+        # Add learnable skip connection weights for decoder layers
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+        # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
+        # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
+        # self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
+        self.lm_head.weight.detach().zero_() # @Grad62304977
+
+    def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
+        BLOCK_SIZE = 128
+        docs = (input_seq == 50256).cumsum(0)
+
+        def document_causal(b, h, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            document_mask = docs[q_idx] == docs[kv_idx]
+            return causal_mask & document_mask
+
+        def dense_to_ordered(dense_mask: Tensor):
+            num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
+            indices = dense_mask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
+            return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+
+        # manual block mask creation by @YouJiacheng
+        assert len(input_seq) % BLOCK_SIZE == 0
+        NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
+        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
+        any_causal_bm = block_idx[:, None] >= block_idx
+        all_causal_bm = block_idx[:, None] > block_idx
+        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
+        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
+        any_document_bm = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
+        all_document_bm = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
+        any_bm = any_causal_bm & any_document_bm
+        all_bm = all_causal_bm & all_document_bm
+        partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(any_bm & ~all_bm)
+        full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
+        def build_bm(sw_num_blocks: Tensor) -> BlockMask:
+            return BlockMask.from_kv_blocks(
+                torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(sw_num_blocks - full_kv_num_blocks, 1)),
+                partial_kv_indices,
+                torch.clamp_max(full_kv_num_blocks, sw_num_blocks - 1),
+                full_kv_indices,
+                BLOCK_SIZE=BLOCK_SIZE,
+                mask_mod=document_causal,
+            )
+        # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
+        return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
+
+
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+        assert input_seq.ndim == 1
+
+        long_bm, short_bm = self.create_block_masks(input_seq, sliding_window_num_blocks)
+
+        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        ve = self.value_embeds(input_seq)
+        assert len(ve) == len(self.blocks)
+        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
+        assert len(ve_enc) == self.num_encoder_layers and len(ve_dec) == self.num_decoder_layers
+
+        # Store outputs for U-Net skip connections
+        skip_connections = []
+        # Encoder pass - process only the first half of the blocks
+        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
+        assert len(block_masks) == self.num_encoder_layers
+        for i, block in enumerate(self.blocks[:self.num_encoder_layers]):
+            x = block(x, ve_enc[i], x0, block_masks[i])
+            skip_connections.append(x)
+        # Decoder pass - process the remaining blocks with weighted skip connections
+        block_masks.reverse()
+        assert len(block_masks) == self.num_decoder_layers
+        for i, block in enumerate(self.blocks[self.num_encoder_layers:]):
+            x = x + self.skip_weights[i] * skip_connections.pop()
+            x = block(x, ve_dec[i], x0, block_masks[i])
+        loss = self.forward_decode(target_seq, x)
+        return loss
+
+    @torch.compile()
+    def forward_decode(self, target_seq, x):
+        # x = norm(x).view(-1, x.shape[-1])
+        # return linear_cross_entropy(x, self.lm_head.weight, target_seq, softcap=15)
+        # CCE didn't work
+        # Not sure if I translated the softcap properly but meh
+        x = norm(x)
+        logits = self.lm_head(x)
+        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+        logits = 30 * torch.sigmoid(logits.float() / 7.5)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
+        return loss
+
+# -----------------------------------------------------------------------------
+# Our own simple Distributed Data Loader
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(f"{file}", False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % world_size == 0
+    local_batch_size = batch_size // world_size
+    file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn"t helpful.
+        pos += batch_size
+        yield inputs, targets
+
+# -----------------------------------------------------------------------------
+# int main
+
+def print0(s, console=True):
+    if master_process:
+        timestamp = time.strftime("%H:%M:%S.") + f"{time.time() % 1:.3f}"[2:]
+        s = f"{timestamp}: {s}"
+        with open(logfile, "a") as f:
+            if console:
+                print(s)
+            print(s, file=f)
+
+def log_mem():
+    print0(
+        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB",
+        console=True,
+    )
+
+@dataclass(frozen=True, kw_only=True)
+class Hyperparameters:
+    # data
+    train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    # optimization
+    num_iterations: int = 1770 # number of iterations to run
+    cooldown_frac: float = 0.4 # fraction of training spent cooling down the learning rate
+    # evaluation and logging
+    val_loss_every: int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    # implementation
+    seq_len: int = 48*1024 # FlexAttention sequence length
+    val_seq_len: int = 4*64*1024 # FlexAttention sequence length for validation
+    save_checkpoint: bool = False
+
+TEST_HPARAMS = Hyperparameters(
+    train_files = "data/fineweb1B/fineweb_train_*.bin",
+    val_files = "data/fineweb1B/fineweb_val_*.bin",
+    val_tokens = 1048576,
+    num_iterations = 1000, #770,
+    cooldown_frac = 0.4,
+    val_loss_every = 125,
+    seq_len = 16*1024,
+    val_seq_len = 4*16*1024,
+    save_checkpoint = False,
+)
+master_process = None
+logfile = None
+def main(args = TEST_HPARAMS):
+    global master_process, logfile
+    # torchrun sets these env variables
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    assert torch.cuda.is_available()
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    atexit.register(dist.destroy_process_group)
+    dist.barrier()
+    master_process = (rank == 0) # this process will do logging, checkpointing etc.
+
+    # begin logging
+    logfile = None
+    if master_process:
+        run_id = uuid.uuid4()
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{run_id}.txt"
+        print(logfile)
+
+
+    # begin by printing this file (the Python code)
+    print0(code, console=False)
+    print0("="*100, console=False)
+    # log information about the hardware/software environment this is running on
+    print0(f"Running Python {sys.version}", console=False)
+    print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}", console=False)
+    def nvidia_smi():
+        import subprocess  # avoid top level import
+        return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
+    print0(nvidia_smi(), console=False)
+    print0("="*100, console=False)
+    atexit.register(log_mem)
+
+    torch.random.manual_seed(0)
+    torch.cuda.synchronize()
+    print0("Init data")
+    # load data
+    train_batch_size = world_size * args.seq_len
+    train_loader = distributed_data_generator(args.train_files, train_batch_size, rank, world_size)
+
+    torch.cuda.synchronize()
+    print0("Init model")
+    # REF: model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=3, model_dim=384, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    model.bfloat16()
+    for m in model.modules():
+        if isinstance(m, nn.Embedding):
+            m.bfloat16()
+
+    # count parameters
+    n_params_by_dtype = defaultdict(lambda: 0)
+    for name, param in model.named_parameters():
+        dist.broadcast(param.detach(), 0)
+        n_params_by_dtype[param.dtype] += param.numel()
+    for dt, n_params in n_params_by_dtype.items():
+        print0(f"{dt}: {n_params/1024/1024:.3f}Mi params")
+    print0(f"total: {sum(n_params_by_dtype.values())/1024/1024:.3f}Mi params")
+
+
+    torch.cuda.synchronize()
+    print0("Init optimizers")
+    # collect the parameters to optimize
+    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+    scalar_params = [p for p in model.parameters() if p.ndim < 2]
+    head_params = [model.lm_head.weight]
+
+    # init the optimizer(s)
+    lr_mod = (8*48/16) ** -0.5  # Correct LR based on difference in batch size vs 4
+    adam_params = [dict(params=head_params, lr=0.008*lr_mod), dict(params=embed_params, lr=0.6*lr_mod), dict(params=scalar_params, lr=0.04*lr_mod)]
+    # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
+    # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
+    optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
+    optimizer2 = Muon(hidden_matrix_params, lr=0.05*lr_mod, momentum=0.95, rank=rank, world_size=world_size)
+    optimizers = [optimizer1, optimizer2]
+
+    # learning rate schedule: stable then decay
+    def get_lr(step: int):
+        t = 1 - step / args.num_iterations # time remaining in training
+        assert 1 >= t >= 0
+        w = min(t / args.cooldown_frac, 1.0) # 1 -> 0
+        return w * 1.0 + (1 - w) * 0.1
+    schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+    @lru_cache(1)
+    def sw_num_blks(window_size: int):
+        return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+    # Compiling only on layers & output head saves startup time but slows by ~6%, uses ~10% more VRAM
+    model: nn.Module = torch.compile(model) #, dynamic=False)
+
+    training_time_ms = 0
+    # start the clock
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    # begin training
+    print0("Starting train loop")
+    train_steps = args.num_iterations
+    prof = None
+    for step in range(train_steps + 1):
+        last_step = (step == train_steps)
+        # if step == 5:
+        #     prof = profile(record_shapes=True, profile_memory=True, with_stack=True)
+        #     prof.__enter__()
+        #     prof.start()
+        # if prof is not None:
+        #     if step == 9:
+        #         prof.__exit__(None, None, None)
+        #         prof.export_chrome_trace("trace.json")
+        #         prof = None
+        #     else:
+        #         prof.step()
+
+        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+        # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+        # steps with dummy data first, and then re-initialize the model and reset the loader.
+        if step == 10:
+            training_time_ms = 0
+            t0 = time.perf_counter()
+        timed_steps = float("nan") if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+
+        # Linearly increase the block-wise sliding window size over training 128 -> 1792:
+        # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
+        window_size = next_multiple_of_n(1728 * step / train_steps, n=128)
+
+        # --------------- VALIDATION SECTION -----------------
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            model.eval()
+            val_batch_size = world_size * args.val_seq_len
+            assert args.val_tokens % val_batch_size == 0
+            val_steps = args.val_tokens // val_batch_size
+            val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+            val_loss = 0
+            with torch.no_grad():
+                for i in range(val_steps):
+                    x, y = next(val_loader)
+                    val_loss += model(x, y, sw_num_blks(window_size))
+            val_loss /= val_steps
+            del val_loader
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms", console=True)
+            model.train()
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if last_step:
+            if master_process and args.save_checkpoint:
+                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+                os.makedirs(f"logs/{run_id}", exist_ok=True)
+                torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            # the last step only has the validation loop, so break to avoid training
+            break
+
+        # --------------- TRAINING SECTION -----------------
+        inputs, targets = next(train_loader)
+        train_losses = []
+        for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
+            loss = model(input_seq, target_seq, sw_num_blks(window_size))
+            loss.backward()
+            dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+            train_losses.append(loss.item())
+            del loss
+        train_loss = sum(train_losses or [torch.nan]) / max(len(train_losses), 1)
+        for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        del param
+        # momentum warmup for Muon
+        frac = min(step / 300, 1)
+        for group in optimizer2.param_groups:
+            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        # step the optimizers and schedulers
+        for opt, sched in zip(optimizers, schedulers):
+            opt.step()
+            sched.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
+
+        # logging
+        approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms {torch.cuda.memory_allocated()=}", console=True)
+
+
+
+if __name__ == "__main__":
+    main()
+
+23:07:45.118: ====================================================================================================
+23:07:45.118: Running Python 3.12.7 (main, Oct 16 2024, 04:37:19) [Clang 18.1.8 ]
+23:07:45.118: Running PyTorch 2.7.0.dev20250110+cu126 compiled for CUDA 12.6
+23:07:45.200: Sat Feb  1 23:07:45 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 560.35.02              Driver Version: 560.94         CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3090 Ti     On  |   00000000:2D:00.0 Off |                  Off |
+|  0%   45C    P2             96W /  450W |     950MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A        26      G   /Xwayland                                   N/A      |
+|    0   N/A  N/A     68223      C   /python3.12                                 N/A      |
++-----------------------------------------------------------------------------------------+
+
+23:07:45.200: ====================================================================================================
+23:07:45.201: Init data
+23:07:45.201: Init model
+23:07:46.173: torch.bfloat16: 111.728Mi params
+23:07:46.173: total: 111.728Mi params
+23:07:46.173: Init optimizers
+23:07:46.186: Starting train loop
+23:07:54.402: step:0/1000 val_loss:10.8258 train_time:0ms step_avg:nanms
+23:08:27.388: step:1/1000 train_loss:10.8258 train_time:32986ms step_avg:nanms torch.cuda.memory_allocated()=866631680
+23:08:27.529: step:2/1000 train_loss:10.7382 train_time:33126ms step_avg:nanms torch.cuda.memory_allocated()=866631680
+23:08:27.670: step:3/1000 train_loss:10.6025 train_time:33268ms step_avg:nanms torch.cuda.memory_allocated()=866631680
+23:08:27.807: step:4/1000 train_loss:10.4540 train_time:33405ms step_avg:nanms torch.cuda.memory_allocated()=866631680
+23:08:27.947: step:5/1000 train_loss:10.1538 train_time:33545ms step_avg:nanms torch.cuda.memory_allocated()=866631680
+23:08:28.084: step:6/1000 train_loss:9.8151 train_time:33682ms step_avg:nanms torch.cuda.memory_allocated()=866631680
+23:08:28.222: step:7/1000 train_loss:9.5597 train_time:33820ms step_avg:nanms torch.cuda.memory_allocated()=866631680
+23:08:28.359: step:8/1000 train_loss:9.0181 train_time:33957ms step_avg:nanms torch.cuda.memory_allocated()=866631680
+23:08:28.498: step:9/1000 train_loss:8.6533 train_time:34095ms step_avg:nanms torch.cuda.memory_allocated()=866631680
+23:08:28.634: step:10/1000 train_loss:8.5824 train_time:34232ms step_avg:nanms torch.cuda.memory_allocated()=866631680
+23:08:28.771: step:11/1000 train_loss:8.0288 train_time:137ms step_avg:nanms torch.cuda.memory_allocated()=866631680
+23:08:28.909: step:12/1000 train_loss:7.3884 train_time:274ms step_avg:nanms torch.cuda.memory_allocated()=866631680
+23:08:29.046: step:13/1000 train_loss:6.9617 train_time:412ms step_avg:137.25ms torch.cuda.memory_allocated()=866631680
+23:08:29.184: step:14/1000 train_loss:7.5214 train_time:549ms step_avg:137.36ms torch.cuda.memory_allocated()=866631680
+23:08:29.322: step:15/1000 train_loss:7.8037 train_time:687ms step_avg:137.49ms torch.cuda.memory_allocated()=866631680
+23:08:29.459: step:16/1000 train_loss:7.7767 train_time:824ms step_avg:137.40ms torch.cuda.memory_allocated()=866631680
+23:08:29.596: step:17/1000 train_loss:7.8705 train_time:962ms step_avg:137.36ms torch.cuda.memory_allocated()=866631680
+23:08:29.734: step:18/1000 train_loss:8.0937 train_time:1099ms step_avg:137.38ms torch.cuda.memory_allocated()=866631680
+23:08:29.872: step:19/1000 train_loss:7.4311 train_time:1238ms step_avg:137.52ms torch.cuda.memory_allocated()=866631680
+23:08:30.009: step:20/1000 train_loss:7.3853 train_time:1375ms step_avg:137.47ms torch.cuda.memory_allocated()=866631680
+23:08:30.146: step:21/1000 train_loss:7.3173 train_time:1512ms step_avg:137.43ms torch.cuda.memory_allocated()=866631680
+23:08:30.286: step:22/1000 train_loss:7.1643 train_time:1651ms step_avg:137.61ms torch.cuda.memory_allocated()=866631680
+23:08:30.423: step:23/1000 train_loss:6.9841 train_time:1789ms step_avg:137.61ms torch.cuda.memory_allocated()=866631680
+23:08:30.561: step:24/1000 train_loss:6.9255 train_time:1926ms step_avg:137.57ms torch.cuda.memory_allocated()=866631680
+23:08:30.698: step:25/1000 train_loss:6.9666 train_time:2063ms step_avg:137.54ms torch.cuda.memory_allocated()=866631680
+23:08:30.835: step:26/1000 train_loss:6.8682 train_time:2200ms step_avg:137.50ms torch.cuda.memory_allocated()=866631680
+23:08:30.971: step:27/1000 train_loss:6.9711 train_time:2336ms step_avg:137.43ms torch.cuda.memory_allocated()=866631680
+23:08:31.108: step:28/1000 train_loss:7.1926 train_time:2474ms step_avg:137.43ms torch.cuda.memory_allocated()=866631680
+23:08:31.247: step:29/1000 train_loss:7.1857 train_time:2613ms step_avg:137.51ms torch.cuda.memory_allocated()=866631680
+23:08:31.385: step:30/1000 train_loss:6.8613 train_time:2751ms step_avg:137.54ms torch.cuda.memory_allocated()=866631680
+23:08:31.524: step:31/1000 train_loss:6.9511 train_time:2889ms step_avg:137.57ms torch.cuda.memory_allocated()=866631680
+23:08:31.661: step:32/1000 train_loss:6.6832 train_time:3027ms step_avg:137.58ms torch.cuda.memory_allocated()=866631680
+23:08:31.799: step:33/1000 train_loss:6.8393 train_time:3164ms step_avg:137.59ms torch.cuda.memory_allocated()=866631680
+23:08:31.936: step:34/1000 train_loss:6.5281 train_time:3302ms step_avg:137.57ms torch.cuda.memory_allocated()=866631680
+23:08:32.074: step:35/1000 train_loss:6.9903 train_time:3439ms step_avg:137.57ms torch.cuda.memory_allocated()=866631680
+23:08:32.211: step:36/1000 train_loss:6.6459 train_time:3576ms step_avg:137.56ms torch.cuda.memory_allocated()=866631680
+23:08:32.348: step:37/1000 train_loss:6.6859 train_time:3714ms step_avg:137.54ms torch.cuda.memory_allocated()=866631680
+23:08:32.485: step:38/1000 train_loss:6.5389 train_time:3851ms step_avg:137.52ms torch.cuda.memory_allocated()=866631680
+23:08:32.622: step:39/1000 train_loss:6.7355 train_time:3987ms step_avg:137.50ms torch.cuda.memory_allocated()=866631680
+23:08:32.760: step:40/1000 train_loss:6.4908 train_time:4125ms step_avg:137.50ms torch.cuda.memory_allocated()=866631680
+23:08:32.896: step:41/1000 train_loss:6.5133 train_time:4262ms step_avg:137.47ms torch.cuda.memory_allocated()=866631680
+23:08:33.033: step:42/1000 train_loss:6.4242 train_time:4399ms step_avg:137.46ms torch.cuda.memory_allocated()=866631680
+23:08:33.171: step:43/1000 train_loss:6.5636 train_time:4536ms step_avg:137.46ms torch.cuda.memory_allocated()=866631680
+23:08:33.309: step:44/1000 train_loss:6.2933 train_time:4674ms step_avg:137.48ms torch.cuda.memory_allocated()=866631680
+23:08:33.447: step:45/1000 train_loss:7.1530 train_time:4812ms step_avg:137.48ms torch.cuda.memory_allocated()=866631680
+23:08:33.583: step:46/1000 train_loss:6.4114 train_time:4949ms step_avg:137.47ms torch.cuda.memory_allocated()=866631680
+23:08:33.721: step:47/1000 train_loss:6.4829 train_time:5086ms step_avg:137.46ms torch.cuda.memory_allocated()=866631680
+23:08:33.857: step:48/1000 train_loss:6.8070 train_time:5223ms step_avg:137.44ms torch.cuda.memory_allocated()=866631680
+23:08:33.994: step:49/1000 train_loss:6.5203 train_time:5360ms step_avg:137.43ms torch.cuda.memory_allocated()=866631680
+23:08:34.132: step:50/1000 train_loss:6.5768 train_time:5498ms step_avg:137.44ms torch.cuda.memory_allocated()=866631680
+23:08:34.269: step:51/1000 train_loss:6.4113 train_time:5635ms step_avg:137.43ms torch.cuda.memory_allocated()=866631680
+23:08:34.406: step:52/1000 train_loss:6.6834 train_time:5771ms step_avg:137.40ms torch.cuda.memory_allocated()=866631680
+23:08:34.543: step:53/1000 train_loss:6.0345 train_time:5908ms step_avg:137.40ms torch.cuda.memory_allocated()=866631680
+23:08:34.680: step:54/1000 train_loss:6.4287 train_time:6046ms step_avg:137.41ms torch.cuda.memory_allocated()=866631680
+23:08:34.817: step:55/1000 train_loss:6.9256 train_time:6182ms step_avg:137.38ms torch.cuda.memory_allocated()=866631680
+23:08:34.954: step:56/1000 train_loss:6.2771 train_time:6320ms step_avg:137.38ms torch.cuda.memory_allocated()=866631680
+23:08:35.092: step:57/1000 train_loss:6.5393 train_time:6457ms step_avg:137.39ms torch.cuda.memory_allocated()=866631680
+23:08:35.229: step:58/1000 train_loss:6.4639 train_time:6594ms step_avg:137.38ms torch.cuda.memory_allocated()=866631680
+23:08:35.367: step:59/1000 train_loss:6.2186 train_time:6733ms step_avg:137.41ms torch.cuda.memory_allocated()=866631680
+23:08:35.504: step:60/1000 train_loss:6.5937 train_time:6869ms step_avg:137.38ms torch.cuda.memory_allocated()=866631680
+23:08:35.640: step:61/1000 train_loss:6.7789 train_time:7006ms step_avg:137.37ms torch.cuda.memory_allocated()=866631680
+23:08:35.777: step:62/1000 train_loss:6.6693 train_time:7142ms step_avg:137.35ms torch.cuda.memory_allocated()=866631680
+23:08:35.914: step:63/1000 train_loss:6.5435 train_time:7279ms step_avg:137.34ms torch.cuda.memory_allocated()=866631680
+23:08:36.051: step:64/1000 train_loss:6.5036 train_time:7416ms step_avg:137.33ms torch.cuda.memory_allocated()=866631680
+23:08:36.188: step:65/1000 train_loss:6.6096 train_time:7554ms step_avg:137.34ms torch.cuda.memory_allocated()=866631680
+23:08:36.326: step:66/1000 train_loss:6.2663 train_time:7692ms step_avg:137.35ms torch.cuda.memory_allocated()=866631680
+23:08:36.463: step:67/1000 train_loss:6.6995 train_time:7829ms step_avg:137.34ms torch.cuda.memory_allocated()=866631680
+23:08:36.600: step:68/1000 train_loss:6.3008 train_time:7966ms step_avg:137.34ms torch.cuda.memory_allocated()=866631680
+23:08:36.737: step:69/1000 train_loss:6.1896 train_time:8102ms step_avg:137.33ms torch.cuda.memory_allocated()=866631680
+23:08:36.874: step:70/1000 train_loss:6.2805 train_time:8240ms step_avg:137.33ms torch.cuda.memory_allocated()=866631680
+23:08:37.011: step:71/1000 train_loss:6.5684 train_time:8376ms step_avg:137.32ms torch.cuda.memory_allocated()=866631680
+23:08:37.148: step:72/1000 train_loss:6.4360 train_time:8513ms step_avg:137.31ms torch.cuda.memory_allocated()=866631680
+23:08:37.287: step:73/1000 train_loss:6.3384 train_time:8653ms step_avg:137.34ms torch.cuda.memory_allocated()=866631680
+23:08:37.425: step:74/1000 train_loss:6.4720 train_time:8790ms step_avg:137.35ms torch.cuda.memory_allocated()=866631680
+23:08:37.562: step:75/1000 train_loss:6.0897 train_time:8927ms step_avg:137.34ms torch.cuda.memory_allocated()=866631680
+23:08:37.700: step:76/1000 train_loss:6.3066 train_time:9066ms step_avg:137.36ms torch.cuda.memory_allocated()=866631680
+23:08:37.840: step:77/1000 train_loss:6.2323 train_time:9205ms step_avg:137.39ms torch.cuda.memory_allocated()=866631680
+23:08:37.979: step:78/1000 train_loss:6.0753 train_time:9344ms step_avg:137.42ms torch.cuda.memory_allocated()=866631680
+23:08:38.118: step:79/1000 train_loss:6.3587 train_time:9483ms step_avg:137.44ms torch.cuda.memory_allocated()=866631680
+23:08:38.257: step:80/1000 train_loss:6.0983 train_time:9623ms step_avg:137.47ms torch.cuda.memory_allocated()=866631680
+23:08:38.397: step:81/1000 train_loss:6.0855 train_time:9762ms step_avg:137.50ms torch.cuda.memory_allocated()=866631680
+23:08:38.537: step:82/1000 train_loss:6.1718 train_time:9902ms step_avg:137.53ms torch.cuda.memory_allocated()=866631680
+23:08:38.675: step:83/1000 train_loss:6.4614 train_time:10041ms step_avg:137.55ms torch.cuda.memory_allocated()=866631680
+23:08:38.814: step:84/1000 train_loss:6.7134 train_time:10180ms step_avg:137.56ms torch.cuda.memory_allocated()=866631680
+23:08:38.953: step:85/1000 train_loss:6.1397 train_time:10319ms step_avg:137.58ms torch.cuda.memory_allocated()=866631680
+23:08:39.092: step:86/1000 train_loss:6.4117 train_time:10458ms step_avg:137.60ms torch.cuda.memory_allocated()=866631680
+23:08:39.231: step:87/1000 train_loss:6.3649 train_time:10596ms step_avg:137.62ms torch.cuda.memory_allocated()=866631680
+23:08:39.370: step:88/1000 train_loss:6.2385 train_time:10735ms step_avg:137.63ms torch.cuda.memory_allocated()=866631680
+23:08:39.511: step:89/1000 train_loss:6.1863 train_time:10877ms step_avg:137.68ms torch.cuda.memory_allocated()=866631680
+23:08:39.651: step:90/1000 train_loss:6.3196 train_time:11016ms step_avg:137.70ms torch.cuda.memory_allocated()=866631680
+23:08:39.790: step:91/1000 train_loss:6.1797 train_time:11156ms step_avg:137.72ms torch.cuda.memory_allocated()=866631680
+23:08:39.930: step:92/1000 train_loss:6.4792 train_time:11295ms step_avg:137.74ms torch.cuda.memory_allocated()=866631680
+23:08:40.068: step:93/1000 train_loss:6.9533 train_time:11433ms step_avg:137.75ms torch.cuda.memory_allocated()=866631680
+23:08:40.208: step:94/1000 train_loss:6.1342 train_time:11573ms step_avg:137.78ms torch.cuda.memory_allocated()=866631680
+23:08:40.348: step:95/1000 train_loss:6.2698 train_time:11713ms step_avg:137.80ms torch.cuda.memory_allocated()=866631680
+23:08:40.488: step:96/1000 train_loss:5.9585 train_time:11853ms step_avg:137.82ms torch.cuda.memory_allocated()=866631680
+23:08:40.627: step:97/1000 train_loss:6.0303 train_time:11992ms step_avg:137.84ms torch.cuda.memory_allocated()=866631680
+23:08:40.765: step:98/1000 train_loss:6.2985 train_time:12131ms step_avg:137.85ms torch.cuda.memory_allocated()=866631680
+23:08:40.904: step:99/1000 train_loss:5.7475 train_time:12269ms step_avg:137.86ms torch.cuda.memory_allocated()=866631680
+23:08:41.044: step:100/1000 train_loss:6.2163 train_time:12410ms step_avg:137.89ms torch.cuda.memory_allocated()=866631680
+23:08:41.183: step:101/1000 train_loss:6.1406 train_time:12549ms step_avg:137.90ms torch.cuda.memory_allocated()=866631680
+23:08:41.323: step:102/1000 train_loss:5.9131 train_time:12689ms step_avg:137.92ms torch.cuda.memory_allocated()=866631680
+23:08:41.462: step:103/1000 train_loss:6.0312 train_time:12828ms step_avg:137.93ms torch.cuda.memory_allocated()=866631680
+23:08:41.602: step:104/1000 train_loss:6.0130 train_time:12967ms step_avg:137.95ms torch.cuda.memory_allocated()=866631680
+23:08:41.741: step:105/1000 train_loss:6.0751 train_time:13106ms step_avg:137.96ms torch.cuda.memory_allocated()=866631680
+23:08:41.880: step:106/1000 train_loss:6.3722 train_time:13246ms step_avg:137.98ms torch.cuda.memory_allocated()=866631680
+23:08:42.019: step:107/1000 train_loss:6.1304 train_time:13384ms step_avg:137.98ms torch.cuda.memory_allocated()=866631680
+23:08:42.159: step:108/1000 train_loss:6.1917 train_time:13524ms step_avg:138.00ms torch.cuda.memory_allocated()=866631680
+23:08:42.299: step:109/1000 train_loss:6.1727 train_time:13664ms step_avg:138.02ms torch.cuda.memory_allocated()=866631680
+23:08:42.438: step:110/1000 train_loss:5.7326 train_time:13803ms step_avg:138.03ms torch.cuda.memory_allocated()=866631680
+23:08:42.577: step:111/1000 train_loss:6.0374 train_time:13943ms step_avg:138.05ms torch.cuda.memory_allocated()=866631680
+23:08:42.717: step:112/1000 train_loss:6.2036 train_time:14082ms step_avg:138.06ms torch.cuda.memory_allocated()=866631680
+23:08:42.856: step:113/1000 train_loss:5.9296 train_time:14222ms step_avg:138.07ms torch.cuda.memory_allocated()=866631680
+23:08:42.996: step:114/1000 train_loss:5.9499 train_time:14361ms step_avg:138.09ms torch.cuda.memory_allocated()=866631680
+23:08:43.135: step:115/1000 train_loss:5.8638 train_time:14500ms step_avg:138.10ms torch.cuda.memory_allocated()=866631680
+23:08:43.273: step:116/1000 train_loss:6.0656 train_time:14639ms step_avg:138.10ms torch.cuda.memory_allocated()=866631680
+23:08:43.414: step:117/1000 train_loss:6.1465 train_time:14779ms step_avg:138.12ms torch.cuda.memory_allocated()=866631680
+23:08:43.553: step:118/1000 train_loss:5.9678 train_time:14919ms step_avg:138.14ms torch.cuda.memory_allocated()=866631680
+23:08:43.693: step:119/1000 train_loss:5.8238 train_time:15058ms step_avg:138.15ms torch.cuda.memory_allocated()=866631680
+23:08:43.831: step:120/1000 train_loss:5.6990 train_time:15197ms step_avg:138.15ms torch.cuda.memory_allocated()=866631680
+23:08:43.971: step:121/1000 train_loss:6.4883 train_time:15336ms step_avg:138.16ms torch.cuda.memory_allocated()=866631680
+23:08:44.110: step:122/1000 train_loss:6.2897 train_time:15476ms step_avg:138.17ms torch.cuda.memory_allocated()=866631680
+23:08:44.250: step:123/1000 train_loss:6.0757 train_time:15615ms step_avg:138.19ms torch.cuda.memory_allocated()=866631680
+23:08:44.388: step:124/1000 train_loss:6.0568 train_time:15754ms step_avg:138.19ms torch.cuda.memory_allocated()=866631680
+23:08:44.529: step:125/1000 train_loss:6.0815 train_time:15894ms step_avg:138.21ms torch.cuda.memory_allocated()=866631680
+23:08:46.505: step:125/1000 val_loss:6.1040 train_time:15894ms step_avg:138.21ms
+23:08:46.646: step:126/1000 train_loss:6.4559 train_time:16035ms step_avg:138.23ms torch.cuda.memory_allocated()=866631680
+23:08:46.785: step:127/1000 train_loss:6.2889 train_time:16174ms step_avg:138.24ms torch.cuda.memory_allocated()=866631680
+23:08:46.927: step:128/1000 train_loss:6.0149 train_time:16316ms step_avg:138.27ms torch.cuda.memory_allocated()=866631680
+23:08:47.066: step:129/1000 train_loss:5.8043 train_time:16455ms step_avg:138.28ms torch.cuda.memory_allocated()=866631680
+23:08:47.207: step:130/1000 train_loss:6.2747 train_time:16596ms step_avg:138.30ms torch.cuda.memory_allocated()=866631680
+23:08:47.347: step:131/1000 train_loss:6.0064 train_time:16736ms step_avg:138.32ms torch.cuda.memory_allocated()=866631680
+23:08:47.487: step:132/1000 train_loss:6.0798 train_time:16876ms step_avg:138.33ms torch.cuda.memory_allocated()=866631680
+23:08:47.628: step:133/1000 train_loss:6.0686 train_time:17017ms step_avg:138.35ms torch.cuda.memory_allocated()=866631680
+23:08:47.768: step:134/1000 train_loss:5.9712 train_time:17157ms step_avg:138.36ms torch.cuda.memory_allocated()=866631680
+23:08:47.909: step:135/1000 train_loss:6.4912 train_time:17298ms step_avg:138.38ms torch.cuda.memory_allocated()=866631680
+23:08:48.048: step:136/1000 train_loss:6.0972 train_time:17437ms step_avg:138.39ms torch.cuda.memory_allocated()=866631680
+23:08:48.187: step:137/1000 train_loss:5.9755 train_time:17577ms step_avg:138.40ms torch.cuda.memory_allocated()=866631680
+23:08:48.328: step:138/1000 train_loss:5.9398 train_time:17717ms step_avg:138.41ms torch.cuda.memory_allocated()=866631680
+23:08:48.468: step:139/1000 train_loss:6.2210 train_time:17857ms step_avg:138.43ms torch.cuda.memory_allocated()=866631680
+23:08:48.609: step:140/1000 train_loss:5.6993 train_time:17998ms step_avg:138.44ms torch.cuda.memory_allocated()=866631680
+23:08:48.749: step:141/1000 train_loss:6.0178 train_time:18138ms step_avg:138.46ms torch.cuda.memory_allocated()=866631680
+23:08:48.889: step:142/1000 train_loss:5.9385 train_time:18278ms step_avg:138.47ms torch.cuda.memory_allocated()=866631680
+23:08:49.028: step:143/1000 train_loss:6.0088 train_time:18418ms step_avg:138.48ms torch.cuda.memory_allocated()=866631680
+23:08:49.168: step:144/1000 train_loss:6.3348 train_time:18557ms step_avg:138.48ms torch.cuda.memory_allocated()=866631680
+23:08:49.309: step:145/1000 train_loss:5.9538 train_time:18698ms step_avg:138.50ms torch.cuda.memory_allocated()=866631680
+23:08:49.448: step:146/1000 train_loss:6.1110 train_time:18838ms step_avg:138.51ms torch.cuda.memory_allocated()=866631680
+23:08:49.589: step:147/1000 train_loss:5.9404 train_time:18978ms step_avg:138.52ms torch.cuda.memory_allocated()=866631680
+23:08:49.728: step:148/1000 train_loss:5.6607 train_time:19117ms step_avg:138.53ms torch.cuda.memory_allocated()=866631680
+23:08:49.868: step:149/1000 train_loss:5.6771 train_time:19257ms step_avg:138.54ms torch.cuda.memory_allocated()=866631680
+23:08:50.010: step:150/1000 train_loss:5.6952 train_time:19399ms step_avg:138.56ms torch.cuda.memory_allocated()=866631680
+23:08:50.152: step:151/1000 train_loss:5.8052 train_time:19541ms step_avg:138.59ms torch.cuda.memory_allocated()=866631680
+23:08:50.293: step:152/1000 train_loss:6.0355 train_time:19683ms step_avg:138.61ms torch.cuda.memory_allocated()=866631680
+23:08:50.434: step:153/1000 train_loss:5.9001 train_time:19823ms step_avg:138.62ms torch.cuda.memory_allocated()=866631680
+23:08:50.576: step:154/1000 train_loss:5.9353 train_time:19965ms step_avg:138.64ms torch.cuda.memory_allocated()=866631680
+23:08:50.717: step:155/1000 train_loss:5.7340 train_time:20106ms step_avg:138.66ms torch.cuda.memory_allocated()=866631680
+23:08:50.858: step:156/1000 train_loss:6.0267 train_time:20247ms step_avg:138.68ms torch.cuda.memory_allocated()=866631680
+23:08:50.000: step:157/1000 train_loss:5.9662 train_time:20389ms step_avg:138.70ms torch.cuda.memory_allocated()=866631680
+23:08:51.142: step:158/1000 train_loss:5.9382 train_time:20531ms step_avg:138.72ms torch.cuda.memory_allocated()=866631680
+23:08:51.284: step:159/1000 train_loss:5.7971 train_time:20673ms step_avg:138.75ms torch.cuda.memory_allocated()=866631680
+23:08:51.425: step:160/1000 train_loss:5.8063 train_time:20814ms step_avg:138.76ms torch.cuda.memory_allocated()=866631680
+23:08:51.566: step:161/1000 train_loss:5.6776 train_time:20955ms step_avg:138.78ms torch.cuda.memory_allocated()=866631680
+23:08:51.707: step:162/1000 train_loss:5.8646 train_time:21096ms step_avg:138.79ms torch.cuda.memory_allocated()=866631680
+23:08:51.847: step:163/1000 train_loss:5.7731 train_time:21236ms step_avg:138.80ms torch.cuda.memory_allocated()=866631680
+23:08:51.989: step:164/1000 train_loss:5.6490 train_time:21378ms step_avg:138.82ms torch.cuda.memory_allocated()=866631680
+23:08:52.131: step:165/1000 train_loss:5.7606 train_time:21520ms step_avg:138.84ms torch.cuda.memory_allocated()=866631680
+23:08:52.274: step:166/1000 train_loss:5.6624 train_time:21663ms step_avg:138.87ms torch.cuda.memory_allocated()=866631680
+23:08:52.415: step:167/1000 train_loss:5.9096 train_time:21804ms step_avg:138.88ms torch.cuda.memory_allocated()=866631680
+23:08:52.557: step:168/1000 train_loss:5.9994 train_time:21946ms step_avg:138.90ms torch.cuda.memory_allocated()=866631680
+23:08:52.697: step:169/1000 train_loss:5.6436 train_time:22087ms step_avg:138.91ms torch.cuda.memory_allocated()=866631680
+23:08:52.838: step:170/1000 train_loss:5.6733 train_time:22227ms step_avg:138.92ms torch.cuda.memory_allocated()=866631680
+23:08:52.981: step:171/1000 train_loss:5.7871 train_time:22370ms step_avg:138.95ms torch.cuda.memory_allocated()=866631680
+23:08:53.121: step:172/1000 train_loss:5.7604 train_time:22511ms step_avg:138.95ms torch.cuda.memory_allocated()=866631680
+23:08:53.263: step:173/1000 train_loss:5.6098 train_time:22652ms step_avg:138.97ms torch.cuda.memory_allocated()=866631680
+23:08:53.405: step:174/1000 train_loss:5.9272 train_time:22794ms step_avg:138.99ms torch.cuda.memory_allocated()=866631680
+23:08:53.547: step:175/1000 train_loss:5.8529 train_time:22936ms step_avg:139.01ms torch.cuda.memory_allocated()=866631680
+23:08:53.689: step:176/1000 train_loss:5.8406 train_time:23078ms step_avg:139.02ms torch.cuda.memory_allocated()=866631680
+23:08:53.831: step:177/1000 train_loss:5.6884 train_time:23220ms step_avg:139.04ms torch.cuda.memory_allocated()=866631680
+23:08:53.973: step:178/1000 train_loss:5.8807 train_time:23362ms step_avg:139.06ms torch.cuda.memory_allocated()=866631680
+23:08:54.114: step:179/1000 train_loss:5.7187 train_time:23503ms step_avg:139.07ms torch.cuda.memory_allocated()=866631680
+23:08:54.255: step:180/1000 train_loss:5.6340 train_time:23644ms step_avg:139.08ms torch.cuda.memory_allocated()=866631680
+23:08:54.396: step:181/1000 train_loss:5.7903 train_time:23785ms step_avg:139.10ms torch.cuda.memory_allocated()=866631680
+23:08:54.540: step:182/1000 train_loss:5.5436 train_time:23929ms step_avg:139.12ms torch.cuda.memory_allocated()=866631680
+23:08:54.681: step:183/1000 train_loss:5.7193 train_time:24070ms step_avg:139.13ms torch.cuda.memory_allocated()=866631680
+23:08:54.823: step:184/1000 train_loss:5.8005 train_time:24212ms step_avg:139.15ms torch.cuda.memory_allocated()=866631680
+23:08:54.965: step:185/1000 train_loss:5.6370 train_time:24354ms step_avg:139.16ms torch.cuda.memory_allocated()=866631680
+23:08:55.106: step:186/1000 train_loss:5.7913 train_time:24495ms step_avg:139.18ms torch.cuda.memory_allocated()=866631680
+23:08:55.247: step:187/1000 train_loss:5.8413 train_time:24636ms step_avg:139.19ms torch.cuda.memory_allocated()=866631680
+23:08:55.388: step:188/1000 train_loss:6.0092 train_time:24778ms step_avg:139.20ms torch.cuda.memory_allocated()=866631680
+23:08:55.529: step:189/1000 train_loss:5.8417 train_time:24918ms step_avg:139.21ms torch.cuda.memory_allocated()=866631680
+23:08:55.671: step:190/1000 train_loss:5.8741 train_time:25060ms step_avg:139.22ms torch.cuda.memory_allocated()=866631680
+23:08:55.813: step:191/1000 train_loss:5.8693 train_time:25202ms step_avg:139.24ms torch.cuda.memory_allocated()=866631680
+23:08:55.953: step:192/1000 train_loss:6.0192 train_time:25342ms step_avg:139.24ms torch.cuda.memory_allocated()=866631680
+23:08:56.095: step:193/1000 train_loss:5.8261 train_time:25484ms step_avg:139.26ms torch.cuda.memory_allocated()=866631680
+23:08:56.237: step:194/1000 train_loss:5.7662 train_time:25626ms step_avg:139.27ms torch.cuda.memory_allocated()=866631680
+23:08:56.378: step:195/1000 train_loss:6.3188 train_time:25767ms step_avg:139.28ms torch.cuda.memory_allocated()=866631680
+23:08:56.519: step:196/1000 train_loss:6.0943 train_time:25908ms step_avg:139.29ms torch.cuda.memory_allocated()=866631680
+23:08:56.661: step:197/1000 train_loss:5.6684 train_time:26050ms step_avg:139.31ms torch.cuda.memory_allocated()=866631680
+23:08:56.804: step:198/1000 train_loss:5.7204 train_time:26193ms step_avg:139.32ms torch.cuda.memory_allocated()=866631680
+23:08:56.945: step:199/1000 train_loss:5.7350 train_time:26334ms step_avg:139.33ms torch.cuda.memory_allocated()=866631680
+23:08:57.086: step:200/1000 train_loss:5.7660 train_time:26475ms step_avg:139.34ms torch.cuda.memory_allocated()=866631680
+23:08:57.227: step:201/1000 train_loss:5.6378 train_time:26616ms step_avg:139.35ms torch.cuda.memory_allocated()=866631680
+23:08:57.371: step:202/1000 train_loss:5.8933 train_time:26760ms step_avg:139.37ms torch.cuda.memory_allocated()=866631680
+23:08:57.512: step:203/1000 train_loss:5.9578 train_time:26901ms step_avg:139.38ms torch.cuda.memory_allocated()=866631680
+23:08:57.654: step:204/1000 train_loss:5.4729 train_time:27043ms step_avg:139.40ms torch.cuda.memory_allocated()=866631680
+23:08:57.795: step:205/1000 train_loss:6.1616 train_time:27184ms step_avg:139.41ms torch.cuda.memory_allocated()=866631680
+23:08:57.937: step:206/1000 train_loss:6.1588 train_time:27326ms step_avg:139.42ms torch.cuda.memory_allocated()=866631680
+23:08:58.077: step:207/1000 train_loss:5.9414 train_time:27466ms step_avg:139.42ms torch.cuda.memory_allocated()=866631680
+23:08:58.219: step:208/1000 train_loss:5.9156 train_time:27608ms step_avg:139.43ms torch.cuda.memory_allocated()=866631680
+23:08:58.360: step:209/1000 train_loss:5.6884 train_time:27749ms step_avg:139.44ms torch.cuda.memory_allocated()=866631680
+23:08:58.501: step:210/1000 train_loss:5.9484 train_time:27890ms step_avg:139.45ms torch.cuda.memory_allocated()=866631680
+23:08:58.643: step:211/1000 train_loss:5.9362 train_time:28032ms step_avg:139.46ms torch.cuda.memory_allocated()=866631680
+23:08:58.784: step:212/1000 train_loss:5.9712 train_time:28173ms step_avg:139.47ms torch.cuda.memory_allocated()=866631680
+23:08:58.924: step:213/1000 train_loss:5.8080 train_time:28313ms step_avg:139.47ms torch.cuda.memory_allocated()=866631680
+23:08:59.066: step:214/1000 train_loss:5.6487 train_time:28455ms step_avg:139.48ms torch.cuda.memory_allocated()=866631680
+23:08:59.208: step:215/1000 train_loss:5.7968 train_time:28597ms step_avg:139.50ms torch.cuda.memory_allocated()=866631680
+23:08:59.352: step:216/1000 train_loss:5.9239 train_time:28742ms step_avg:139.52ms torch.cuda.memory_allocated()=866631680
+23:08:59.494: step:217/1000 train_loss:5.6188 train_time:28883ms step_avg:139.53ms torch.cuda.memory_allocated()=866631680
+23:08:59.636: step:218/1000 train_loss:5.7090 train_time:29025ms step_avg:139.54ms torch.cuda.memory_allocated()=866631680
+23:08:59.777: step:219/1000 train_loss:5.7565 train_time:29166ms step_avg:139.55ms torch.cuda.memory_allocated()=866631680
+23:08:59.919: step:220/1000 train_loss:5.7454 train_time:29308ms step_avg:139.56ms torch.cuda.memory_allocated()=866631680
+23:09:00.061: step:221/1000 train_loss:5.9433 train_time:29450ms step_avg:139.57ms torch.cuda.memory_allocated()=866631680
+23:09:00.202: step:222/1000 train_loss:5.8107 train_time:29591ms step_avg:139.58ms torch.cuda.memory_allocated()=866631680
+23:09:00.343: step:223/1000 train_loss:5.7663 train_time:29732ms step_avg:139.59ms torch.cuda.memory_allocated()=866631680
+23:09:00.492: step:224/1000 train_loss:5.6129 train_time:29881ms step_avg:139.63ms torch.cuda.memory_allocated()=866631680
+23:09:00.640: step:225/1000 train_loss:5.5688 train_time:30029ms step_avg:139.67ms torch.cuda.memory_allocated()=866631680
+23:09:00.788: step:226/1000 train_loss:6.3326 train_time:30177ms step_avg:139.71ms torch.cuda.memory_allocated()=866631680
+23:09:00.936: step:227/1000 train_loss:5.6464 train_time:30325ms step_avg:139.75ms torch.cuda.memory_allocated()=866631680
+23:09:01.084: step:228/1000 train_loss:5.6134 train_time:30473ms step_avg:139.79ms torch.cuda.memory_allocated()=866631680
+23:09:01.232: step:229/1000 train_loss:5.6392 train_time:30621ms step_avg:139.82ms torch.cuda.memory_allocated()=866631680
+23:09:01.380: step:230/1000 train_loss:5.6803 train_time:30769ms step_avg:139.86ms torch.cuda.memory_allocated()=866631680
+23:09:01.527: step:231/1000 train_loss:5.8531 train_time:30916ms step_avg:139.89ms torch.cuda.memory_allocated()=866631680
+23:09:01.674: step:232/1000 train_loss:5.5169 train_time:31063ms step_avg:139.93ms torch.cuda.memory_allocated()=866631680
+23:09:01.823: step:233/1000 train_loss:5.8514 train_time:31212ms step_avg:139.96ms torch.cuda.memory_allocated()=866631680
+23:09:01.970: step:234/1000 train_loss:5.4827 train_time:31360ms step_avg:140.00ms torch.cuda.memory_allocated()=866631680
+23:09:02.119: step:235/1000 train_loss:5.7699 train_time:31508ms step_avg:140.03ms torch.cuda.memory_allocated()=866631680
+23:09:02.265: step:236/1000 train_loss:5.5064 train_time:31654ms step_avg:140.06ms torch.cuda.memory_allocated()=866631680
+23:09:02.413: step:237/1000 train_loss:5.4157 train_time:31802ms step_avg:140.10ms torch.cuda.memory_allocated()=866631680
+23:09:02.561: step:238/1000 train_loss:5.5919 train_time:31950ms step_avg:140.13ms torch.cuda.memory_allocated()=866631680
+23:09:02.709: step:239/1000 train_loss:5.7091 train_time:32098ms step_avg:140.17ms torch.cuda.memory_allocated()=866631680
+23:09:02.857: step:240/1000 train_loss:5.4939 train_time:32246ms step_avg:140.20ms torch.cuda.memory_allocated()=866631680
+23:09:03.006: step:241/1000 train_loss:4.6780 train_time:32395ms step_avg:140.24ms torch.cuda.memory_allocated()=866631680
+23:09:03.153: step:242/1000 train_loss:5.6426 train_time:32542ms step_avg:140.27ms torch.cuda.memory_allocated()=866631680
+23:09:03.301: step:243/1000 train_loss:5.8051 train_time:32690ms step_avg:140.30ms torch.cuda.memory_allocated()=866631680
+23:09:03.449: step:244/1000 train_loss:5.5214 train_time:32838ms step_avg:140.33ms torch.cuda.memory_allocated()=866631680
+23:09:03.596: step:245/1000 train_loss:5.5402 train_time:32985ms step_avg:140.36ms torch.cuda.memory_allocated()=866631680
+23:09:03.744: step:246/1000 train_loss:5.6091 train_time:33133ms step_avg:140.39ms torch.cuda.memory_allocated()=866631680
+23:09:03.891: step:247/1000 train_loss:5.8073 train_time:33280ms step_avg:140.42ms torch.cuda.memory_allocated()=866631680
+23:09:04.040: step:248/1000 train_loss:5.5509 train_time:33429ms step_avg:140.46ms torch.cuda.memory_allocated()=866631680
+23:09:04.187: step:249/1000 train_loss:6.0488 train_time:33576ms step_avg:140.49ms torch.cuda.memory_allocated()=866631680
+23:09:04.335: step:250/1000 train_loss:5.6438 train_time:33724ms step_avg:140.52ms torch.cuda.memory_allocated()=866631680
+23:09:06.106: step:250/1000 val_loss:5.7043 train_time:33724ms step_avg:140.52ms
+23:09:06.254: step:251/1000 train_loss:5.4329 train_time:33872ms step_avg:140.55ms torch.cuda.memory_allocated()=866631680
+23:09:06.404: step:252/1000 train_loss:5.7314 train_time:34021ms step_avg:140.58ms torch.cuda.memory_allocated()=866631680
+23:09:06.550: step:253/1000 train_loss:5.4298 train_time:34168ms step_avg:140.61ms torch.cuda.memory_allocated()=866631680
+23:09:06.697: step:254/1000 train_loss:5.3867 train_time:34315ms step_avg:140.64ms torch.cuda.memory_allocated()=866631680
+23:09:06.845: step:255/1000 train_loss:5.4636 train_time:34463ms step_avg:140.66ms torch.cuda.memory_allocated()=866631680
+23:09:06.993: step:256/1000 train_loss:5.6443 train_time:34611ms step_avg:140.69ms torch.cuda.memory_allocated()=866631680
+23:09:07.141: step:257/1000 train_loss:5.8350 train_time:34759ms step_avg:140.72ms torch.cuda.memory_allocated()=866631680
+23:09:07.289: step:258/1000 train_loss:5.5900 train_time:34907ms step_avg:140.75ms torch.cuda.memory_allocated()=866631680
+23:09:07.437: step:259/1000 train_loss:5.6630 train_time:35055ms step_avg:140.78ms torch.cuda.memory_allocated()=866631680
+23:09:07.586: step:260/1000 train_loss:5.7024 train_time:35204ms step_avg:140.82ms torch.cuda.memory_allocated()=866631680
+23:09:07.733: step:261/1000 train_loss:5.8632 train_time:35351ms step_avg:140.84ms torch.cuda.memory_allocated()=866631680
+23:09:07.880: step:262/1000 train_loss:5.5288 train_time:35498ms step_avg:140.86ms torch.cuda.memory_allocated()=866631680
+23:09:08.027: step:263/1000 train_loss:5.6386 train_time:35645ms step_avg:140.89ms torch.cuda.memory_allocated()=866631680
+23:09:08.175: step:264/1000 train_loss:5.5983 train_time:35792ms step_avg:140.92ms torch.cuda.memory_allocated()=866631680
+23:09:08.322: step:265/1000 train_loss:5.7541 train_time:35940ms step_avg:140.94ms torch.cuda.memory_allocated()=866631680
+23:09:08.470: step:266/1000 train_loss:5.5218 train_time:36088ms step_avg:140.97ms torch.cuda.memory_allocated()=866631680
+23:09:08.618: step:267/1000 train_loss:5.7123 train_time:36235ms step_avg:140.99ms torch.cuda.memory_allocated()=866631680
+23:09:08.765: step:268/1000 train_loss:5.6639 train_time:36383ms step_avg:141.02ms torch.cuda.memory_allocated()=866631680
+23:09:08.912: step:269/1000 train_loss:5.7065 train_time:36530ms step_avg:141.04ms torch.cuda.memory_allocated()=866631680
+23:09:09.060: step:270/1000 train_loss:5.7630 train_time:36678ms step_avg:141.07ms torch.cuda.memory_allocated()=866631680
+23:09:09.208: step:271/1000 train_loss:5.6936 train_time:36826ms step_avg:141.10ms torch.cuda.memory_allocated()=866631680
+23:09:09.356: step:272/1000 train_loss:5.9340 train_time:36974ms step_avg:141.12ms torch.cuda.memory_allocated()=866631680
+23:09:09.505: step:273/1000 train_loss:5.7472 train_time:37123ms step_avg:141.15ms torch.cuda.memory_allocated()=866631680
+23:09:09.653: step:274/1000 train_loss:5.6740 train_time:37271ms step_avg:141.18ms torch.cuda.memory_allocated()=866631680
+23:09:09.801: step:275/1000 train_loss:5.6807 train_time:37419ms step_avg:141.20ms torch.cuda.memory_allocated()=866631680
+23:09:09.951: step:276/1000 train_loss:5.9356 train_time:37569ms step_avg:141.24ms torch.cuda.memory_allocated()=866631680
+23:09:10.098: step:277/1000 train_loss:5.5191 train_time:37716ms step_avg:141.26ms torch.cuda.memory_allocated()=866631680
+23:09:10.246: step:278/1000 train_loss:5.4777 train_time:37863ms step_avg:141.28ms torch.cuda.memory_allocated()=866631680
+23:09:10.393: step:279/1000 train_loss:5.6073 train_time:38011ms step_avg:141.31ms torch.cuda.memory_allocated()=866631680
+23:09:10.540: step:280/1000 train_loss:5.6527 train_time:38158ms step_avg:141.33ms torch.cuda.memory_allocated()=866631680
+23:09:10.688: step:281/1000 train_loss:5.4427 train_time:38306ms step_avg:141.35ms torch.cuda.memory_allocated()=866631680
+23:09:10.835: step:282/1000 train_loss:5.4978 train_time:38453ms step_avg:141.37ms torch.cuda.memory_allocated()=866631680
+23:09:10.983: step:283/1000 train_loss:5.3828 train_time:38601ms step_avg:141.40ms torch.cuda.memory_allocated()=866631680
+23:09:11.132: step:284/1000 train_loss:5.5936 train_time:38749ms step_avg:141.42ms torch.cuda.memory_allocated()=866631680
+23:09:11.281: step:285/1000 train_loss:5.8393 train_time:38898ms step_avg:141.45ms torch.cuda.memory_allocated()=866631680
+23:09:11.429: step:286/1000 train_loss:6.6926 train_time:39047ms step_avg:141.47ms torch.cuda.memory_allocated()=866631680
+23:09:11.577: step:287/1000 train_loss:6.1432 train_time:39194ms step_avg:141.50ms torch.cuda.memory_allocated()=866631680
+23:09:11.725: step:288/1000 train_loss:5.8482 train_time:39343ms step_avg:141.52ms torch.cuda.memory_allocated()=866631680
+23:09:11.872: step:289/1000 train_loss:5.8646 train_time:39490ms step_avg:141.54ms torch.cuda.memory_allocated()=866631680
+23:09:12.020: step:290/1000 train_loss:5.5971 train_time:39637ms step_avg:141.56ms torch.cuda.memory_allocated()=866631680
+23:09:12.166: step:291/1000 train_loss:5.1734 train_time:39784ms step_avg:141.58ms torch.cuda.memory_allocated()=866631680
+23:09:12.314: step:292/1000 train_loss:5.8665 train_time:39931ms step_avg:141.60ms torch.cuda.memory_allocated()=866631680
+23:09:12.461: step:293/1000 train_loss:5.3264 train_time:40078ms step_avg:141.62ms torch.cuda.memory_allocated()=866631680
+23:09:12.608: step:294/1000 train_loss:5.2797 train_time:40226ms step_avg:141.64ms torch.cuda.memory_allocated()=866631680
+23:09:12.756: step:295/1000 train_loss:5.5435 train_time:40373ms step_avg:141.66ms torch.cuda.memory_allocated()=866631680
+23:09:12.903: step:296/1000 train_loss:5.5441 train_time:40521ms step_avg:141.68ms torch.cuda.memory_allocated()=866631680
+23:09:13.050: step:297/1000 train_loss:5.4969 train_time:40668ms step_avg:141.70ms torch.cuda.memory_allocated()=866631680
+23:09:13.200: step:298/1000 train_loss:5.3097 train_time:40818ms step_avg:141.73ms torch.cuda.memory_allocated()=866631680
+23:09:13.350: step:299/1000 train_loss:5.7231 train_time:40967ms step_avg:141.76ms torch.cuda.memory_allocated()=866631680
+23:09:13.500: step:300/1000 train_loss:5.6073 train_time:41117ms step_avg:141.78ms torch.cuda.memory_allocated()=866631680
+23:09:13.648: step:301/1000 train_loss:5.4379 train_time:41266ms step_avg:141.81ms torch.cuda.memory_allocated()=866631680
+23:09:13.797: step:302/1000 train_loss:5.1486 train_time:41415ms step_avg:141.83ms torch.cuda.memory_allocated()=866631680
+23:09:13.946: step:303/1000 train_loss:5.3772 train_time:41564ms step_avg:141.86ms torch.cuda.memory_allocated()=866631680
+23:09:14.094: step:304/1000 train_loss:5.6023 train_time:41712ms step_avg:141.88ms torch.cuda.memory_allocated()=866631680
+23:09:14.244: step:305/1000 train_loss:5.4302 train_time:41861ms step_avg:141.90ms torch.cuda.memory_allocated()=866631680
+23:09:14.395: step:306/1000 train_loss:5.7060 train_time:42013ms step_avg:141.94ms torch.cuda.memory_allocated()=866631680
+23:09:14.544: step:307/1000 train_loss:5.4941 train_time:42162ms step_avg:141.96ms torch.cuda.memory_allocated()=866631680
+23:09:14.692: step:308/1000 train_loss:5.6128 train_time:42310ms step_avg:141.98ms torch.cuda.memory_allocated()=866631680
+23:09:14.841: step:309/1000 train_loss:5.3731 train_time:42459ms step_avg:142.00ms torch.cuda.memory_allocated()=866631680
+23:09:14.989: step:310/1000 train_loss:5.5199 train_time:42607ms step_avg:142.02ms torch.cuda.memory_allocated()=866631680
+23:09:15.138: step:311/1000 train_loss:5.3953 train_time:42755ms step_avg:142.04ms torch.cuda.memory_allocated()=866631680
+23:09:15.287: step:312/1000 train_loss:5.4929 train_time:42904ms step_avg:142.07ms torch.cuda.memory_allocated()=866631680
+23:09:15.436: step:313/1000 train_loss:5.3100 train_time:43054ms step_avg:142.09ms torch.cuda.memory_allocated()=866631680
+23:09:15.586: step:314/1000 train_loss:5.4781 train_time:43204ms step_avg:142.12ms torch.cuda.memory_allocated()=866631680
+23:09:15.734: step:315/1000 train_loss:5.6926 train_time:43352ms step_avg:142.14ms torch.cuda.memory_allocated()=866631680
+23:09:15.882: step:316/1000 train_loss:5.5793 train_time:43500ms step_avg:142.16ms torch.cuda.memory_allocated()=866631680
+23:09:16.030: step:317/1000 train_loss:5.4582 train_time:43648ms step_avg:142.18ms torch.cuda.memory_allocated()=866631680
+23:09:16.178: step:318/1000 train_loss:5.4348 train_time:43796ms step_avg:142.19ms torch.cuda.memory_allocated()=866631680
+23:09:16.327: step:319/1000 train_loss:5.5868 train_time:43945ms step_avg:142.22ms torch.cuda.memory_allocated()=866631680
+23:09:16.476: step:320/1000 train_loss:5.4028 train_time:44094ms step_avg:142.24ms torch.cuda.memory_allocated()=866631680
+23:09:16.626: step:321/1000 train_loss:5.3477 train_time:44244ms step_avg:142.26ms torch.cuda.memory_allocated()=866631680
+23:09:16.776: step:322/1000 train_loss:5.5321 train_time:44393ms step_avg:142.29ms torch.cuda.memory_allocated()=866631680
+23:09:16.923: step:323/1000 train_loss:5.6773 train_time:44541ms step_avg:142.30ms torch.cuda.memory_allocated()=866631680
+23:09:17.072: step:324/1000 train_loss:5.5811 train_time:44690ms step_avg:142.32ms torch.cuda.memory_allocated()=866631680
+23:09:17.220: step:325/1000 train_loss:5.4542 train_time:44838ms step_avg:142.34ms torch.cuda.memory_allocated()=866631680
+23:09:17.368: step:326/1000 train_loss:5.4934 train_time:44986ms step_avg:142.36ms torch.cuda.memory_allocated()=866631680
+23:09:17.516: step:327/1000 train_loss:5.5273 train_time:45134ms step_avg:142.38ms torch.cuda.memory_allocated()=866631680
+23:09:17.665: step:328/1000 train_loss:5.4894 train_time:45283ms step_avg:142.40ms torch.cuda.memory_allocated()=866631680
+23:09:17.813: step:329/1000 train_loss:5.5236 train_time:45431ms step_avg:142.42ms torch.cuda.memory_allocated()=866631680
+23:09:17.962: step:330/1000 train_loss:5.3641 train_time:45580ms step_avg:142.44ms torch.cuda.memory_allocated()=866631680
+23:09:18.111: step:331/1000 train_loss:5.3754 train_time:45729ms step_avg:142.46ms torch.cuda.memory_allocated()=866631680
+23:09:18.259: step:332/1000 train_loss:5.7850 train_time:45877ms step_avg:142.48ms torch.cuda.memory_allocated()=866631680
+23:09:18.407: step:333/1000 train_loss:5.3535 train_time:46025ms step_avg:142.49ms torch.cuda.memory_allocated()=866631680
+23:09:18.557: step:334/1000 train_loss:5.2555 train_time:46175ms step_avg:142.51ms torch.cuda.memory_allocated()=866631680
+23:09:18.706: step:335/1000 train_loss:5.5849 train_time:46324ms step_avg:142.54ms torch.cuda.memory_allocated()=866631680
+23:09:18.855: step:336/1000 train_loss:5.3163 train_time:46473ms step_avg:142.56ms torch.cuda.memory_allocated()=866631680
+23:09:19.005: step:337/1000 train_loss:5.5297 train_time:46623ms step_avg:142.58ms torch.cuda.memory_allocated()=866631680
+23:09:19.155: step:338/1000 train_loss:5.4676 train_time:46773ms step_avg:142.60ms torch.cuda.memory_allocated()=866631680
+23:09:19.305: step:339/1000 train_loss:5.5671 train_time:46923ms step_avg:142.62ms torch.cuda.memory_allocated()=866631680
+23:09:19.453: step:340/1000 train_loss:5.4387 train_time:47071ms step_avg:142.64ms torch.cuda.memory_allocated()=866631680
+23:09:19.602: step:341/1000 train_loss:5.2734 train_time:47220ms step_avg:142.66ms torch.cuda.memory_allocated()=866631680
+23:09:19.751: step:342/1000 train_loss:5.5057 train_time:47368ms step_avg:142.68ms torch.cuda.memory_allocated()=866631680
+23:09:19.900: step:343/1000 train_loss:5.3770 train_time:47518ms step_avg:142.70ms torch.cuda.memory_allocated()=866631680
+23:09:20.048: step:344/1000 train_loss:5.5803 train_time:47666ms step_avg:142.71ms torch.cuda.memory_allocated()=866631680
+23:09:20.197: step:345/1000 train_loss:5.4868 train_time:47815ms step_avg:142.73ms torch.cuda.memory_allocated()=866631680
+23:09:20.346: step:346/1000 train_loss:5.2351 train_time:47964ms step_avg:142.75ms torch.cuda.memory_allocated()=866631680
+23:09:20.494: step:347/1000 train_loss:5.4229 train_time:48111ms step_avg:142.76ms torch.cuda.memory_allocated()=866631680
+23:09:20.642: step:348/1000 train_loss:5.3653 train_time:48260ms step_avg:142.78ms torch.cuda.memory_allocated()=866631680
+23:09:20.790: step:349/1000 train_loss:6.1805 train_time:48408ms step_avg:142.80ms torch.cuda.memory_allocated()=866631680
+23:09:20.939: step:350/1000 train_loss:5.3789 train_time:48557ms step_avg:142.82ms torch.cuda.memory_allocated()=866631680
+23:09:21.088: step:351/1000 train_loss:5.5270 train_time:48706ms step_avg:142.83ms torch.cuda.memory_allocated()=866631680
+23:09:21.238: step:352/1000 train_loss:5.3360 train_time:48856ms step_avg:142.85ms torch.cuda.memory_allocated()=866631680
+23:09:21.386: step:353/1000 train_loss:5.4253 train_time:49004ms step_avg:142.87ms torch.cuda.memory_allocated()=866631680
+23:09:21.536: step:354/1000 train_loss:5.5577 train_time:49154ms step_avg:142.89ms torch.cuda.memory_allocated()=866631680
+23:09:21.685: step:355/1000 train_loss:5.3902 train_time:49303ms step_avg:142.91ms torch.cuda.memory_allocated()=866631680
+23:09:21.834: step:356/1000 train_loss:5.4210 train_time:49452ms step_avg:142.92ms torch.cuda.memory_allocated()=866631680
+23:09:21.983: step:357/1000 train_loss:5.4626 train_time:49601ms step_avg:142.94ms torch.cuda.memory_allocated()=866631680
+23:09:22.132: step:358/1000 train_loss:5.1449 train_time:49750ms step_avg:142.96ms torch.cuda.memory_allocated()=866631680
+23:09:22.281: step:359/1000 train_loss:5.6233 train_time:49898ms step_avg:142.98ms torch.cuda.memory_allocated()=866631680
+23:09:22.429: step:360/1000 train_loss:5.4518 train_time:50046ms step_avg:142.99ms torch.cuda.memory_allocated()=866631680
+23:09:22.577: step:361/1000 train_loss:5.5090 train_time:50195ms step_avg:143.00ms torch.cuda.memory_allocated()=866631680
+23:09:22.726: step:362/1000 train_loss:5.4829 train_time:50344ms step_avg:143.02ms torch.cuda.memory_allocated()=866631680
+23:09:22.876: step:363/1000 train_loss:5.4096 train_time:50494ms step_avg:143.04ms torch.cuda.memory_allocated()=866631680
+23:09:23.024: step:364/1000 train_loss:5.1719 train_time:50642ms step_avg:143.06ms torch.cuda.memory_allocated()=866631680
+23:09:23.172: step:365/1000 train_loss:5.3089 train_time:50790ms step_avg:143.07ms torch.cuda.memory_allocated()=866631680
+23:09:23.321: step:366/1000 train_loss:5.3934 train_time:50939ms step_avg:143.09ms torch.cuda.memory_allocated()=866631680
+23:09:23.469: step:367/1000 train_loss:5.1485 train_time:51087ms step_avg:143.10ms torch.cuda.memory_allocated()=866631680
+23:09:23.617: step:368/1000 train_loss:5.6815 train_time:51235ms step_avg:143.12ms torch.cuda.memory_allocated()=866631680
+23:09:23.766: step:369/1000 train_loss:5.3555 train_time:51384ms step_avg:143.13ms torch.cuda.memory_allocated()=866631680
+23:09:23.915: step:370/1000 train_loss:5.2689 train_time:51533ms step_avg:143.15ms torch.cuda.memory_allocated()=866631680
+23:09:24.064: step:371/1000 train_loss:5.4968 train_time:51682ms step_avg:143.16ms torch.cuda.memory_allocated()=866631680
+23:09:24.218: step:372/1000 train_loss:5.2266 train_time:51836ms step_avg:143.19ms torch.cuda.memory_allocated()=866631680
+23:09:24.372: step:373/1000 train_loss:5.5064 train_time:51990ms step_avg:143.22ms torch.cuda.memory_allocated()=866631680
+23:09:24.526: step:374/1000 train_loss:5.4931 train_time:52144ms step_avg:143.25ms torch.cuda.memory_allocated()=866631680
+23:09:24.680: step:375/1000 train_loss:5.6999 train_time:52298ms step_avg:143.28ms torch.cuda.memory_allocated()=866631680
+23:09:26.486: step:375/1000 val_loss:5.4205 train_time:52298ms step_avg:143.28ms
+23:09:26.641: step:376/1000 train_loss:5.7030 train_time:52452ms step_avg:143.31ms torch.cuda.memory_allocated()=866631680
+23:09:26.794: step:377/1000 train_loss:5.3865 train_time:52605ms step_avg:143.34ms torch.cuda.memory_allocated()=866631680
+23:09:26.947: step:378/1000 train_loss:5.5785 train_time:52759ms step_avg:143.37ms torch.cuda.memory_allocated()=866631680
+23:09:27.101: step:379/1000 train_loss:5.4609 train_time:52912ms step_avg:143.39ms torch.cuda.memory_allocated()=866631680
+23:09:27.254: step:380/1000 train_loss:5.2596 train_time:53066ms step_avg:143.42ms torch.cuda.memory_allocated()=866631680
+23:09:27.408: step:381/1000 train_loss:5.1934 train_time:53220ms step_avg:143.45ms torch.cuda.memory_allocated()=866631680
+23:09:27.561: step:382/1000 train_loss:5.4994 train_time:53373ms step_avg:143.48ms torch.cuda.memory_allocated()=866631680
+23:09:27.715: step:383/1000 train_loss:5.4470 train_time:53527ms step_avg:143.50ms torch.cuda.memory_allocated()=866631680
+23:09:27.868: step:384/1000 train_loss:5.3347 train_time:53680ms step_avg:143.53ms torch.cuda.memory_allocated()=866631680
+23:09:28.023: step:385/1000 train_loss:5.2724 train_time:53834ms step_avg:143.56ms torch.cuda.memory_allocated()=866631680
+23:09:28.176: step:386/1000 train_loss:5.2530 train_time:53988ms step_avg:143.58ms torch.cuda.memory_allocated()=866631680
+23:09:28.329: step:387/1000 train_loss:5.4050 train_time:54141ms step_avg:143.61ms torch.cuda.memory_allocated()=866631680
+23:09:28.484: step:388/1000 train_loss:5.3423 train_time:54295ms step_avg:143.64ms torch.cuda.memory_allocated()=866631680
+23:09:28.637: step:389/1000 train_loss:5.2886 train_time:54449ms step_avg:143.66ms torch.cuda.memory_allocated()=866631680
+23:09:28.790: step:390/1000 train_loss:5.4626 train_time:54602ms step_avg:143.69ms torch.cuda.memory_allocated()=866631680
+23:09:28.944: step:391/1000 train_loss:5.3585 train_time:54755ms step_avg:143.71ms torch.cuda.memory_allocated()=866631680
+23:09:29.097: step:392/1000 train_loss:5.3718 train_time:54908ms step_avg:143.74ms torch.cuda.memory_allocated()=866631680
+23:09:29.251: step:393/1000 train_loss:5.4974 train_time:55062ms step_avg:143.77ms torch.cuda.memory_allocated()=866631680
+23:09:29.406: step:394/1000 train_loss:5.5700 train_time:55218ms step_avg:143.80ms torch.cuda.memory_allocated()=866631680
+23:09:29.560: step:395/1000 train_loss:5.4843 train_time:55372ms step_avg:143.82ms torch.cuda.memory_allocated()=866631680
+23:09:29.714: step:396/1000 train_loss:5.3459 train_time:55526ms step_avg:143.85ms torch.cuda.memory_allocated()=866631680
+23:09:29.869: step:397/1000 train_loss:5.3873 train_time:55680ms step_avg:143.88ms torch.cuda.memory_allocated()=866631680
+23:09:30.024: step:398/1000 train_loss:5.2260 train_time:55835ms step_avg:143.91ms torch.cuda.memory_allocated()=866631680
+23:09:30.179: step:399/1000 train_loss:5.5946 train_time:55990ms step_avg:143.93ms torch.cuda.memory_allocated()=866631680
+23:09:30.333: step:400/1000 train_loss:5.2807 train_time:56144ms step_avg:143.96ms torch.cuda.memory_allocated()=866631680
+23:09:30.486: step:401/1000 train_loss:5.2855 train_time:56298ms step_avg:143.98ms torch.cuda.memory_allocated()=866631680
+23:09:30.641: step:402/1000 train_loss:5.3982 train_time:56452ms step_avg:144.01ms torch.cuda.memory_allocated()=866631680
+23:09:30.794: step:403/1000 train_loss:5.4548 train_time:56605ms step_avg:144.03ms torch.cuda.memory_allocated()=866631680
+23:09:30.948: step:404/1000 train_loss:5.2805 train_time:56760ms step_avg:144.06ms torch.cuda.memory_allocated()=866631680
+23:09:31.103: step:405/1000 train_loss:5.2029 train_time:56914ms step_avg:144.09ms torch.cuda.memory_allocated()=866631680
+23:09:31.258: step:406/1000 train_loss:5.1523 train_time:57069ms step_avg:144.11ms torch.cuda.memory_allocated()=866631680
+23:09:31.411: step:407/1000 train_loss:5.4283 train_time:57223ms step_avg:144.14ms torch.cuda.memory_allocated()=866631680
+23:09:31.564: step:408/1000 train_loss:5.1500 train_time:57376ms step_avg:144.16ms torch.cuda.memory_allocated()=866631680
+23:09:31.718: step:409/1000 train_loss:5.5757 train_time:57529ms step_avg:144.18ms torch.cuda.memory_allocated()=866631680
+23:09:31.871: step:410/1000 train_loss:5.3755 train_time:57683ms step_avg:144.21ms torch.cuda.memory_allocated()=866631680
+23:09:32.024: step:411/1000 train_loss:5.3080 train_time:57836ms step_avg:144.23ms torch.cuda.memory_allocated()=866631680
+23:09:32.178: step:412/1000 train_loss:5.5407 train_time:57989ms step_avg:144.25ms torch.cuda.memory_allocated()=866631680
+23:09:32.333: step:413/1000 train_loss:5.4051 train_time:58144ms step_avg:144.28ms torch.cuda.memory_allocated()=866631680
+23:09:32.486: step:414/1000 train_loss:5.1151 train_time:58298ms step_avg:144.30ms torch.cuda.memory_allocated()=866631680
+23:09:32.641: step:415/1000 train_loss:5.2415 train_time:58452ms step_avg:144.33ms torch.cuda.memory_allocated()=866631680
+23:09:32.795: step:416/1000 train_loss:5.2627 train_time:58607ms step_avg:144.35ms torch.cuda.memory_allocated()=866631680
+23:09:32.950: step:417/1000 train_loss:5.2006 train_time:58761ms step_avg:144.38ms torch.cuda.memory_allocated()=866631680
+23:09:33.105: step:418/1000 train_loss:5.2582 train_time:58916ms step_avg:144.40ms torch.cuda.memory_allocated()=866631680
+23:09:33.258: step:419/1000 train_loss:5.3940 train_time:59069ms step_avg:144.42ms torch.cuda.memory_allocated()=866631680
+23:09:33.412: step:420/1000 train_loss:5.2829 train_time:59224ms step_avg:144.45ms torch.cuda.memory_allocated()=866631680
+23:09:33.568: step:421/1000 train_loss:5.3801 train_time:59379ms step_avg:144.47ms torch.cuda.memory_allocated()=866631680
+23:09:33.720: step:422/1000 train_loss:5.3745 train_time:59532ms step_avg:144.49ms torch.cuda.memory_allocated()=866631680
+23:09:33.874: step:423/1000 train_loss:5.2647 train_time:59685ms step_avg:144.52ms torch.cuda.memory_allocated()=866631680
+23:09:34.027: step:424/1000 train_loss:5.2853 train_time:59838ms step_avg:144.54ms torch.cuda.memory_allocated()=866631680
+23:09:34.181: step:425/1000 train_loss:4.9569 train_time:59993ms step_avg:144.56ms torch.cuda.memory_allocated()=866631680
+23:09:34.335: step:426/1000 train_loss:5.0917 train_time:60146ms step_avg:144.58ms torch.cuda.memory_allocated()=866631680
+23:09:34.490: step:427/1000 train_loss:5.1595 train_time:60301ms step_avg:144.61ms torch.cuda.memory_allocated()=866631680
+23:09:34.644: step:428/1000 train_loss:5.1772 train_time:60455ms step_avg:144.63ms torch.cuda.memory_allocated()=866631680
+23:09:34.797: step:429/1000 train_loss:5.5116 train_time:60608ms step_avg:144.65ms torch.cuda.memory_allocated()=866631680
+23:09:34.950: step:430/1000 train_loss:5.8195 train_time:60761ms step_avg:144.67ms torch.cuda.memory_allocated()=866631680
+23:09:35.103: step:431/1000 train_loss:5.3054 train_time:60915ms step_avg:144.69ms torch.cuda.memory_allocated()=866631680
+23:09:35.257: step:432/1000 train_loss:5.1939 train_time:61069ms step_avg:144.71ms torch.cuda.memory_allocated()=866631680
+23:09:35.411: step:433/1000 train_loss:5.3402 train_time:61223ms step_avg:144.73ms torch.cuda.memory_allocated()=866631680
+23:09:35.564: step:434/1000 train_loss:5.4369 train_time:61376ms step_avg:144.75ms torch.cuda.memory_allocated()=866631680
+23:09:35.719: step:435/1000 train_loss:5.1332 train_time:61530ms step_avg:144.78ms torch.cuda.memory_allocated()=866631680
+23:09:35.872: step:436/1000 train_loss:5.0734 train_time:61683ms step_avg:144.80ms torch.cuda.memory_allocated()=866631680
+23:09:36.024: step:437/1000 train_loss:5.0804 train_time:61836ms step_avg:144.81ms torch.cuda.memory_allocated()=866631680
+23:09:36.178: step:438/1000 train_loss:5.1437 train_time:61989ms step_avg:144.83ms torch.cuda.memory_allocated()=866631680
+23:09:36.332: step:439/1000 train_loss:4.9060 train_time:62143ms step_avg:144.86ms torch.cuda.memory_allocated()=866631680
+23:09:36.485: step:440/1000 train_loss:4.9779 train_time:62297ms step_avg:144.88ms torch.cuda.memory_allocated()=866631680
+23:09:36.639: step:441/1000 train_loss:5.2180 train_time:62451ms step_avg:144.90ms torch.cuda.memory_allocated()=866631680
+23:09:36.792: step:442/1000 train_loss:5.1897 train_time:62604ms step_avg:144.92ms torch.cuda.memory_allocated()=866631680
+23:09:36.946: step:443/1000 train_loss:5.3023 train_time:62758ms step_avg:144.94ms torch.cuda.memory_allocated()=866631680
+23:09:37.103: step:444/1000 train_loss:5.1075 train_time:62915ms step_avg:144.96ms torch.cuda.memory_allocated()=866631680
+23:09:37.257: step:445/1000 train_loss:5.2954 train_time:63068ms step_avg:144.98ms torch.cuda.memory_allocated()=866631680
+23:09:37.412: step:446/1000 train_loss:5.2426 train_time:63223ms step_avg:145.01ms torch.cuda.memory_allocated()=866631680
+23:09:37.566: step:447/1000 train_loss:5.2952 train_time:63377ms step_avg:145.03ms torch.cuda.memory_allocated()=866631680
+23:09:37.720: step:448/1000 train_loss:5.2976 train_time:63532ms step_avg:145.05ms torch.cuda.memory_allocated()=866631680
+23:09:37.877: step:449/1000 train_loss:5.1168 train_time:63689ms step_avg:145.08ms torch.cuda.memory_allocated()=866631680
+23:09:38.032: step:450/1000 train_loss:5.2882 train_time:63843ms step_avg:145.10ms torch.cuda.memory_allocated()=866631680
+23:09:38.187: step:451/1000 train_loss:5.1696 train_time:63999ms step_avg:145.12ms torch.cuda.memory_allocated()=866631680
+23:09:38.343: step:452/1000 train_loss:5.2548 train_time:64155ms step_avg:145.15ms torch.cuda.memory_allocated()=866631680
+23:09:38.497: step:453/1000 train_loss:5.0779 train_time:64309ms step_avg:145.17ms torch.cuda.memory_allocated()=866631680
+23:09:38.651: step:454/1000 train_loss:5.1824 train_time:64462ms step_avg:145.18ms torch.cuda.memory_allocated()=866631680
+23:09:38.806: step:455/1000 train_loss:5.2385 train_time:64617ms step_avg:145.21ms torch.cuda.memory_allocated()=866631680
+23:09:38.960: step:456/1000 train_loss:5.3613 train_time:64772ms step_avg:145.23ms torch.cuda.memory_allocated()=866631680
+23:09:39.116: step:457/1000 train_loss:5.2082 train_time:64927ms step_avg:145.25ms torch.cuda.memory_allocated()=866631680
+23:09:39.271: step:458/1000 train_loss:5.1715 train_time:65082ms step_avg:145.27ms torch.cuda.memory_allocated()=866631680
+23:09:39.426: step:459/1000 train_loss:5.1711 train_time:65237ms step_avg:145.29ms torch.cuda.memory_allocated()=866631680
+23:09:39.580: step:460/1000 train_loss:5.2912 train_time:65392ms step_avg:145.32ms torch.cuda.memory_allocated()=866631680
+23:09:39.734: step:461/1000 train_loss:5.1014 train_time:65546ms step_avg:145.33ms torch.cuda.memory_allocated()=866631680
+23:09:39.891: step:462/1000 train_loss:5.0843 train_time:65702ms step_avg:145.36ms torch.cuda.memory_allocated()=866631680
+23:09:40.046: step:463/1000 train_loss:5.3748 train_time:65858ms step_avg:145.38ms torch.cuda.memory_allocated()=866631680
+23:09:40.203: step:464/1000 train_loss:5.3815 train_time:66015ms step_avg:145.41ms torch.cuda.memory_allocated()=866631680
+23:09:40.357: step:465/1000 train_loss:5.2842 train_time:66169ms step_avg:145.43ms torch.cuda.memory_allocated()=866631680
+23:09:40.512: step:466/1000 train_loss:5.3547 train_time:66324ms step_avg:145.45ms torch.cuda.memory_allocated()=866631680
+23:09:40.666: step:467/1000 train_loss:5.2025 train_time:66478ms step_avg:145.47ms torch.cuda.memory_allocated()=866631680
+23:09:40.821: step:468/1000 train_loss:5.1234 train_time:66632ms step_avg:145.48ms torch.cuda.memory_allocated()=866631680
+23:09:40.975: step:469/1000 train_loss:5.2770 train_time:66787ms step_avg:145.50ms torch.cuda.memory_allocated()=866631680
+23:09:41.129: step:470/1000 train_loss:5.0452 train_time:66940ms step_avg:145.52ms torch.cuda.memory_allocated()=866631680
+23:09:41.285: step:471/1000 train_loss:5.1354 train_time:67096ms step_avg:145.54ms torch.cuda.memory_allocated()=866631680
+23:09:41.438: step:472/1000 train_loss:5.3210 train_time:67250ms step_avg:145.56ms torch.cuda.memory_allocated()=866631680
+23:09:41.592: step:473/1000 train_loss:5.1600 train_time:67404ms step_avg:145.58ms torch.cuda.memory_allocated()=866631680
+23:09:41.748: step:474/1000 train_loss:5.4245 train_time:67559ms step_avg:145.60ms torch.cuda.memory_allocated()=866631680
+23:09:41.904: step:475/1000 train_loss:5.5037 train_time:67715ms step_avg:145.62ms torch.cuda.memory_allocated()=866631680
+23:09:42.059: step:476/1000 train_loss:5.3311 train_time:67870ms step_avg:145.64ms torch.cuda.memory_allocated()=866631680
+23:09:42.212: step:477/1000 train_loss:5.0479 train_time:68024ms step_avg:145.66ms torch.cuda.memory_allocated()=866631680
+23:09:42.368: step:478/1000 train_loss:5.2034 train_time:68179ms step_avg:145.68ms torch.cuda.memory_allocated()=866631680
+23:09:42.522: step:479/1000 train_loss:5.5431 train_time:68333ms step_avg:145.70ms torch.cuda.memory_allocated()=866631680
+23:09:42.676: step:480/1000 train_loss:5.0020 train_time:68487ms step_avg:145.72ms torch.cuda.memory_allocated()=866631680
+23:09:42.831: step:481/1000 train_loss:5.3639 train_time:68642ms step_avg:145.74ms torch.cuda.memory_allocated()=866631680
+23:09:42.986: step:482/1000 train_loss:5.0274 train_time:68797ms step_avg:145.76ms torch.cuda.memory_allocated()=866631680
+23:09:43.139: step:483/1000 train_loss:5.0849 train_time:68950ms step_avg:145.77ms torch.cuda.memory_allocated()=866631680
+23:09:43.294: step:484/1000 train_loss:5.2197 train_time:69106ms step_avg:145.79ms torch.cuda.memory_allocated()=866631680
+23:09:43.448: step:485/1000 train_loss:5.2870 train_time:69259ms step_avg:145.81ms torch.cuda.memory_allocated()=866631680
+23:09:43.602: step:486/1000 train_loss:5.1262 train_time:69413ms step_avg:145.83ms torch.cuda.memory_allocated()=866631680
+23:09:43.757: step:487/1000 train_loss:5.1736 train_time:69568ms step_avg:145.85ms torch.cuda.memory_allocated()=866631680
+23:09:43.912: step:488/1000 train_loss:5.0929 train_time:69723ms step_avg:145.86ms torch.cuda.memory_allocated()=866631680
+23:09:44.065: step:489/1000 train_loss:5.0484 train_time:69877ms step_avg:145.88ms torch.cuda.memory_allocated()=866631680
+23:09:44.220: step:490/1000 train_loss:5.2924 train_time:70032ms step_avg:145.90ms torch.cuda.memory_allocated()=866631680
+23:09:44.374: step:491/1000 train_loss:4.9533 train_time:70185ms step_avg:145.92ms torch.cuda.memory_allocated()=866631680
+23:09:44.529: step:492/1000 train_loss:5.0370 train_time:70340ms step_avg:145.93ms torch.cuda.memory_allocated()=866631680
+23:09:44.683: step:493/1000 train_loss:4.8857 train_time:70494ms step_avg:145.95ms torch.cuda.memory_allocated()=866631680
+23:09:44.837: step:494/1000 train_loss:5.5465 train_time:70648ms step_avg:145.97ms torch.cuda.memory_allocated()=866631680
+23:09:44.993: step:495/1000 train_loss:4.8231 train_time:70804ms step_avg:145.99ms torch.cuda.memory_allocated()=866631680
+23:09:45.146: step:496/1000 train_loss:4.9625 train_time:70958ms step_avg:146.00ms torch.cuda.memory_allocated()=866631680
+23:09:45.301: step:497/1000 train_loss:4.9589 train_time:71112ms step_avg:146.02ms torch.cuda.memory_allocated()=866631680
+23:09:45.454: step:498/1000 train_loss:5.0424 train_time:71265ms step_avg:146.04ms torch.cuda.memory_allocated()=866631680
+23:09:45.609: step:499/1000 train_loss:5.2358 train_time:71420ms step_avg:146.05ms torch.cuda.memory_allocated()=866631680
+23:09:45.763: step:500/1000 train_loss:4.8955 train_time:71575ms step_avg:146.07ms torch.cuda.memory_allocated()=866631680
+23:09:47.577: step:500/1000 val_loss:5.1694 train_time:71575ms step_avg:146.07ms
+23:09:47.732: step:501/1000 train_loss:4.7643 train_time:71730ms step_avg:146.09ms torch.cuda.memory_allocated()=866631680
+23:09:47.888: step:502/1000 train_loss:5.1757 train_time:71886ms step_avg:146.11ms torch.cuda.memory_allocated()=866631680
+23:09:48.042: step:503/1000 train_loss:5.1143 train_time:72040ms step_avg:146.13ms torch.cuda.memory_allocated()=866631680
+23:09:48.197: step:504/1000 train_loss:5.1071 train_time:72195ms step_avg:146.14ms torch.cuda.memory_allocated()=866631680
+23:09:48.352: step:505/1000 train_loss:5.3415 train_time:72350ms step_avg:146.16ms torch.cuda.memory_allocated()=866631680
+23:09:48.506: step:506/1000 train_loss:5.2867 train_time:72504ms step_avg:146.18ms torch.cuda.memory_allocated()=866631680
+23:09:48.662: step:507/1000 train_loss:5.3259 train_time:72659ms step_avg:146.20ms torch.cuda.memory_allocated()=866631680
+23:09:48.815: step:508/1000 train_loss:5.0935 train_time:72813ms step_avg:146.21ms torch.cuda.memory_allocated()=866631680
+23:09:48.969: step:509/1000 train_loss:5.0374 train_time:72967ms step_avg:146.23ms torch.cuda.memory_allocated()=866631680
+23:09:49.125: step:510/1000 train_loss:4.8447 train_time:73122ms step_avg:146.24ms torch.cuda.memory_allocated()=866631680
+23:09:49.281: step:511/1000 train_loss:5.2799 train_time:73279ms step_avg:146.26ms torch.cuda.memory_allocated()=866631680
+23:09:49.436: step:512/1000 train_loss:5.1814 train_time:73433ms step_avg:146.28ms torch.cuda.memory_allocated()=866631680
+23:09:49.591: step:513/1000 train_loss:5.1421 train_time:73589ms step_avg:146.30ms torch.cuda.memory_allocated()=866631680
+23:09:49.744: step:514/1000 train_loss:5.3700 train_time:73742ms step_avg:146.31ms torch.cuda.memory_allocated()=866631680
+23:09:49.898: step:515/1000 train_loss:5.2188 train_time:73896ms step_avg:146.33ms torch.cuda.memory_allocated()=866631680
+23:09:50.053: step:516/1000 train_loss:5.2272 train_time:74051ms step_avg:146.35ms torch.cuda.memory_allocated()=866631680
+23:09:50.207: step:517/1000 train_loss:5.0379 train_time:74205ms step_avg:146.36ms torch.cuda.memory_allocated()=866631680
+23:09:50.362: step:518/1000 train_loss:5.0296 train_time:74359ms step_avg:146.38ms torch.cuda.memory_allocated()=866631680
+23:09:50.516: step:519/1000 train_loss:5.2626 train_time:74514ms step_avg:146.39ms torch.cuda.memory_allocated()=866631680
+23:09:50.675: step:520/1000 train_loss:5.0963 train_time:74673ms step_avg:146.42ms torch.cuda.memory_allocated()=866631680
+23:09:50.834: step:521/1000 train_loss:4.6354 train_time:74832ms step_avg:146.44ms torch.cuda.memory_allocated()=866631680
+23:09:50.992: step:522/1000 train_loss:4.9360 train_time:74989ms step_avg:146.46ms torch.cuda.memory_allocated()=866631680
+23:09:51.151: step:523/1000 train_loss:5.0803 train_time:75149ms step_avg:146.49ms torch.cuda.memory_allocated()=866631680
+23:09:51.311: step:524/1000 train_loss:5.0298 train_time:75309ms step_avg:146.52ms torch.cuda.memory_allocated()=866631680
+23:09:51.470: step:525/1000 train_loss:4.8688 train_time:75467ms step_avg:146.54ms torch.cuda.memory_allocated()=866631680
+23:09:51.627: step:526/1000 train_loss:5.0544 train_time:75625ms step_avg:146.56ms torch.cuda.memory_allocated()=866631680
+23:09:51.786: step:527/1000 train_loss:5.2608 train_time:75784ms step_avg:146.58ms torch.cuda.memory_allocated()=866631680
+23:09:51.947: step:528/1000 train_loss:5.0386 train_time:75945ms step_avg:146.61ms torch.cuda.memory_allocated()=866631680
+23:09:52.105: step:529/1000 train_loss:4.9303 train_time:76103ms step_avg:146.63ms torch.cuda.memory_allocated()=866631680
+23:09:52.261: step:530/1000 train_loss:5.0947 train_time:76259ms step_avg:146.65ms torch.cuda.memory_allocated()=866631680
+23:09:52.419: step:531/1000 train_loss:4.8668 train_time:76417ms step_avg:146.67ms torch.cuda.memory_allocated()=866631680
+23:09:52.577: step:532/1000 train_loss:5.1108 train_time:76575ms step_avg:146.69ms torch.cuda.memory_allocated()=866631680
+23:09:52.736: step:533/1000 train_loss:5.0635 train_time:76734ms step_avg:146.72ms torch.cuda.memory_allocated()=866631680
+23:09:52.892: step:534/1000 train_loss:5.1476 train_time:76890ms step_avg:146.74ms torch.cuda.memory_allocated()=866631680
+23:09:53.052: step:535/1000 train_loss:5.1852 train_time:77050ms step_avg:146.76ms torch.cuda.memory_allocated()=866631680
+23:09:53.209: step:536/1000 train_loss:5.2886 train_time:77207ms step_avg:146.78ms torch.cuda.memory_allocated()=866631680
+23:09:53.371: step:537/1000 train_loss:4.8267 train_time:77369ms step_avg:146.81ms torch.cuda.memory_allocated()=866631680
+23:09:53.530: step:538/1000 train_loss:4.9061 train_time:77528ms step_avg:146.83ms torch.cuda.memory_allocated()=866631680
+23:09:53.689: step:539/1000 train_loss:5.6332 train_time:77687ms step_avg:146.86ms torch.cuda.memory_allocated()=866631680
+23:09:53.850: step:540/1000 train_loss:5.1631 train_time:77847ms step_avg:146.88ms torch.cuda.memory_allocated()=866631680
+23:09:54.008: step:541/1000 train_loss:4.8977 train_time:78006ms step_avg:146.90ms torch.cuda.memory_allocated()=866631680
+23:09:54.166: step:542/1000 train_loss:5.0471 train_time:78164ms step_avg:146.92ms torch.cuda.memory_allocated()=866631680
+23:09:54.325: step:543/1000 train_loss:5.5830 train_time:78323ms step_avg:146.95ms torch.cuda.memory_allocated()=866631680
+23:09:54.485: step:544/1000 train_loss:4.9485 train_time:78482ms step_avg:146.97ms torch.cuda.memory_allocated()=866631680
+23:09:54.642: step:545/1000 train_loss:5.0997 train_time:78640ms step_avg:146.99ms torch.cuda.memory_allocated()=866631680
+23:09:54.800: step:546/1000 train_loss:5.1831 train_time:78798ms step_avg:147.01ms torch.cuda.memory_allocated()=866631680
+23:09:54.960: step:547/1000 train_loss:5.0272 train_time:78958ms step_avg:147.04ms torch.cuda.memory_allocated()=866631680
+23:09:55.119: step:548/1000 train_loss:4.8932 train_time:79117ms step_avg:147.06ms torch.cuda.memory_allocated()=866631680
+23:09:55.279: step:549/1000 train_loss:5.2730 train_time:79276ms step_avg:147.08ms torch.cuda.memory_allocated()=866631680
+23:09:55.438: step:550/1000 train_loss:4.8100 train_time:79435ms step_avg:147.10ms torch.cuda.memory_allocated()=866631680
+23:09:55.596: step:551/1000 train_loss:5.3038 train_time:79594ms step_avg:147.12ms torch.cuda.memory_allocated()=866631680
+23:09:55.754: step:552/1000 train_loss:5.0821 train_time:79752ms step_avg:147.14ms torch.cuda.memory_allocated()=866631680
+23:09:55.916: step:553/1000 train_loss:5.2669 train_time:79913ms step_avg:147.17ms torch.cuda.memory_allocated()=866631680
+23:09:56.078: step:554/1000 train_loss:4.9562 train_time:80076ms step_avg:147.20ms torch.cuda.memory_allocated()=866631680
+23:09:56.236: step:555/1000 train_loss:5.1796 train_time:80234ms step_avg:147.22ms torch.cuda.memory_allocated()=866631680
+23:09:56.395: step:556/1000 train_loss:5.1045 train_time:80392ms step_avg:147.24ms torch.cuda.memory_allocated()=866631680
+23:09:56.552: step:557/1000 train_loss:5.2005 train_time:80550ms step_avg:147.26ms torch.cuda.memory_allocated()=866631680
+23:09:56.713: step:558/1000 train_loss:5.1870 train_time:80711ms step_avg:147.28ms torch.cuda.memory_allocated()=866631680
+23:09:56.873: step:559/1000 train_loss:5.4438 train_time:80871ms step_avg:147.31ms torch.cuda.memory_allocated()=866631680
+23:09:57.032: step:560/1000 train_loss:5.0130 train_time:81030ms step_avg:147.33ms torch.cuda.memory_allocated()=866631680
+23:09:57.191: step:561/1000 train_loss:5.1460 train_time:81189ms step_avg:147.35ms torch.cuda.memory_allocated()=866631680
+23:09:57.352: step:562/1000 train_loss:5.2593 train_time:81349ms step_avg:147.37ms torch.cuda.memory_allocated()=866631680
+23:09:57.514: step:563/1000 train_loss:5.5480 train_time:81511ms step_avg:147.40ms torch.cuda.memory_allocated()=866631680
+23:09:57.677: step:564/1000 train_loss:5.4960 train_time:81675ms step_avg:147.43ms torch.cuda.memory_allocated()=866631680
+23:09:57.836: step:565/1000 train_loss:5.0318 train_time:81834ms step_avg:147.45ms torch.cuda.memory_allocated()=866631680
+23:09:57.994: step:566/1000 train_loss:5.1833 train_time:81992ms step_avg:147.47ms torch.cuda.memory_allocated()=866631680
+23:09:58.153: step:567/1000 train_loss:4.9223 train_time:82151ms step_avg:147.49ms torch.cuda.memory_allocated()=866631680
+23:09:58.312: step:568/1000 train_loss:4.8180 train_time:82310ms step_avg:147.51ms torch.cuda.memory_allocated()=866631680
+23:09:58.471: step:569/1000 train_loss:5.2664 train_time:82469ms step_avg:147.53ms torch.cuda.memory_allocated()=866631680
+23:09:58.628: step:570/1000 train_loss:4.9860 train_time:82626ms step_avg:147.55ms torch.cuda.memory_allocated()=866631680
+23:09:58.786: step:571/1000 train_loss:5.0504 train_time:82784ms step_avg:147.56ms torch.cuda.memory_allocated()=866631680
+23:09:58.944: step:572/1000 train_loss:5.0941 train_time:82942ms step_avg:147.58ms torch.cuda.memory_allocated()=866631680
+23:09:59.104: step:573/1000 train_loss:5.1298 train_time:83101ms step_avg:147.60ms torch.cuda.memory_allocated()=866631680
+23:09:59.261: step:574/1000 train_loss:5.0042 train_time:83259ms step_avg:147.62ms torch.cuda.memory_allocated()=866631680
+23:09:59.420: step:575/1000 train_loss:5.0698 train_time:83418ms step_avg:147.64ms torch.cuda.memory_allocated()=866631680
+23:09:59.577: step:576/1000 train_loss:5.2511 train_time:83575ms step_avg:147.66ms torch.cuda.memory_allocated()=866631680
+23:09:59.736: step:577/1000 train_loss:4.9484 train_time:83733ms step_avg:147.68ms torch.cuda.memory_allocated()=866631680
+23:09:59.894: step:578/1000 train_loss:5.3950 train_time:83892ms step_avg:147.70ms torch.cuda.memory_allocated()=866631680
+23:10:00.054: step:579/1000 train_loss:5.1417 train_time:84052ms step_avg:147.72ms torch.cuda.memory_allocated()=866631680
+23:10:00.213: step:580/1000 train_loss:4.7533 train_time:84211ms step_avg:147.74ms torch.cuda.memory_allocated()=866631680
+23:10:00.373: step:581/1000 train_loss:5.1232 train_time:84370ms step_avg:147.76ms torch.cuda.memory_allocated()=866631680
+23:10:00.530: step:582/1000 train_loss:5.2220 train_time:84528ms step_avg:147.78ms torch.cuda.memory_allocated()=866631680
+23:10:00.692: step:583/1000 train_loss:4.9290 train_time:84690ms step_avg:147.80ms torch.cuda.memory_allocated()=866631680
+23:10:00.849: step:584/1000 train_loss:5.1327 train_time:84847ms step_avg:147.82ms torch.cuda.memory_allocated()=866631680
+23:10:01.006: step:585/1000 train_loss:5.1794 train_time:85004ms step_avg:147.83ms torch.cuda.memory_allocated()=866631680
+23:10:01.167: step:586/1000 train_loss:5.2460 train_time:85165ms step_avg:147.86ms torch.cuda.memory_allocated()=866631680
+23:10:01.326: step:587/1000 train_loss:5.0564 train_time:85324ms step_avg:147.88ms torch.cuda.memory_allocated()=866631680
+23:10:01.484: step:588/1000 train_loss:5.1179 train_time:85482ms step_avg:147.89ms torch.cuda.memory_allocated()=866631680
+23:10:01.643: step:589/1000 train_loss:5.3726 train_time:85640ms step_avg:147.91ms torch.cuda.memory_allocated()=866631680
+23:10:01.804: step:590/1000 train_loss:6.3146 train_time:85802ms step_avg:147.93ms torch.cuda.memory_allocated()=866631680
+23:10:01.962: step:591/1000 train_loss:5.2239 train_time:85960ms step_avg:147.95ms torch.cuda.memory_allocated()=866631680
+23:10:02.117: step:592/1000 train_loss:5.0589 train_time:86115ms step_avg:147.96ms torch.cuda.memory_allocated()=866631680
+23:10:02.276: step:593/1000 train_loss:4.7420 train_time:86274ms step_avg:147.98ms torch.cuda.memory_allocated()=866631680
+23:10:02.435: step:594/1000 train_loss:4.9736 train_time:86433ms step_avg:148.00ms torch.cuda.memory_allocated()=866631680
+23:10:02.594: step:595/1000 train_loss:5.1550 train_time:86591ms step_avg:148.02ms torch.cuda.memory_allocated()=866631680
+23:10:02.753: step:596/1000 train_loss:4.8776 train_time:86751ms step_avg:148.04ms torch.cuda.memory_allocated()=866631680
+23:10:02.914: step:597/1000 train_loss:5.0051 train_time:86911ms step_avg:148.06ms torch.cuda.memory_allocated()=866631680
+23:10:03.075: step:598/1000 train_loss:5.1081 train_time:87073ms step_avg:148.08ms torch.cuda.memory_allocated()=866631680
+23:10:03.233: step:599/1000 train_loss:4.9616 train_time:87231ms step_avg:148.10ms torch.cuda.memory_allocated()=866631680
+23:10:03.394: step:600/1000 train_loss:5.7972 train_time:87392ms step_avg:148.12ms torch.cuda.memory_allocated()=866631680
+23:10:03.554: step:601/1000 train_loss:4.6759 train_time:87551ms step_avg:148.14ms torch.cuda.memory_allocated()=866631680
+23:10:03.713: step:602/1000 train_loss:5.0060 train_time:87711ms step_avg:148.16ms torch.cuda.memory_allocated()=866631680
+23:10:03.871: step:603/1000 train_loss:5.0443 train_time:87869ms step_avg:148.18ms torch.cuda.memory_allocated()=866631680
+23:10:04.029: step:604/1000 train_loss:5.1477 train_time:88027ms step_avg:148.19ms torch.cuda.memory_allocated()=866631680
+23:10:04.187: step:605/1000 train_loss:4.9765 train_time:88185ms step_avg:148.21ms torch.cuda.memory_allocated()=866631680
+23:10:04.348: step:606/1000 train_loss:5.0651 train_time:88346ms step_avg:148.23ms torch.cuda.memory_allocated()=866631680
+23:10:04.505: step:607/1000 train_loss:5.1406 train_time:88503ms step_avg:148.25ms torch.cuda.memory_allocated()=866631680
+23:10:04.665: step:608/1000 train_loss:5.3272 train_time:88663ms step_avg:148.27ms torch.cuda.memory_allocated()=866631680
+23:10:04.823: step:609/1000 train_loss:4.9768 train_time:88821ms step_avg:148.28ms torch.cuda.memory_allocated()=866631680
+23:10:04.983: step:610/1000 train_loss:4.9353 train_time:88980ms step_avg:148.30ms torch.cuda.memory_allocated()=866631680
+23:10:05.143: step:611/1000 train_loss:4.5773 train_time:89140ms step_avg:148.32ms torch.cuda.memory_allocated()=866631680
+23:10:05.302: step:612/1000 train_loss:4.6617 train_time:89300ms step_avg:148.34ms torch.cuda.memory_allocated()=866631680
+23:10:05.460: step:613/1000 train_loss:4.8311 train_time:89458ms step_avg:148.36ms torch.cuda.memory_allocated()=866631680
+23:10:05.621: step:614/1000 train_loss:4.8883 train_time:89619ms step_avg:148.38ms torch.cuda.memory_allocated()=866631680
+23:10:05.782: step:615/1000 train_loss:4.8333 train_time:89780ms step_avg:148.40ms torch.cuda.memory_allocated()=866631680
+23:10:05.939: step:616/1000 train_loss:4.9681 train_time:89937ms step_avg:148.41ms torch.cuda.memory_allocated()=866631680
+23:10:06.099: step:617/1000 train_loss:4.9325 train_time:90097ms step_avg:148.43ms torch.cuda.memory_allocated()=866631680
+23:10:06.257: step:618/1000 train_loss:5.1576 train_time:90255ms step_avg:148.45ms torch.cuda.memory_allocated()=866631680
+23:10:06.416: step:619/1000 train_loss:5.0777 train_time:90414ms step_avg:148.46ms torch.cuda.memory_allocated()=866631680
+23:10:06.574: step:620/1000 train_loss:5.0287 train_time:90572ms step_avg:148.48ms torch.cuda.memory_allocated()=866631680
+23:10:06.732: step:621/1000 train_loss:5.0497 train_time:90730ms step_avg:148.49ms torch.cuda.memory_allocated()=866631680
+23:10:06.893: step:622/1000 train_loss:4.8970 train_time:90891ms step_avg:148.51ms torch.cuda.memory_allocated()=866631680
+23:10:07.053: step:623/1000 train_loss:4.9441 train_time:91051ms step_avg:148.53ms torch.cuda.memory_allocated()=866631680
+23:10:07.213: step:624/1000 train_loss:5.0822 train_time:91210ms step_avg:148.55ms torch.cuda.memory_allocated()=866631680
+23:10:07.370: step:625/1000 train_loss:4.9924 train_time:91367ms step_avg:148.56ms torch.cuda.memory_allocated()=866631680
+23:10:09.205: step:625/1000 val_loss:5.0039 train_time:91368ms step_avg:148.57ms
+23:10:09.364: step:626/1000 train_loss:5.1434 train_time:91526ms step_avg:148.58ms torch.cuda.memory_allocated()=866631680
+23:10:09.522: step:627/1000 train_loss:5.0941 train_time:91684ms step_avg:148.60ms torch.cuda.memory_allocated()=866631680
+23:10:09.682: step:628/1000 train_loss:5.3636 train_time:91844ms step_avg:148.61ms torch.cuda.memory_allocated()=866631680
+23:10:09.842: step:629/1000 train_loss:4.9144 train_time:92004ms step_avg:148.63ms torch.cuda.memory_allocated()=866631680
+23:10:09.003: step:630/1000 train_loss:5.0664 train_time:92165ms step_avg:148.65ms torch.cuda.memory_allocated()=866631680
+23:10:10.162: step:631/1000 train_loss:5.0991 train_time:92323ms step_avg:148.67ms torch.cuda.memory_allocated()=866631680
+23:10:10.322: step:632/1000 train_loss:4.8629 train_time:92484ms step_avg:148.69ms torch.cuda.memory_allocated()=866631680
+23:10:10.481: step:633/1000 train_loss:5.0559 train_time:92643ms step_avg:148.70ms torch.cuda.memory_allocated()=866631680
+23:10:10.642: step:634/1000 train_loss:4.7816 train_time:92804ms step_avg:148.72ms torch.cuda.memory_allocated()=866631680
+23:10:10.800: step:635/1000 train_loss:4.9988 train_time:92961ms step_avg:148.74ms torch.cuda.memory_allocated()=866631680
+23:10:10.959: step:636/1000 train_loss:5.1368 train_time:93121ms step_avg:148.76ms torch.cuda.memory_allocated()=866631680
+23:10:11.115: step:637/1000 train_loss:5.1479 train_time:93277ms step_avg:148.77ms torch.cuda.memory_allocated()=866631680
+23:10:11.273: step:638/1000 train_loss:5.0848 train_time:93435ms step_avg:148.78ms torch.cuda.memory_allocated()=866631680
+23:10:11.430: step:639/1000 train_loss:4.9539 train_time:93591ms step_avg:148.79ms torch.cuda.memory_allocated()=866631680
+23:10:11.586: step:640/1000 train_loss:4.8437 train_time:93748ms step_avg:148.81ms torch.cuda.memory_allocated()=866631680
+23:10:11.745: step:641/1000 train_loss:4.8199 train_time:93907ms step_avg:148.82ms torch.cuda.memory_allocated()=866631680
+23:10:11.903: step:642/1000 train_loss:5.0211 train_time:94065ms step_avg:148.84ms torch.cuda.memory_allocated()=866631680
+23:10:12.064: step:643/1000 train_loss:4.9800 train_time:94226ms step_avg:148.86ms torch.cuda.memory_allocated()=866631680
+23:10:12.224: step:644/1000 train_loss:5.0865 train_time:94386ms step_avg:148.87ms torch.cuda.memory_allocated()=866631680
+23:10:12.383: step:645/1000 train_loss:5.1220 train_time:94545ms step_avg:148.89ms torch.cuda.memory_allocated()=866631680
+23:10:12.546: step:646/1000 train_loss:4.9589 train_time:94707ms step_avg:148.91ms torch.cuda.memory_allocated()=866631680
+23:10:12.707: step:647/1000 train_loss:4.9953 train_time:94869ms step_avg:148.93ms torch.cuda.memory_allocated()=866631680
+23:10:12.866: step:648/1000 train_loss:4.9853 train_time:95027ms step_avg:148.95ms torch.cuda.memory_allocated()=866631680
+23:10:13.023: step:649/1000 train_loss:5.0630 train_time:95185ms step_avg:148.96ms torch.cuda.memory_allocated()=866631680
+23:10:13.181: step:650/1000 train_loss:4.8971 train_time:95343ms step_avg:148.97ms torch.cuda.memory_allocated()=866631680
+23:10:13.341: step:651/1000 train_loss:4.8838 train_time:95502ms step_avg:148.99ms torch.cuda.memory_allocated()=866631680
+23:10:13.501: step:652/1000 train_loss:4.6709 train_time:95663ms step_avg:149.01ms torch.cuda.memory_allocated()=866631680
+23:10:13.660: step:653/1000 train_loss:4.7140 train_time:95822ms step_avg:149.02ms torch.cuda.memory_allocated()=866631680
+23:10:13.820: step:654/1000 train_loss:4.7692 train_time:95981ms step_avg:149.04ms torch.cuda.memory_allocated()=866631680
+23:10:13.978: step:655/1000 train_loss:4.8347 train_time:96140ms step_avg:149.05ms torch.cuda.memory_allocated()=866631680
+23:10:14.138: step:656/1000 train_loss:5.0992 train_time:96300ms step_avg:149.07ms torch.cuda.memory_allocated()=866631680
+23:10:14.295: step:657/1000 train_loss:5.0257 train_time:96457ms step_avg:149.08ms torch.cuda.memory_allocated()=866631680
+23:10:14.454: step:658/1000 train_loss:4.9790 train_time:96616ms step_avg:149.10ms torch.cuda.memory_allocated()=866631680
+23:10:14.614: step:659/1000 train_loss:5.3618 train_time:96776ms step_avg:149.12ms torch.cuda.memory_allocated()=866631680
+23:10:14.773: step:660/1000 train_loss:5.3367 train_time:96935ms step_avg:149.13ms torch.cuda.memory_allocated()=866631680
+23:10:14.930: step:661/1000 train_loss:4.9853 train_time:97091ms step_avg:149.14ms torch.cuda.memory_allocated()=866631680
+23:10:15.089: step:662/1000 train_loss:4.8246 train_time:97250ms step_avg:149.16ms torch.cuda.memory_allocated()=866631680
+23:10:15.247: step:663/1000 train_loss:4.9225 train_time:97408ms step_avg:149.17ms torch.cuda.memory_allocated()=866631680
+23:10:15.405: step:664/1000 train_loss:4.9739 train_time:97567ms step_avg:149.19ms torch.cuda.memory_allocated()=866631680
+23:10:15.563: step:665/1000 train_loss:5.1553 train_time:97724ms step_avg:149.20ms torch.cuda.memory_allocated()=866631680
+23:10:15.722: step:666/1000 train_loss:5.3289 train_time:97884ms step_avg:149.21ms torch.cuda.memory_allocated()=866631680
+23:10:15.880: step:667/1000 train_loss:4.8773 train_time:98042ms step_avg:149.23ms torch.cuda.memory_allocated()=866631680
+23:10:16.041: step:668/1000 train_loss:5.1069 train_time:98203ms step_avg:149.24ms torch.cuda.memory_allocated()=866631680
+23:10:16.204: step:669/1000 train_loss:5.0653 train_time:98366ms step_avg:149.27ms torch.cuda.memory_allocated()=866631680
+23:10:16.364: step:670/1000 train_loss:4.9171 train_time:98526ms step_avg:149.28ms torch.cuda.memory_allocated()=866631680
+23:10:16.526: step:671/1000 train_loss:5.0170 train_time:98688ms step_avg:149.30ms torch.cuda.memory_allocated()=866631680
+23:10:16.685: step:672/1000 train_loss:4.9253 train_time:98847ms step_avg:149.32ms torch.cuda.memory_allocated()=866631680
+23:10:16.848: step:673/1000 train_loss:5.1800 train_time:99009ms step_avg:149.34ms torch.cuda.memory_allocated()=866631680
+23:10:17.016: step:674/1000 train_loss:5.3765 train_time:99178ms step_avg:149.36ms torch.cuda.memory_allocated()=866631680
+23:10:17.177: step:675/1000 train_loss:4.9128 train_time:99339ms step_avg:149.38ms torch.cuda.memory_allocated()=866631680
+23:10:17.341: step:676/1000 train_loss:4.8948 train_time:99502ms step_avg:149.40ms torch.cuda.memory_allocated()=866631680
+23:10:17.506: step:677/1000 train_loss:5.0220 train_time:99668ms step_avg:149.43ms torch.cuda.memory_allocated()=866631680
+23:10:17.675: step:678/1000 train_loss:5.1439 train_time:99837ms step_avg:149.46ms torch.cuda.memory_allocated()=866631680
+23:10:17.833: step:679/1000 train_loss:4.9930 train_time:99995ms step_avg:149.47ms torch.cuda.memory_allocated()=866631680
+23:10:17.002: step:680/1000 train_loss:4.8177 train_time:100163ms step_avg:149.50ms torch.cuda.memory_allocated()=866631680
+23:10:18.170: step:681/1000 train_loss:4.8068 train_time:100332ms step_avg:149.53ms torch.cuda.memory_allocated()=866631680
+23:10:18.337: step:682/1000 train_loss:4.8635 train_time:100499ms step_avg:149.55ms torch.cuda.memory_allocated()=866631680
+23:10:18.500: step:683/1000 train_loss:4.8711 train_time:100662ms step_avg:149.57ms torch.cuda.memory_allocated()=866631680
+23:10:18.664: step:684/1000 train_loss:5.0073 train_time:100825ms step_avg:149.59ms torch.cuda.memory_allocated()=866631680
+23:10:18.827: step:685/1000 train_loss:5.3102 train_time:100989ms step_avg:149.61ms torch.cuda.memory_allocated()=866631680
+23:10:18.993: step:686/1000 train_loss:4.9615 train_time:101154ms step_avg:149.64ms torch.cuda.memory_allocated()=866631680
+23:10:19.154: step:687/1000 train_loss:4.8275 train_time:101315ms step_avg:149.65ms torch.cuda.memory_allocated()=866631680
+23:10:19.319: step:688/1000 train_loss:5.5758 train_time:101480ms step_avg:149.68ms torch.cuda.memory_allocated()=866631680
+23:10:19.479: step:689/1000 train_loss:4.6521 train_time:101641ms step_avg:149.69ms torch.cuda.memory_allocated()=866631680
+23:10:19.640: step:690/1000 train_loss:4.8455 train_time:101802ms step_avg:149.71ms torch.cuda.memory_allocated()=866631680
+23:10:19.804: step:691/1000 train_loss:4.9195 train_time:101966ms step_avg:149.73ms torch.cuda.memory_allocated()=866631680
+23:10:19.966: step:692/1000 train_loss:4.6948 train_time:102128ms step_avg:149.75ms torch.cuda.memory_allocated()=866631680
+23:10:20.130: step:693/1000 train_loss:4.8237 train_time:102292ms step_avg:149.77ms torch.cuda.memory_allocated()=866631680
+23:10:20.298: step:694/1000 train_loss:5.2860 train_time:102459ms step_avg:149.79ms torch.cuda.memory_allocated()=866631680
+23:10:20.458: step:695/1000 train_loss:4.8204 train_time:102620ms step_avg:149.81ms torch.cuda.memory_allocated()=866631680
+23:10:20.622: step:696/1000 train_loss:4.9721 train_time:102784ms step_avg:149.83ms torch.cuda.memory_allocated()=866631680
+23:10:20.785: step:697/1000 train_loss:5.1340 train_time:102947ms step_avg:149.85ms torch.cuda.memory_allocated()=866631680
+23:10:20.945: step:698/1000 train_loss:4.7576 train_time:103107ms step_avg:149.86ms torch.cuda.memory_allocated()=866631680
+23:10:21.105: step:699/1000 train_loss:5.0629 train_time:103267ms step_avg:149.88ms torch.cuda.memory_allocated()=866631680
+23:10:21.273: step:700/1000 train_loss:5.8282 train_time:103434ms step_avg:149.90ms torch.cuda.memory_allocated()=866631680
+23:10:21.437: step:701/1000 train_loss:4.6243 train_time:103598ms step_avg:149.93ms torch.cuda.memory_allocated()=866631680
+23:10:21.600: step:702/1000 train_loss:4.7028 train_time:103762ms step_avg:149.95ms torch.cuda.memory_allocated()=866631680
+23:10:21.762: step:703/1000 train_loss:4.9899 train_time:103924ms step_avg:149.96ms torch.cuda.memory_allocated()=866631680
+23:10:21.925: step:704/1000 train_loss:5.0347 train_time:104086ms step_avg:149.98ms torch.cuda.memory_allocated()=866631680
+23:10:22.087: step:705/1000 train_loss:5.0835 train_time:104248ms step_avg:150.00ms torch.cuda.memory_allocated()=866631680
+23:10:22.245: step:706/1000 train_loss:4.8692 train_time:104406ms step_avg:150.01ms torch.cuda.memory_allocated()=866631680
+23:10:22.406: step:707/1000 train_loss:5.1257 train_time:104568ms step_avg:150.03ms torch.cuda.memory_allocated()=866631680
+23:10:22.570: step:708/1000 train_loss:4.8498 train_time:104732ms step_avg:150.05ms torch.cuda.memory_allocated()=866631680
+23:10:22.732: step:709/1000 train_loss:4.8359 train_time:104893ms step_avg:150.06ms torch.cuda.memory_allocated()=866631680
+23:10:22.893: step:710/1000 train_loss:4.9422 train_time:105055ms step_avg:150.08ms torch.cuda.memory_allocated()=866631680
+23:10:23.060: step:711/1000 train_loss:5.0166 train_time:105221ms step_avg:150.10ms torch.cuda.memory_allocated()=866631680
+23:10:23.221: step:712/1000 train_loss:5.0161 train_time:105382ms step_avg:150.12ms torch.cuda.memory_allocated()=866631680
+23:10:23.384: step:713/1000 train_loss:5.3756 train_time:105545ms step_avg:150.14ms torch.cuda.memory_allocated()=866631680
+23:10:23.547: step:714/1000 train_loss:4.9053 train_time:105708ms step_avg:150.15ms torch.cuda.memory_allocated()=866631680
+23:10:23.713: step:715/1000 train_loss:4.6464 train_time:105875ms step_avg:150.18ms torch.cuda.memory_allocated()=866631680
+23:10:23.874: step:716/1000 train_loss:4.8568 train_time:106036ms step_avg:150.19ms torch.cuda.memory_allocated()=866631680
+23:10:24.037: step:717/1000 train_loss:4.7353 train_time:106199ms step_avg:150.21ms torch.cuda.memory_allocated()=866631680
+23:10:24.199: step:718/1000 train_loss:4.8471 train_time:106360ms step_avg:150.23ms torch.cuda.memory_allocated()=866631680
+23:10:24.364: step:719/1000 train_loss:4.8737 train_time:106525ms step_avg:150.25ms torch.cuda.memory_allocated()=866631680
+23:10:24.528: step:720/1000 train_loss:4.7180 train_time:106689ms step_avg:150.27ms torch.cuda.memory_allocated()=866631680
+23:10:24.689: step:721/1000 train_loss:4.9788 train_time:106851ms step_avg:150.28ms torch.cuda.memory_allocated()=866631680
+23:10:24.851: step:722/1000 train_loss:5.0229 train_time:107013ms step_avg:150.30ms torch.cuda.memory_allocated()=866631680
+23:10:25.013: step:723/1000 train_loss:4.6806 train_time:107175ms step_avg:150.32ms torch.cuda.memory_allocated()=866631680
+23:10:25.174: step:724/1000 train_loss:4.7945 train_time:107335ms step_avg:150.33ms torch.cuda.memory_allocated()=866631680
+23:10:25.339: step:725/1000 train_loss:4.9541 train_time:107501ms step_avg:150.35ms torch.cuda.memory_allocated()=866631680
+23:10:25.500: step:726/1000 train_loss:4.9486 train_time:107662ms step_avg:150.37ms torch.cuda.memory_allocated()=866631680
+23:10:25.661: step:727/1000 train_loss:4.9006 train_time:107823ms step_avg:150.38ms torch.cuda.memory_allocated()=866631680
+23:10:25.822: step:728/1000 train_loss:4.9507 train_time:107984ms step_avg:150.40ms torch.cuda.memory_allocated()=866631680
+23:10:25.984: step:729/1000 train_loss:4.7367 train_time:108146ms step_avg:150.41ms torch.cuda.memory_allocated()=866631680
+23:10:26.143: step:730/1000 train_loss:4.9220 train_time:108305ms step_avg:150.42ms torch.cuda.memory_allocated()=866631680
+23:10:26.306: step:731/1000 train_loss:4.7214 train_time:108467ms step_avg:150.44ms torch.cuda.memory_allocated()=866631680
+23:10:26.465: step:732/1000 train_loss:4.6738 train_time:108627ms step_avg:150.45ms torch.cuda.memory_allocated()=866631680
+23:10:26.629: step:733/1000 train_loss:4.4592 train_time:108791ms step_avg:150.47ms torch.cuda.memory_allocated()=866631680
+23:10:26.793: step:734/1000 train_loss:4.6257 train_time:108954ms step_avg:150.49ms torch.cuda.memory_allocated()=866631680
+23:10:26.953: step:735/1000 train_loss:4.8927 train_time:109114ms step_avg:150.50ms torch.cuda.memory_allocated()=866631680
+23:10:27.120: step:736/1000 train_loss:4.8503 train_time:109282ms step_avg:150.53ms torch.cuda.memory_allocated()=866631680
+23:10:27.285: step:737/1000 train_loss:5.5421 train_time:109447ms step_avg:150.55ms torch.cuda.memory_allocated()=866631680
+23:10:27.448: step:738/1000 train_loss:5.0730 train_time:109609ms step_avg:150.56ms torch.cuda.memory_allocated()=866631680
+23:10:27.610: step:739/1000 train_loss:4.9292 train_time:109772ms step_avg:150.58ms torch.cuda.memory_allocated()=866631680
+23:10:27.772: step:740/1000 train_loss:4.8001 train_time:109934ms step_avg:150.59ms torch.cuda.memory_allocated()=866631680
+23:10:27.934: step:741/1000 train_loss:4.7904 train_time:110096ms step_avg:150.61ms torch.cuda.memory_allocated()=866631680
+23:10:28.097: step:742/1000 train_loss:4.8665 train_time:110258ms step_avg:150.63ms torch.cuda.memory_allocated()=866631680
+23:10:28.260: step:743/1000 train_loss:4.7643 train_time:110421ms step_avg:150.64ms torch.cuda.memory_allocated()=866631680
+23:10:28.422: step:744/1000 train_loss:4.7187 train_time:110584ms step_avg:150.66ms torch.cuda.memory_allocated()=866631680
+23:10:28.587: step:745/1000 train_loss:4.8247 train_time:110748ms step_avg:150.68ms torch.cuda.memory_allocated()=866631680
+23:10:28.749: step:746/1000 train_loss:4.8940 train_time:110910ms step_avg:150.69ms torch.cuda.memory_allocated()=866631680
+23:10:28.911: step:747/1000 train_loss:4.9058 train_time:111073ms step_avg:150.71ms torch.cuda.memory_allocated()=866631680
+23:10:29.077: step:748/1000 train_loss:4.6603 train_time:111238ms step_avg:150.73ms torch.cuda.memory_allocated()=866631680
+23:10:29.240: step:749/1000 train_loss:4.8766 train_time:111402ms step_avg:150.75ms torch.cuda.memory_allocated()=866631680
+23:10:29.405: step:750/1000 train_loss:4.9124 train_time:111567ms step_avg:150.77ms torch.cuda.memory_allocated()=866631680
+23:10:31.269: step:750/1000 val_loss:4.8551 train_time:111567ms step_avg:150.77ms
+23:10:31.431: step:751/1000 train_loss:4.8611 train_time:111729ms step_avg:150.78ms torch.cuda.memory_allocated()=866631680
+23:10:31.597: step:752/1000 train_loss:4.9523 train_time:111895ms step_avg:150.80ms torch.cuda.memory_allocated()=866631680
+23:10:31.761: step:753/1000 train_loss:4.7006 train_time:112059ms step_avg:150.82ms torch.cuda.memory_allocated()=866631680
+23:10:31.921: step:754/1000 train_loss:5.1768 train_time:112219ms step_avg:150.83ms torch.cuda.memory_allocated()=866631680
+23:10:32.080: step:755/1000 train_loss:4.8871 train_time:112378ms step_avg:150.84ms torch.cuda.memory_allocated()=866631680
+23:10:32.242: step:756/1000 train_loss:4.8711 train_time:112540ms step_avg:150.86ms torch.cuda.memory_allocated()=866631680
+23:10:32.405: step:757/1000 train_loss:4.7751 train_time:112703ms step_avg:150.87ms torch.cuda.memory_allocated()=866631680
+23:10:32.566: step:758/1000 train_loss:5.0498 train_time:112864ms step_avg:150.89ms torch.cuda.memory_allocated()=866631680
+23:10:32.728: step:759/1000 train_loss:4.6053 train_time:113026ms step_avg:150.90ms torch.cuda.memory_allocated()=866631680
+23:10:32.890: step:760/1000 train_loss:4.8985 train_time:113188ms step_avg:150.92ms torch.cuda.memory_allocated()=866631680
+23:10:33.053: step:761/1000 train_loss:4.6862 train_time:113351ms step_avg:150.93ms torch.cuda.memory_allocated()=866631680
+23:10:33.215: step:762/1000 train_loss:4.6032 train_time:113513ms step_avg:150.95ms torch.cuda.memory_allocated()=866631680
+23:10:33.379: step:763/1000 train_loss:4.6366 train_time:113677ms step_avg:150.97ms torch.cuda.memory_allocated()=866631680
+23:10:33.541: step:764/1000 train_loss:4.7888 train_time:113839ms step_avg:150.98ms torch.cuda.memory_allocated()=866631680
+23:10:33.704: step:765/1000 train_loss:4.6706 train_time:114002ms step_avg:151.00ms torch.cuda.memory_allocated()=866631680
+23:10:33.863: step:766/1000 train_loss:4.9678 train_time:114161ms step_avg:151.01ms torch.cuda.memory_allocated()=866631680
+23:10:34.027: step:767/1000 train_loss:4.8593 train_time:114325ms step_avg:151.02ms torch.cuda.memory_allocated()=866631680
+23:10:34.191: step:768/1000 train_loss:5.1633 train_time:114489ms step_avg:151.04ms torch.cuda.memory_allocated()=866631680
+23:10:34.353: step:769/1000 train_loss:4.6479 train_time:114651ms step_avg:151.05ms torch.cuda.memory_allocated()=866631680
+23:10:34.512: step:770/1000 train_loss:4.9325 train_time:114810ms step_avg:151.07ms torch.cuda.memory_allocated()=866631680
+23:10:34.674: step:771/1000 train_loss:4.8389 train_time:114972ms step_avg:151.08ms torch.cuda.memory_allocated()=866631680
+23:10:34.840: step:772/1000 train_loss:4.7251 train_time:115138ms step_avg:151.10ms torch.cuda.memory_allocated()=866631680
+23:10:34.998: step:773/1000 train_loss:4.9856 train_time:115296ms step_avg:151.11ms torch.cuda.memory_allocated()=866631680
+23:10:35.163: step:774/1000 train_loss:4.8875 train_time:115461ms step_avg:151.13ms torch.cuda.memory_allocated()=866631680
+23:10:35.325: step:775/1000 train_loss:4.7088 train_time:115622ms step_avg:151.14ms torch.cuda.memory_allocated()=866631680
+23:10:35.487: step:776/1000 train_loss:4.7992 train_time:115784ms step_avg:151.15ms torch.cuda.memory_allocated()=866631680
+23:10:35.648: step:777/1000 train_loss:4.7278 train_time:115946ms step_avg:151.17ms torch.cuda.memory_allocated()=866631680
+23:10:35.810: step:778/1000 train_loss:4.7387 train_time:116108ms step_avg:151.18ms torch.cuda.memory_allocated()=866631680
+23:10:35.975: step:779/1000 train_loss:4.2932 train_time:116273ms step_avg:151.20ms torch.cuda.memory_allocated()=866631680
+23:10:36.136: step:780/1000 train_loss:4.7621 train_time:116434ms step_avg:151.21ms torch.cuda.memory_allocated()=866631680
+23:10:36.296: step:781/1000 train_loss:4.8388 train_time:116594ms step_avg:151.22ms torch.cuda.memory_allocated()=866631680
+23:10:36.455: step:782/1000 train_loss:4.6903 train_time:116753ms step_avg:151.23ms torch.cuda.memory_allocated()=866631680
+23:10:36.621: step:783/1000 train_loss:5.1884 train_time:116918ms step_avg:151.25ms torch.cuda.memory_allocated()=866631680
+23:10:36.788: step:784/1000 train_loss:4.7734 train_time:117085ms step_avg:151.27ms torch.cuda.memory_allocated()=866631680
+23:10:36.953: step:785/1000 train_loss:4.9326 train_time:117251ms step_avg:151.29ms torch.cuda.memory_allocated()=866631680
+23:10:37.114: step:786/1000 train_loss:4.6104 train_time:117412ms step_avg:151.30ms torch.cuda.memory_allocated()=866631680
+23:10:37.282: step:787/1000 train_loss:4.6218 train_time:117580ms step_avg:151.33ms torch.cuda.memory_allocated()=866631680
+23:10:37.446: step:788/1000 train_loss:4.7906 train_time:117744ms step_avg:151.34ms torch.cuda.memory_allocated()=866631680
+23:10:37.608: step:789/1000 train_loss:4.6820 train_time:117906ms step_avg:151.36ms torch.cuda.memory_allocated()=866631680
+23:10:37.772: step:790/1000 train_loss:4.5239 train_time:118070ms step_avg:151.37ms torch.cuda.memory_allocated()=866631680
+23:10:37.935: step:791/1000 train_loss:5.0219 train_time:118233ms step_avg:151.39ms torch.cuda.memory_allocated()=866631680
+23:10:38.095: step:792/1000 train_loss:4.7944 train_time:118393ms step_avg:151.40ms torch.cuda.memory_allocated()=866631680
+23:10:38.258: step:793/1000 train_loss:4.8445 train_time:118556ms step_avg:151.41ms torch.cuda.memory_allocated()=866631680
+23:10:38.420: step:794/1000 train_loss:4.8776 train_time:118718ms step_avg:151.43ms torch.cuda.memory_allocated()=866631680
+23:10:38.583: step:795/1000 train_loss:4.9307 train_time:118881ms step_avg:151.44ms torch.cuda.memory_allocated()=866631680
+23:10:38.745: step:796/1000 train_loss:4.7349 train_time:119043ms step_avg:151.45ms torch.cuda.memory_allocated()=866631680
+23:10:38.911: step:797/1000 train_loss:5.1851 train_time:119209ms step_avg:151.47ms torch.cuda.memory_allocated()=866631680
+23:10:39.074: step:798/1000 train_loss:4.7412 train_time:119372ms step_avg:151.49ms torch.cuda.memory_allocated()=866631680
+23:10:39.237: step:799/1000 train_loss:4.9627 train_time:119535ms step_avg:151.50ms torch.cuda.memory_allocated()=866631680
+23:10:39.402: step:800/1000 train_loss:4.9095 train_time:119699ms step_avg:151.52ms torch.cuda.memory_allocated()=866631680
+23:10:39.563: step:801/1000 train_loss:5.0367 train_time:119860ms step_avg:151.53ms torch.cuda.memory_allocated()=866631680
+23:10:39.727: step:802/1000 train_loss:4.5227 train_time:120025ms step_avg:151.55ms torch.cuda.memory_allocated()=866631680
+23:10:39.891: step:803/1000 train_loss:4.6326 train_time:120189ms step_avg:151.56ms torch.cuda.memory_allocated()=866631680
+23:10:40.062: step:804/1000 train_loss:4.8718 train_time:120360ms step_avg:151.59ms torch.cuda.memory_allocated()=866631680
+23:10:40.231: step:805/1000 train_loss:5.3308 train_time:120529ms step_avg:151.61ms torch.cuda.memory_allocated()=866631680
+23:10:40.395: step:806/1000 train_loss:4.9673 train_time:120693ms step_avg:151.62ms torch.cuda.memory_allocated()=866631680
+23:10:40.558: step:807/1000 train_loss:4.9124 train_time:120856ms step_avg:151.64ms torch.cuda.memory_allocated()=866631680
+23:10:40.720: step:808/1000 train_loss:4.7983 train_time:121018ms step_avg:151.65ms torch.cuda.memory_allocated()=866631680
+23:10:40.881: step:809/1000 train_loss:4.6095 train_time:121179ms step_avg:151.66ms torch.cuda.memory_allocated()=866631680
+23:10:41.045: step:810/1000 train_loss:4.4556 train_time:121343ms step_avg:151.68ms torch.cuda.memory_allocated()=866631680
+23:10:41.207: step:811/1000 train_loss:4.9809 train_time:121505ms step_avg:151.69ms torch.cuda.memory_allocated()=866631680
+23:10:41.371: step:812/1000 train_loss:4.9632 train_time:121668ms step_avg:151.71ms torch.cuda.memory_allocated()=866631680
+23:10:41.532: step:813/1000 train_loss:4.7288 train_time:121830ms step_avg:151.72ms torch.cuda.memory_allocated()=866631680
+23:10:41.690: step:814/1000 train_loss:4.9727 train_time:121988ms step_avg:151.73ms torch.cuda.memory_allocated()=866631680
+23:10:41.852: step:815/1000 train_loss:4.8665 train_time:122150ms step_avg:151.74ms torch.cuda.memory_allocated()=866631680
+23:10:42.014: step:816/1000 train_loss:4.6968 train_time:122312ms step_avg:151.75ms torch.cuda.memory_allocated()=866631680
+23:10:42.181: step:817/1000 train_loss:4.7507 train_time:122479ms step_avg:151.77ms torch.cuda.memory_allocated()=866631680
+23:10:42.346: step:818/1000 train_loss:4.7171 train_time:122643ms step_avg:151.79ms torch.cuda.memory_allocated()=866631680
+23:10:42.507: step:819/1000 train_loss:4.8492 train_time:122805ms step_avg:151.80ms torch.cuda.memory_allocated()=866631680
+23:10:42.676: step:820/1000 train_loss:4.9119 train_time:122973ms step_avg:151.82ms torch.cuda.memory_allocated()=866631680
+23:10:42.838: step:821/1000 train_loss:4.7134 train_time:123136ms step_avg:151.83ms torch.cuda.memory_allocated()=866631680
+23:10:42.003: step:822/1000 train_loss:4.7212 train_time:123301ms step_avg:151.85ms torch.cuda.memory_allocated()=866631680
+23:10:43.168: step:823/1000 train_loss:4.6980 train_time:123466ms step_avg:151.86ms torch.cuda.memory_allocated()=866631680
+23:10:43.338: step:824/1000 train_loss:4.6616 train_time:123636ms step_avg:151.89ms torch.cuda.memory_allocated()=866631680
+23:10:43.506: step:825/1000 train_loss:4.7518 train_time:123804ms step_avg:151.91ms torch.cuda.memory_allocated()=866631680
+23:10:43.671: step:826/1000 train_loss:4.7982 train_time:123968ms step_avg:151.92ms torch.cuda.memory_allocated()=866631680
+23:10:43.835: step:827/1000 train_loss:4.5940 train_time:124133ms step_avg:151.94ms torch.cuda.memory_allocated()=866631680
+23:10:43.004: step:828/1000 train_loss:4.6152 train_time:124302ms step_avg:151.96ms torch.cuda.memory_allocated()=866631680
+23:10:44.176: step:829/1000 train_loss:4.6569 train_time:124474ms step_avg:151.98ms torch.cuda.memory_allocated()=866631680
+23:10:44.343: step:830/1000 train_loss:4.7462 train_time:124641ms step_avg:152.00ms torch.cuda.memory_allocated()=866631680
+23:10:44.509: step:831/1000 train_loss:5.0095 train_time:124807ms step_avg:152.02ms torch.cuda.memory_allocated()=866631680
+23:10:44.685: step:832/1000 train_loss:5.6070 train_time:124983ms step_avg:152.05ms torch.cuda.memory_allocated()=866631680
+23:10:44.857: step:833/1000 train_loss:5.1162 train_time:125155ms step_avg:152.07ms torch.cuda.memory_allocated()=866631680
+23:10:45.021: step:834/1000 train_loss:4.6822 train_time:125319ms step_avg:152.09ms torch.cuda.memory_allocated()=866631680
+23:10:45.187: step:835/1000 train_loss:4.7099 train_time:125485ms step_avg:152.10ms torch.cuda.memory_allocated()=866631680
+23:10:45.358: step:836/1000 train_loss:4.9031 train_time:125656ms step_avg:152.13ms torch.cuda.memory_allocated()=866631680
+23:10:45.526: step:837/1000 train_loss:4.8607 train_time:125824ms step_avg:152.14ms torch.cuda.memory_allocated()=866631680
+23:10:45.692: step:838/1000 train_loss:4.5772 train_time:125989ms step_avg:152.16ms torch.cuda.memory_allocated()=866631680
+23:10:45.854: step:839/1000 train_loss:4.7382 train_time:126152ms step_avg:152.17ms torch.cuda.memory_allocated()=866631680
+23:10:46.019: step:840/1000 train_loss:4.5828 train_time:126317ms step_avg:152.19ms torch.cuda.memory_allocated()=866631680
+23:10:46.184: step:841/1000 train_loss:4.7435 train_time:126482ms step_avg:152.20ms torch.cuda.memory_allocated()=866631680
+23:10:46.352: step:842/1000 train_loss:4.8477 train_time:126650ms step_avg:152.22ms torch.cuda.memory_allocated()=866631680
+23:10:46.519: step:843/1000 train_loss:4.5153 train_time:126817ms step_avg:152.24ms torch.cuda.memory_allocated()=866631680
+23:10:46.684: step:844/1000 train_loss:4.7535 train_time:126982ms step_avg:152.26ms torch.cuda.memory_allocated()=866631680
+23:10:46.848: step:845/1000 train_loss:4.9176 train_time:127145ms step_avg:152.27ms torch.cuda.memory_allocated()=866631680
+23:10:47.010: step:846/1000 train_loss:4.9492 train_time:127308ms step_avg:152.28ms torch.cuda.memory_allocated()=866631680
+23:10:47.173: step:847/1000 train_loss:4.8167 train_time:127471ms step_avg:152.30ms torch.cuda.memory_allocated()=866631680
+23:10:47.337: step:848/1000 train_loss:4.7431 train_time:127635ms step_avg:152.31ms torch.cuda.memory_allocated()=866631680
+23:10:47.497: step:849/1000 train_loss:4.7878 train_time:127795ms step_avg:152.32ms torch.cuda.memory_allocated()=866631680
+23:10:47.662: step:850/1000 train_loss:4.9266 train_time:127960ms step_avg:152.33ms torch.cuda.memory_allocated()=866631680
+23:10:47.832: step:851/1000 train_loss:4.7509 train_time:128130ms step_avg:152.35ms torch.cuda.memory_allocated()=866631680
+23:10:47.995: step:852/1000 train_loss:4.7401 train_time:128293ms step_avg:152.37ms torch.cuda.memory_allocated()=866631680
+23:10:48.160: step:853/1000 train_loss:4.5592 train_time:128458ms step_avg:152.38ms torch.cuda.memory_allocated()=866631680
+23:10:48.324: step:854/1000 train_loss:5.0789 train_time:128622ms step_avg:152.40ms torch.cuda.memory_allocated()=866631680
+23:10:48.484: step:855/1000 train_loss:4.7685 train_time:128782ms step_avg:152.40ms torch.cuda.memory_allocated()=866631680
+23:10:48.647: step:856/1000 train_loss:4.7757 train_time:128945ms step_avg:152.42ms torch.cuda.memory_allocated()=866631680
+23:10:48.810: step:857/1000 train_loss:4.8641 train_time:129108ms step_avg:152.43ms torch.cuda.memory_allocated()=866631680
+23:10:48.970: step:858/1000 train_loss:4.6901 train_time:129268ms step_avg:152.44ms torch.cuda.memory_allocated()=866631680
+23:10:49.133: step:859/1000 train_loss:4.7094 train_time:129431ms step_avg:152.45ms torch.cuda.memory_allocated()=866631680
+23:10:49.296: step:860/1000 train_loss:5.1442 train_time:129594ms step_avg:152.46ms torch.cuda.memory_allocated()=866631680
+23:10:49.457: step:861/1000 train_loss:4.8839 train_time:129755ms step_avg:152.47ms torch.cuda.memory_allocated()=866631680
+23:10:49.620: step:862/1000 train_loss:4.5194 train_time:129918ms step_avg:152.49ms torch.cuda.memory_allocated()=866631680
+23:10:49.787: step:863/1000 train_loss:4.7047 train_time:130085ms step_avg:152.50ms torch.cuda.memory_allocated()=866631680
+23:10:49.952: step:864/1000 train_loss:4.6583 train_time:130250ms step_avg:152.52ms torch.cuda.memory_allocated()=866631680
+23:10:50.119: step:865/1000 train_loss:4.6607 train_time:130417ms step_avg:152.53ms torch.cuda.memory_allocated()=866631680
+23:10:50.289: step:866/1000 train_loss:4.3624 train_time:130587ms step_avg:152.55ms torch.cuda.memory_allocated()=866631680
+23:10:50.450: step:867/1000 train_loss:4.7891 train_time:130748ms step_avg:152.56ms torch.cuda.memory_allocated()=866631680
+23:10:50.613: step:868/1000 train_loss:4.5420 train_time:130911ms step_avg:152.58ms torch.cuda.memory_allocated()=866631680
+23:10:50.780: step:869/1000 train_loss:4.7222 train_time:131078ms step_avg:152.59ms torch.cuda.memory_allocated()=866631680
+23:10:50.942: step:870/1000 train_loss:4.7726 train_time:131240ms step_avg:152.60ms torch.cuda.memory_allocated()=866631680
+23:10:51.107: step:871/1000 train_loss:4.7962 train_time:131405ms step_avg:152.62ms torch.cuda.memory_allocated()=866631680
+23:10:51.275: step:872/1000 train_loss:4.6645 train_time:131573ms step_avg:152.64ms torch.cuda.memory_allocated()=866631680
+23:10:51.439: step:873/1000 train_loss:4.6374 train_time:131737ms step_avg:152.65ms torch.cuda.memory_allocated()=866631680
+23:10:51.607: step:874/1000 train_loss:4.6148 train_time:131904ms step_avg:152.67ms torch.cuda.memory_allocated()=866631680
+23:10:51.774: step:875/1000 train_loss:4.4046 train_time:132072ms step_avg:152.68ms torch.cuda.memory_allocated()=866631680
+23:10:53.646: step:875/1000 val_loss:4.7408 train_time:132072ms step_avg:152.68ms
+23:10:53.811: step:876/1000 train_loss:4.7126 train_time:132236ms step_avg:152.70ms torch.cuda.memory_allocated()=866631680
+23:10:53.974: step:877/1000 train_loss:4.6758 train_time:132399ms step_avg:152.71ms torch.cuda.memory_allocated()=866631680
+23:10:54.148: step:878/1000 train_loss:4.1984 train_time:132573ms step_avg:152.73ms torch.cuda.memory_allocated()=866631680
+23:10:54.314: step:879/1000 train_loss:4.6123 train_time:132740ms step_avg:152.75ms torch.cuda.memory_allocated()=866631680
+23:10:54.481: step:880/1000 train_loss:4.4419 train_time:132906ms step_avg:152.77ms torch.cuda.memory_allocated()=866631680
+23:10:54.644: step:881/1000 train_loss:4.6728 train_time:133069ms step_avg:152.78ms torch.cuda.memory_allocated()=866631680
+23:10:54.811: step:882/1000 train_loss:4.8853 train_time:133237ms step_avg:152.79ms torch.cuda.memory_allocated()=866631680
+23:10:54.972: step:883/1000 train_loss:4.6785 train_time:133398ms step_avg:152.80ms torch.cuda.memory_allocated()=866631680
+23:10:55.136: step:884/1000 train_loss:4.6273 train_time:133561ms step_avg:152.82ms torch.cuda.memory_allocated()=866631680
+23:10:55.302: step:885/1000 train_loss:4.5984 train_time:133727ms step_avg:152.83ms torch.cuda.memory_allocated()=866631680
+23:10:55.466: step:886/1000 train_loss:4.6367 train_time:133892ms step_avg:152.84ms torch.cuda.memory_allocated()=866631680
+23:10:55.631: step:887/1000 train_loss:4.9421 train_time:134056ms step_avg:152.86ms torch.cuda.memory_allocated()=866631680
+23:10:55.793: step:888/1000 train_loss:4.8122 train_time:134219ms step_avg:152.87ms torch.cuda.memory_allocated()=866631680
+23:10:55.958: step:889/1000 train_loss:4.6433 train_time:134384ms step_avg:152.88ms torch.cuda.memory_allocated()=866631680
+23:10:56.125: step:890/1000 train_loss:4.7276 train_time:134551ms step_avg:152.90ms torch.cuda.memory_allocated()=866631680
+23:10:56.292: step:891/1000 train_loss:4.6026 train_time:134718ms step_avg:152.91ms torch.cuda.memory_allocated()=866631680
+23:10:56.458: step:892/1000 train_loss:4.7279 train_time:134883ms step_avg:152.93ms torch.cuda.memory_allocated()=866631680
+23:10:56.631: step:893/1000 train_loss:4.8623 train_time:135056ms step_avg:152.95ms torch.cuda.memory_allocated()=866631680
+23:10:56.792: step:894/1000 train_loss:4.7884 train_time:135217ms step_avg:152.96ms torch.cuda.memory_allocated()=866631680
+23:10:56.956: step:895/1000 train_loss:4.6549 train_time:135382ms step_avg:152.97ms torch.cuda.memory_allocated()=866631680
+23:10:57.122: step:896/1000 train_loss:4.5072 train_time:135547ms step_avg:152.99ms torch.cuda.memory_allocated()=866631680
+23:10:57.288: step:897/1000 train_loss:4.8320 train_time:135714ms step_avg:153.00ms torch.cuda.memory_allocated()=866631680
+23:10:57.449: step:898/1000 train_loss:4.6844 train_time:135875ms step_avg:153.01ms torch.cuda.memory_allocated()=866631680
+23:10:57.611: step:899/1000 train_loss:4.7416 train_time:136036ms step_avg:153.02ms torch.cuda.memory_allocated()=866631680
+23:10:57.778: step:900/1000 train_loss:4.8086 train_time:136204ms step_avg:153.04ms torch.cuda.memory_allocated()=866631680
+23:10:57.947: step:901/1000 train_loss:4.8717 train_time:136373ms step_avg:153.06ms torch.cuda.memory_allocated()=866631680
+23:10:58.113: step:902/1000 train_loss:4.4325 train_time:136538ms step_avg:153.07ms torch.cuda.memory_allocated()=866631680
+23:10:58.278: step:903/1000 train_loss:4.5018 train_time:136704ms step_avg:153.08ms torch.cuda.memory_allocated()=866631680
+23:10:58.441: step:904/1000 train_loss:4.8432 train_time:136866ms step_avg:153.09ms torch.cuda.memory_allocated()=866631680
+23:10:58.604: step:905/1000 train_loss:4.6941 train_time:137029ms step_avg:153.10ms torch.cuda.memory_allocated()=866631680
+23:10:58.765: step:906/1000 train_loss:4.6590 train_time:137191ms step_avg:153.11ms torch.cuda.memory_allocated()=866631680
+23:10:58.930: step:907/1000 train_loss:4.7653 train_time:137355ms step_avg:153.13ms torch.cuda.memory_allocated()=866631680
+23:10:59.096: step:908/1000 train_loss:4.8399 train_time:137521ms step_avg:153.14ms torch.cuda.memory_allocated()=866631680
+23:10:59.261: step:909/1000 train_loss:4.5301 train_time:137687ms step_avg:153.16ms torch.cuda.memory_allocated()=866631680
+23:10:59.424: step:910/1000 train_loss:4.9027 train_time:137850ms step_avg:153.17ms torch.cuda.memory_allocated()=866631680
+23:10:59.591: step:911/1000 train_loss:5.1245 train_time:138016ms step_avg:153.18ms torch.cuda.memory_allocated()=866631680
+23:10:59.766: step:912/1000 train_loss:4.8995 train_time:138191ms step_avg:153.21ms torch.cuda.memory_allocated()=866631680
+23:10:59.937: step:913/1000 train_loss:4.8717 train_time:138363ms step_avg:153.23ms torch.cuda.memory_allocated()=866631680
+23:11:00.100: step:914/1000 train_loss:4.7709 train_time:138525ms step_avg:153.24ms torch.cuda.memory_allocated()=866631680
+23:11:00.262: step:915/1000 train_loss:4.5478 train_time:138688ms step_avg:153.25ms torch.cuda.memory_allocated()=866631680
+23:11:00.430: step:916/1000 train_loss:5.3653 train_time:138855ms step_avg:153.26ms torch.cuda.memory_allocated()=866631680
+23:11:00.596: step:917/1000 train_loss:5.1106 train_time:139021ms step_avg:153.28ms torch.cuda.memory_allocated()=866631680
+23:11:00.761: step:918/1000 train_loss:4.9587 train_time:139186ms step_avg:153.29ms torch.cuda.memory_allocated()=866631680
+23:11:00.927: step:919/1000 train_loss:4.9654 train_time:139352ms step_avg:153.30ms torch.cuda.memory_allocated()=866631680
+23:11:01.094: step:920/1000 train_loss:4.4412 train_time:139519ms step_avg:153.32ms torch.cuda.memory_allocated()=866631680
+23:11:01.259: step:921/1000 train_loss:4.7633 train_time:139685ms step_avg:153.33ms torch.cuda.memory_allocated()=866631680
+23:11:01.422: step:922/1000 train_loss:4.7179 train_time:139848ms step_avg:153.34ms torch.cuda.memory_allocated()=866631680
+23:11:01.590: step:923/1000 train_loss:4.8505 train_time:140015ms step_avg:153.36ms torch.cuda.memory_allocated()=866631680
+23:11:01.751: step:924/1000 train_loss:4.7385 train_time:140176ms step_avg:153.37ms torch.cuda.memory_allocated()=866631680
+23:11:01.917: step:925/1000 train_loss:4.4189 train_time:140343ms step_avg:153.38ms torch.cuda.memory_allocated()=866631680
+23:11:02.083: step:926/1000 train_loss:4.8862 train_time:140508ms step_avg:153.39ms torch.cuda.memory_allocated()=866631680
+23:11:02.249: step:927/1000 train_loss:4.7502 train_time:140674ms step_avg:153.41ms torch.cuda.memory_allocated()=866631680
+23:11:02.413: step:928/1000 train_loss:4.4580 train_time:140839ms step_avg:153.42ms torch.cuda.memory_allocated()=866631680
+23:11:02.577: step:929/1000 train_loss:4.4404 train_time:141002ms step_avg:153.43ms torch.cuda.memory_allocated()=866631680
+23:11:02.743: step:930/1000 train_loss:4.9676 train_time:141168ms step_avg:153.44ms torch.cuda.memory_allocated()=866631680
+23:11:02.907: step:931/1000 train_loss:4.7010 train_time:141333ms step_avg:153.46ms torch.cuda.memory_allocated()=866631680
+23:11:03.076: step:932/1000 train_loss:4.3858 train_time:141502ms step_avg:153.47ms torch.cuda.memory_allocated()=866631680
+23:11:03.242: step:933/1000 train_loss:4.4994 train_time:141668ms step_avg:153.49ms torch.cuda.memory_allocated()=866631680
+23:11:03.412: step:934/1000 train_loss:4.5228 train_time:141837ms step_avg:153.50ms torch.cuda.memory_allocated()=866631680
+23:11:03.579: step:935/1000 train_loss:4.6554 train_time:142004ms step_avg:153.52ms torch.cuda.memory_allocated()=866631680
+23:11:03.743: step:936/1000 train_loss:4.6949 train_time:142169ms step_avg:153.53ms torch.cuda.memory_allocated()=866631680
+23:11:03.906: step:937/1000 train_loss:4.6490 train_time:142331ms step_avg:153.54ms torch.cuda.memory_allocated()=866631680
+23:11:04.073: step:938/1000 train_loss:4.5246 train_time:142499ms step_avg:153.55ms torch.cuda.memory_allocated()=866631680
+23:11:04.239: step:939/1000 train_loss:4.8588 train_time:142664ms step_avg:153.57ms torch.cuda.memory_allocated()=866631680
+23:11:04.410: step:940/1000 train_loss:4.6280 train_time:142835ms step_avg:153.59ms torch.cuda.memory_allocated()=866631680
+23:11:04.577: step:941/1000 train_loss:4.7802 train_time:143002ms step_avg:153.60ms torch.cuda.memory_allocated()=866631680
+23:11:04.747: step:942/1000 train_loss:4.6565 train_time:143172ms step_avg:153.62ms torch.cuda.memory_allocated()=866631680
+23:11:04.911: step:943/1000 train_loss:4.5061 train_time:143336ms step_avg:153.63ms torch.cuda.memory_allocated()=866631680
+23:11:05.078: step:944/1000 train_loss:4.4292 train_time:143503ms step_avg:153.64ms torch.cuda.memory_allocated()=866631680
+23:11:05.246: step:945/1000 train_loss:4.8462 train_time:143671ms step_avg:153.66ms torch.cuda.memory_allocated()=866631680
+23:11:05.409: step:946/1000 train_loss:4.7801 train_time:143834ms step_avg:153.67ms torch.cuda.memory_allocated()=866631680
+23:11:05.569: step:947/1000 train_loss:4.8792 train_time:143994ms step_avg:153.68ms torch.cuda.memory_allocated()=866631680
+23:11:05.731: step:948/1000 train_loss:4.7767 train_time:144156ms step_avg:153.68ms torch.cuda.memory_allocated()=866631680
+23:11:05.901: step:949/1000 train_loss:4.6882 train_time:144327ms step_avg:153.70ms torch.cuda.memory_allocated()=866631680
+23:11:06.078: step:950/1000 train_loss:4.5467 train_time:144503ms step_avg:153.73ms torch.cuda.memory_allocated()=866631680
+23:11:06.245: step:951/1000 train_loss:4.5769 train_time:144670ms step_avg:153.74ms torch.cuda.memory_allocated()=866631680
+23:11:06.410: step:952/1000 train_loss:4.6743 train_time:144836ms step_avg:153.75ms torch.cuda.memory_allocated()=866631680
+23:11:06.578: step:953/1000 train_loss:4.8623 train_time:145003ms step_avg:153.77ms torch.cuda.memory_allocated()=866631680
+23:11:06.743: step:954/1000 train_loss:4.6602 train_time:145169ms step_avg:153.78ms torch.cuda.memory_allocated()=866631680
+23:11:06.918: step:955/1000 train_loss:4.5225 train_time:145344ms step_avg:153.80ms torch.cuda.memory_allocated()=866631680
+23:11:07.084: step:956/1000 train_loss:4.3950 train_time:145509ms step_avg:153.82ms torch.cuda.memory_allocated()=866631680
+23:11:07.250: step:957/1000 train_loss:4.6124 train_time:145676ms step_avg:153.83ms torch.cuda.memory_allocated()=866631680
+23:11:07.428: step:958/1000 train_loss:4.7611 train_time:145853ms step_avg:153.85ms torch.cuda.memory_allocated()=866631680
+23:11:07.593: step:959/1000 train_loss:4.6762 train_time:146018ms step_avg:153.87ms torch.cuda.memory_allocated()=866631680
+23:11:07.759: step:960/1000 train_loss:4.7724 train_time:146184ms step_avg:153.88ms torch.cuda.memory_allocated()=866631680
+23:11:07.926: step:961/1000 train_loss:4.5400 train_time:146351ms step_avg:153.89ms torch.cuda.memory_allocated()=866631680
+23:11:08.094: step:962/1000 train_loss:4.4550 train_time:146519ms step_avg:153.91ms torch.cuda.memory_allocated()=866631680
+23:11:08.259: step:963/1000 train_loss:4.7562 train_time:146684ms step_avg:153.92ms torch.cuda.memory_allocated()=866631680
+23:11:08.424: step:964/1000 train_loss:4.7200 train_time:146850ms step_avg:153.93ms torch.cuda.memory_allocated()=866631680
+23:11:08.593: step:965/1000 train_loss:4.6307 train_time:147018ms step_avg:153.95ms torch.cuda.memory_allocated()=866631680
+23:11:08.756: step:966/1000 train_loss:4.7507 train_time:147182ms step_avg:153.96ms torch.cuda.memory_allocated()=866631680
+23:11:08.921: step:967/1000 train_loss:4.7148 train_time:147346ms step_avg:153.97ms torch.cuda.memory_allocated()=866631680
+23:11:09.086: step:968/1000 train_loss:4.6654 train_time:147511ms step_avg:153.98ms torch.cuda.memory_allocated()=866631680
+23:11:09.255: step:969/1000 train_loss:4.5886 train_time:147680ms step_avg:153.99ms torch.cuda.memory_allocated()=866631680
+23:11:09.418: step:970/1000 train_loss:4.5988 train_time:147843ms step_avg:154.00ms torch.cuda.memory_allocated()=866631680
+23:11:09.583: step:971/1000 train_loss:4.7514 train_time:148009ms step_avg:154.02ms torch.cuda.memory_allocated()=866631680
+23:11:09.750: step:972/1000 train_loss:4.6162 train_time:148175ms step_avg:154.03ms torch.cuda.memory_allocated()=866631680
+23:11:09.918: step:973/1000 train_loss:4.6290 train_time:148344ms step_avg:154.04ms torch.cuda.memory_allocated()=866631680
+23:11:10.082: step:974/1000 train_loss:4.6363 train_time:148508ms step_avg:154.05ms torch.cuda.memory_allocated()=866631680
+23:11:10.245: step:975/1000 train_loss:4.7083 train_time:148670ms step_avg:154.06ms torch.cuda.memory_allocated()=866631680
+23:11:10.405: step:976/1000 train_loss:4.7851 train_time:148830ms step_avg:154.07ms torch.cuda.memory_allocated()=866631680
+23:11:10.576: step:977/1000 train_loss:4.7386 train_time:149002ms step_avg:154.09ms torch.cuda.memory_allocated()=866631680
+23:11:10.744: step:978/1000 train_loss:4.9153 train_time:149169ms step_avg:154.10ms torch.cuda.memory_allocated()=866631680
+23:11:10.924: step:979/1000 train_loss:5.1721 train_time:149350ms step_avg:154.13ms torch.cuda.memory_allocated()=866631680
+23:11:11.108: step:980/1000 train_loss:5.2646 train_time:149533ms step_avg:154.16ms torch.cuda.memory_allocated()=866631680
+23:11:11.279: step:981/1000 train_loss:4.9429 train_time:149704ms step_avg:154.18ms torch.cuda.memory_allocated()=866631680
+23:11:11.443: step:982/1000 train_loss:4.9514 train_time:149868ms step_avg:154.19ms torch.cuda.memory_allocated()=866631680
+23:11:11.613: step:983/1000 train_loss:4.8492 train_time:150038ms step_avg:154.20ms torch.cuda.memory_allocated()=866631680
+23:11:11.779: step:984/1000 train_loss:4.7520 train_time:150204ms step_avg:154.21ms torch.cuda.memory_allocated()=866631680
+23:11:11.948: step:985/1000 train_loss:4.6144 train_time:150374ms step_avg:154.23ms torch.cuda.memory_allocated()=866631680
+23:11:12.112: step:986/1000 train_loss:4.6459 train_time:150537ms step_avg:154.24ms torch.cuda.memory_allocated()=866631680
+23:11:12.276: step:987/1000 train_loss:4.4970 train_time:150702ms step_avg:154.25ms torch.cuda.memory_allocated()=866631680
+23:11:12.444: step:988/1000 train_loss:4.8772 train_time:150869ms step_avg:154.26ms torch.cuda.memory_allocated()=866631680
+23:11:12.615: step:989/1000 train_loss:4.5662 train_time:151040ms step_avg:154.28ms torch.cuda.memory_allocated()=866631680
+23:11:12.786: step:990/1000 train_loss:4.7038 train_time:151211ms step_avg:154.30ms torch.cuda.memory_allocated()=866631680
+23:11:12.957: step:991/1000 train_loss:4.5251 train_time:151382ms step_avg:154.31ms torch.cuda.memory_allocated()=866631680
+23:11:13.123: step:992/1000 train_loss:4.5748 train_time:151549ms step_avg:154.33ms torch.cuda.memory_allocated()=866631680
+23:11:13.288: step:993/1000 train_loss:4.6475 train_time:151713ms step_avg:154.34ms torch.cuda.memory_allocated()=866631680
+23:11:13.453: step:994/1000 train_loss:4.5570 train_time:151878ms step_avg:154.35ms torch.cuda.memory_allocated()=866631680
+23:11:13.626: step:995/1000 train_loss:4.6769 train_time:152052ms step_avg:154.37ms torch.cuda.memory_allocated()=866631680
+23:11:13.802: step:996/1000 train_loss:4.1116 train_time:152228ms step_avg:154.39ms torch.cuda.memory_allocated()=866631680
+23:11:13.973: step:997/1000 train_loss:4.4314 train_time:152398ms step_avg:154.41ms torch.cuda.memory_allocated()=866631680
+23:11:14.141: step:998/1000 train_loss:4.4658 train_time:152567ms step_avg:154.42ms torch.cuda.memory_allocated()=866631680
+23:11:14.305: step:999/1000 train_loss:4.5355 train_time:152730ms step_avg:154.43ms torch.cuda.memory_allocated()=866631680
+23:11:14.466: step:1000/1000 train_loss:4.5350 train_time:152891ms step_avg:154.44ms torch.cuda.memory_allocated()=866631680
+23:11:16.351: step:1000/1000 val_loss:4.6727 train_time:152891ms step_avg:154.44ms
+23:11:16.353: peak memory allocated: 7162 MiB reserved: 11196 MiB

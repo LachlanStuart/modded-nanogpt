@@ -16,12 +16,18 @@ Plan:
 Licenses: This repository combines several independently-licensed sources, each of which requires its own notice to be distributed - see the `LICENSE` files.
 
 Findings:
-* [cross-cut-entropy](https://github.com/apple/ml-cross-entropy) was slower (196ms/step vs 184ms), except when set to `impl="torch_compile"`, where it was the same speed. (both were wrapped in a compile)
-* Attempting to hack in attention KV sinks (skipping the qkv projection) using flex_attention's return_lse to combine 2 query results, and 1 "register" token per head:
-    * flex_attention(return_lse=True) is slow. Doing a 2nd run of flex_attention with 1 KV is also very slow. Together: 283ms/step instead of 163ms/step. (without compile)
-    * with 1 sink after 1k steps * 16k seqlen:
-    22:58:30.082: step:1000/1000 val_loss:4.6840 train_time:229529ms step_avg:231.85ms
-    * with no sink: 23:11:16.351: step:1000/1000 val_loss:4.6727 train_time:152891ms step_avg:154.44ms
+* [cut-cross-entropy](https://github.com/apple/ml-cross-entropy) was slower (196ms/step vs 184ms), except when set to `impl="torch_compile"`, where it was the same speed. (both were wrapped in a compile)
+* Attempting to hack in attention KV sinks (skipping the qkv projection) using flex_attention's return_lse to combine 2 query results. 1k steps * 16k seqlen:
+    * baseline: `val_loss:4.6727 step_avg:154.44ms`
+    * 1 sink:   `val_loss:4.6840 step_avg:231.85ms`
+    * 8 sinks:  `val_loss:4.6780 step_avg:223.48ms`
+    * The 2 contexts need to be combined by lerping with `exp2(lse1) / (exp2(lse1) + esp2(lse2))`
+    * Just setting `return_lse=True` on `flex_attention()` causes some slowdown by itself.
+    * Total slowdown is much worse than one would expect based on FLOPS.
+    * This failure is likely due to Muon being a orthogonalizing optimizer and keeping qkv from exploding.
+    * 8 sinks optimized by Adam as scalars:  `val_loss:4.6776 step_avg:203.95ms`
+
+
 
 # Original README.md below
 

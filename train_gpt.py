@@ -20,6 +20,15 @@ from torch.profiler import profile, record_function, ProfilerActivity
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 # torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
+import triton
+import triton.language as tl
+
+try:
+    from lovely_tensors import monkey_patch
+    monkey_patch()
+except ImportError:
+    pass
+
 
 # -----------------------------------------------------------------------------
 #region  Custom operators : FP8 matmul by @YouJiacheng
@@ -106,7 +115,6 @@ mm_op.register_autograd(backward, setup_context=setup_context)
 #endregion
 # -----------------------------------------------------------------------------
 #region Muon optimizer
-
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
@@ -312,7 +320,6 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-@torch.compile()
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, layer_idx: int, max_seq_len: int):
         super().__init__()
@@ -347,6 +354,46 @@ class ValueEmbedding(nn.Module):
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
+def create_block_masks(input_seq: Tensor, sliding_window_num_blocks: Tensor):
+    BLOCK_SIZE = 128
+    docs = (input_seq == 50256).cumsum(0)
+
+    def document_causal(b, h, q_idx, kv_idx):
+        causal_mask = q_idx >= kv_idx
+        document_mask = docs[q_idx] == docs[kv_idx]
+        return causal_mask & document_mask
+
+    def dense_to_ordered(dense_mask: Tensor):
+        num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
+        indices = dense_mask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
+        return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+
+    # manual block mask creation by @YouJiacheng
+    assert len(input_seq) % BLOCK_SIZE == 0
+    NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
+    block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
+    any_causal_bm = block_idx[:, None] >= block_idx
+    all_causal_bm = block_idx[:, None] > block_idx
+    docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
+    docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
+    any_document_bm = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
+    all_document_bm = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
+    any_bm = any_causal_bm & any_document_bm
+    all_bm = all_causal_bm & all_document_bm
+    partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(any_bm & ~all_bm)
+    full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
+    def build_bm(sw_num_blocks: Tensor) -> BlockMask:
+        return BlockMask.from_kv_blocks(
+            torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(sw_num_blocks - full_kv_num_blocks, 1)),
+            partial_kv_indices,
+            torch.clamp_max(full_kv_num_blocks, sw_num_blocks - 1),
+            full_kv_indices,
+            BLOCK_SIZE=BLOCK_SIZE,
+            mask_mod=document_causal,
+        )
+    # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
+    return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
+
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
@@ -365,51 +412,11 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
         self.lm_head.weight.detach().zero_() # @Grad62304977
 
-    def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
-        BLOCK_SIZE = 128
-        docs = (input_seq == 50256).cumsum(0)
-
-        def document_causal(b, h, q_idx, kv_idx):
-            causal_mask = q_idx >= kv_idx
-            document_mask = docs[q_idx] == docs[kv_idx]
-            return causal_mask & document_mask
-
-        def dense_to_ordered(dense_mask: Tensor):
-            num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
-            indices = dense_mask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
-            return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
-
-        # manual block mask creation by @YouJiacheng
-        assert len(input_seq) % BLOCK_SIZE == 0
-        NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
-        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
-        any_causal_bm = block_idx[:, None] >= block_idx
-        all_causal_bm = block_idx[:, None] > block_idx
-        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
-        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
-        any_document_bm = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
-        all_document_bm = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
-        any_bm = any_causal_bm & any_document_bm
-        all_bm = all_causal_bm & all_document_bm
-        partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(any_bm & ~all_bm)
-        full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
-        def build_bm(sw_num_blocks: Tensor) -> BlockMask:
-            return BlockMask.from_kv_blocks(
-                torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(sw_num_blocks - full_kv_num_blocks, 1)),
-                partial_kv_indices,
-                torch.clamp_max(full_kv_num_blocks, sw_num_blocks - 1),
-                full_kv_indices,
-                BLOCK_SIZE=BLOCK_SIZE,
-                mask_mod=document_causal,
-            )
-        # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
-        return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
-
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
-        long_bm, short_bm = self.create_block_masks(input_seq, sliding_window_num_blocks)
+        long_bm, short_bm = create_block_masks(input_seq, sliding_window_num_blocks)
 
         x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
         ve = self.value_embeds(input_seq)
@@ -431,21 +438,914 @@ class GPT(nn.Module):
         for i, block in enumerate(self.blocks[self.num_encoder_layers:]):
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = block(x, ve_dec[i], x0, block_masks[i])
-        loss = self.forward_decode(target_seq, x)
-        return loss
 
-    @torch.compile()
-    def forward_decode(self, target_seq, x):
-        # x = norm(x).view(-1, x.shape[-1])
-        # return linear_cross_entropy(x, self.lm_head.weight, target_seq, softcap=15)
-        # CCE didn't work
-        # Not sure if I translated the softcap properly but meh
         x = norm(x)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits.float() / 7.5)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
         return loss
+
+#endregion
+# -----------------------------------------------------------------------------
+#region MoEUT Triton kernels
+# From https://github.com/RobertCsordas/moeut/blob/master/moeut/cvmm.py
+
+@dataclass
+class CVMMSel:
+    raw_sel: torch.Tensor
+    sel: torch.Tensor
+    sel_index: torch.Tensor
+    out_index: torch.Tensor | None = None
+    reduction_weight: torch.Tensor | None = None
+
+    def clone(self) -> 'CVMMSel':
+        return CVMMSel(self.raw_sel, self.sel, self.sel_index, self.out_index, self.reduction_weight)
+
+
+def cvmm_prepare_sel(sel: torch.Tensor, n_experts: int) -> CVMMSel:
+    fsel = sel.flatten()
+    ssel, sel_index = fsel.sort()
+    return CVMMSel(sel, ssel.view_as(sel), sel_index, None)
+
+
+def dtype_to_type_id(dtype: torch.dtype):
+    if dtype == torch.float32:
+        return 0
+    elif dtype == torch.float16:
+        return 1
+    elif dtype == torch.bfloat16:
+        return 2
+
+    raise ValueError("Unknown dtype")
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+    ],
+    key=['M', 'N', 'K', 'dtype_id', 'allow_tf32']
+)
+@triton.jit
+def cvmm_kernel(
+    # Pointers to matrices
+    a_ptr, b_ptr, c_ptr, index_ptr, sel_ptr, out_index_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # The stride variables represent how much to increase the ptr by when moving by 1
+    # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
+    # by to get the element one row down (A has M rows).
+    stride_am, stride_ak,
+    stride_bo, stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    stride_index, stride_sel, stride_out_index,
+    out_index_is_none: tl.constexpr,
+    dtype_id: tl.constexpr, allow_tf32: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr
+):
+    """Kernel for computing the matmul C = A x B.
+    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    # See above `L2 Cache Optimizations` section for details.
+    pid = tl.program_id(axis=0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    pid_m = first_pid_m + (pid % group_size_m)
+
+    sel_first = tl.load(sel_ptr + pid_m * BLOCK_SIZE_M * stride_sel)
+    sel_last = tl.load(sel_ptr + (min((pid_m + 1) * BLOCK_SIZE_M, M) - 1) * stride_sel)
+    sel_all = tl.load(sel_ptr + stride_sel * ((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M))
+
+    for matrix_id in range(sel_first, sel_last + 1):
+        # ----------------------------------------------------------
+        # Create pointers for the first blocks of A and B.
+        # We will advance this pointer as we move in the K direction
+        # and accumulate
+        # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+        # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+        # See above `Pointer Arithmetics` section for details
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+        remap_offs_am = tl.load(index_ptr + stride_index * offs_am)
+
+        # Create offset pointers
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        a_ptrs = a_ptr + (remap_offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = b_ptr + matrix_id * stride_bo + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+        # -----------------------------------------------------------
+        # Iterate to compute a block of the C matrix.
+        # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+        # of fp32 values for higher accuracy.
+        # `accumulator` will be converted back to fp16 after the loop.
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            # Load the next block of A and B, generate a mask by checking the K dimension.
+            # If it is out of bounds, set it to 0.
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            # We accumulate along the K dimension.
+
+            # Triton was unhappy with passing dtypes as vars.
+            if dtype_id == 1:
+                a = a.to(tl.float16)
+                b = b.to(tl.float16)
+            elif dtype_id == 2:
+                a = a.to(tl.bfloat16)
+                b = b.to(tl.bfloat16)
+
+            accumulator += tl.dot(a, b, allow_tf32=allow_tf32)
+
+            # Advance the ptrs to the next K block.
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+
+
+        if dtype_id == 1:
+            c = accumulator.to(tl.float16)
+        elif dtype_id == 2:
+            c = accumulator.to(tl.bfloat16)
+        else:
+            c = accumulator
+
+        # -----------------------------------------------------------
+        # Write back the block of the output matrix C with masks.
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+
+        if out_index_is_none:
+            remap_offs_cm = remap_offs_am
+        else:
+            remap_offs_cm = tl.load(out_index_ptr + stride_out_index * offs_am)
+
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * remap_offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = ((offs_cm[:, None] < M) & (sel_all[:, None] == matrix_id)) & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
+        # triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 128}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 4}, num_stages=4, num_warps=4),
+
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
+        # triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 128}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 8}, num_stages=4, num_warps=4),
+
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 16}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 16}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
+    ],
+    key=['M', 'N', 'K', 'out_dtype_id', 'allow_tf32', 'dtype_id'], reset_to_zero = ['c_ptr']
+)
+@triton.jit
+def cvmm_backward_kernel3(
+    # Pointers to matrices
+    a_ptr, b_ptr, c_ptr, index_ptr, sel_ptr, out_index_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # The stride variables represent how much to increase the ptr by when moving by 1
+    # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
+    # by to get the element one row down (A has M rows).
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_co, stride_cm, stride_cn,
+    stride_index, stride_sel, stride_out_index,
+    out_index_is_none: tl.constexpr,
+    out_dtype_id: tl.constexpr, allow_tf32: tl.constexpr, dtype_id: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr, K_BLOCKS: tl.constexpr
+):
+    """Kernel for computing the matmul C = A x B.
+    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    # See above `L2 Cache Optimizations` section for details.
+    pid = tl.program_id(axis=0)
+    k_block_id = tl.program_id(axis=1)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # ----------------------------------------------------------
+    # Create pointers for the first blocks of A and B.
+    # We will advance this pointer as we move in the K direction
+    # and accumulate
+    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    # See above `Pointer Arithmetics` section for details
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+    # -----------------------------------------------------------
+    # Iterate to compute a block of the C matrix.
+    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+    # of fp32 values for higher accuracy.
+    # `accumulator` will be converted back to fp16 after the loop.
+
+    a_ptrs_this = a_ptr + offs_am[:, None] * stride_am
+    b_ptrs_this = b_ptr + offs_bn[None, :] * stride_bn
+
+    # Kactual = end_i - start_i
+    # Nblocks = (Kactual + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+
+    # WORK_PER_WORKER = (Nblocks + K_BLOCKS - 1) // K_BLOCKS
+    # WORK_PER_WORKER = WORK_PER_WORKER if WORK_PER_WORKER > MIN_WORK_SIZE else MIN_WORK_SIZE
+
+
+    # # Kloop_start = (Kactual + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+
+    # first_block_k = k_block_id * WORK_PER_WORKER
+    # last_block_k = min((k_block_id+1) * WORK_PER_WORKER, Nblocks)
+
+    block_start_index = k_block_id * BLOCK_SIZE_K * K_BLOCKS
+    block_end_index = min(block_start_index + BLOCK_SIZE_K * K_BLOCKS, K) - 1
+
+    first_mat = tl.load(sel_ptr + stride_sel * block_start_index)
+    last_mat = tl.load(sel_ptr + stride_sel * block_end_index)
+
+
+    for matrix_index in range(first_mat, last_mat + 1):
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+        start_i = block_start_index
+        end_i = block_end_index + 1
+        while start_i < end_i:
+            middle = (start_i + end_i) // 2
+            middle_matrix = tl.load(sel_ptr + middle * stride_sel)
+            if middle_matrix < matrix_index:
+                start_i = middle + 1
+            else:
+                end_i = middle
+
+
+        # # Continue binary search: find the first matrix that is > matrix_index
+        start_i2 = start_i
+        end_i = block_end_index + 1
+        while start_i2 < end_i:
+            middle = (start_i2 + end_i) // 2
+            middle_matrix = tl.load(sel_ptr + middle * stride_sel)
+            if middle_matrix <= matrix_index:
+                start_i2 = middle + 1
+            else:
+                end_i = middle
+
+        end_i = start_i2
+
+        count = end_i - start_i
+
+        block_mem_indices_f_base = start_i  + tl.arange(0, BLOCK_SIZE_K)
+
+        if count > 0:
+            for k in range((count + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K):
+                # block_mem_indices = (k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)) % K
+                block_mem_indices_f = block_mem_indices_f_base + k * BLOCK_SIZE_K
+                block_mem_indices = block_mem_indices_f % K
+                a_index = tl.load(index_ptr + stride_index * block_mem_indices)
+                if out_index_is_none:
+                    b_index = a_index
+                else:
+                    b_index = tl.load(out_index_ptr + stride_out_index * block_mem_indices)
+                sel_ok = block_mem_indices_f < end_i
+
+                a_ptrs = a_ptrs_this + a_index[None, :] * stride_ak
+                b_ptrs = b_ptrs_this + b_index[:, None] * stride_bk
+
+                # Load the next block of A and B, generate a mask by checking the K dimension.
+                # If it is out of bounds, set it to 0.
+                a = tl.load(a_ptrs, mask=sel_ok[None, :], other=0.0)
+                b = tl.load(b_ptrs, mask=sel_ok[:, None], other=0.0)
+
+                if dtype_id == 1:
+                    a = a.to(tl.float16)
+                    b = b.to(tl.float16)
+                elif dtype_id == 2:
+                    a = a.to(tl.bfloat16)
+                    b = b.to(tl.bfloat16)
+
+                # We accumulate along the K dimension.
+                accumulator += tl.dot(a, b, allow_tf32=allow_tf32)
+
+            if out_dtype_id == 1:
+                c = accumulator.to(tl.float16)
+            elif out_dtype_id == 2:
+                c = accumulator.to(tl.bfloat16)
+            else:
+                c = accumulator
+
+            # -----------------------------------------------------------
+            # Write back the block of the output matrix C with masks.
+            offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            c_ptrs = c_ptr + stride_co * matrix_index + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            # tl.store(c_ptrs, c, mask=c_mask)
+            tl.atomic_add(c_ptrs, c, mask=c_mask)
+
+
+torch.library.define("mylib::cvmm_triton", "(Tensor x, Tensor sel_index, Tensor sel, Tensor keys, ScalarType out_dtype, Tensor out_index) -> Tensor")
+@torch.library.impl("mylib::cvmm_triton", "default")
+def cvmm_triton(
+    x: torch.Tensor,
+    sel_index: torch.Tensor,
+    sel: torch.Tensor,
+    keys: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_index: torch.Tensor
+):
+    x = x.flatten(end_dim=-2)
+    assert x.shape[-1] == keys.shape[1]
+
+    sel_shape = sel.shape
+    sel = sel.flatten()
+
+    M = sel.shape[0]
+    O, K, N = keys.shape
+    # Allocates output.
+    out = torch.empty((M, N), device=x.device, dtype=out_dtype)
+    # out = torch.zeros((M, N), device=x.device, dtype=out_dtype)
+    # 1D launch kernel where each block gets its own program.
+
+    # expected_m_per_matrix = int(math.ceil(M / O * 1.5))
+    # expected_m_per_matrix = M
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+    )
+
+    out_index_is_none = False
+    if out_index.numel() == 1 and out_index == -1:
+        out_index_is_none = True
+
+    cvmm_kernel[grid](
+        x, keys, out, sel_index, sel, out_index,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        keys.stride(0), keys.stride(1), keys.stride(2),
+        out.stride(0), out.stride(1),
+        sel_index.stride(0), sel.stride(0), 0 if out_index_is_none else out_index.stride(0),
+        out_index_is_none=out_index_is_none,
+        dtype_id = dtype_to_type_id(out.dtype), allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+    )
+
+    return out.view(*sel_shape, N)
+
+
+@torch.library.register_fake("mylib::cvmm_triton", cvmm_triton)
+def cvmm_triton_abstract(x, sel_idx, sel, keys, out_dtype, out_index):
+    sel_shape = sel.shape
+    sel = sel.flatten()
+    M = sel.shape[0]
+    O, K, N = keys.shape
+    out = torch.empty((M, N), device=x.device, dtype=out_dtype)
+    sel_shape = sel.shape
+    return out.view(*sel_shape, N)
+
+
+def cvmm_triton_backward(
+    x: torch.Tensor,
+    sel_index: torch.Tensor,
+    sel: torch.Tensor,
+    grads: torch.Tensor,
+    n_experts: int,
+    key_dtype: torch.dtype,
+    op_dtype: torch.dtype,
+    out_index: torch.Tensor
+):
+    x = x.flatten(end_dim=-2)
+    x = x.transpose(0, 1)
+    grads = grads.flatten(end_dim=-2)
+    sel = sel.flatten()
+    M, _ = x.shape
+    K, N = grads.shape
+    # FIX: out must be atomic_add'able, which excludes bfloat16. Cast to key_dtype after. Maybe this could be f16
+    out = torch.zeros((n_experts, M, N), device=x.device, dtype=torch.float32)
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), triton.cdiv(K, META['BLOCK_SIZE_K'] * META['K_BLOCKS'])
+    )
+    out_index_is_none = False
+    if out_index.numel() == 1 and out_index == -1:
+        out_index_is_none = True
+
+    cvmm_backward_kernel3[grid](
+        x, grads, out, sel_index, sel, out_index,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        grads.stride(0), grads.stride(1),
+        out.stride(0), out.stride(1), out.stride(2),
+        sel_index.stride(0), sel.stride(0), 0 if out_index_is_none else out_index.stride(0),
+        out_index_is_none=out_index_is_none,
+        out_dtype_id=dtype_to_type_id(out.dtype),
+        dtype_id=dtype_to_type_id(op_dtype),
+        allow_tf32=False #torch.backends.cuda.matmul.allow_tf32
+    )
+    return out.to(dtype=key_dtype)
+
+
+class CVMM(torch.autograd.Function):
+    warned = False
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        sel_index: torch.Tensor,
+        sel: torch.Tensor,
+        keys: torch.Tensor,
+        out_index: torch.Tensor | None = None,
+        reduction_weight: torch.Tensor | None = None
+    ):
+        ctx.save_for_backward(x, keys, sel, sel_index, out_index, reduction_weight)
+
+        # out_type = get_dtype()
+        out_type = x.dtype
+        # out_type = torch.float32
+        if out_index is None:
+            out_index = torch.tensor(-1).cuda()
+        res = torch.ops.mylib.cvmm_triton(x, sel_index, sel, keys, out_type, out_index)
+
+        if reduction_weight is not None:
+            res = res.view(*reduction_weight.shape, res.shape[-1])
+            res = (reduction_weight.unsqueeze(-2).type_as(res) @ res).squeeze(-2)
+
+        ctx.op_type = out_type
+        ctx.keys_type = keys.dtype
+        ctx.dtype = out_type
+        return res.type_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, keys, sel, sel_index, out_index, reduction_weight = ctx.saved_tensors
+        keys_dt = keys
+
+        # Backward for weight
+        if reduction_weight is not None:
+            # Project back the grads with he reduction weight, so the grad for the weight matrix is ok
+            grad_output_w = reduction_weight.unsqueeze(-1).type_as(grad_output) @ grad_output.unsqueeze(-2)
+        else:
+            grad_output_w  = grad_output
+
+        out_index_is_none = False
+        if out_index is None:
+            out_index_is_none = True
+            out_index = torch.tensor(-1).cuda()
+
+        grad_w = cvmm_triton_backward(
+            x,
+            sel_index,
+            sel,
+            grad_output_w,
+            keys_dt.shape[0],
+            ctx.keys_type,
+            ctx.dtype,
+            out_index=out_index
+        )
+
+        # Backward for input and reduction weight
+        grad_w_off = None
+
+        bw_index = sel_index if out_index_is_none else out_index
+        bw_index_out = torch.tensor(-1).cuda()
+        if reduction_weight is not None:
+            # Hack the output indices to emulate repeats
+            bw_index_out = bw_index
+            bw_index = bw_index // reduction_weight.shape[-1]
+
+        grad_x_full = torch.ops.mylib.cvmm_triton(
+            grad_output,
+            bw_index,
+            sel,
+            keys_dt.transpose(1,2),
+            ctx.op_type,
+            bw_index_out
+        )
+
+        grad_x_full = grad_x_full.view(*x.shape[:-1], -1, x.shape[-1])
+        if reduction_weight is not None:
+            # grad_x_full is the unscaled grad. For the input, we have to scale it, for the reduction wegiht,
+            # we have to compute dot products with the input.
+            grad_x = (reduction_weight.view(*grad_x_full.shape[:-1]).unsqueeze(-2).type_as(grad_x_full) @ grad_x_full).squeeze(-2)
+            grad_w_off = (grad_x_full.type_as(reduction_weight) @ x.unsqueeze(-1).type_as(reduction_weight)).squeeze(-1).view_as(reduction_weight)
+        elif grad_x_full.shape[-2] != 1:
+            grad_x = grad_x_full.sum(-2)
+        else:
+            grad_x = grad_x_full
+
+        grad_x = grad_x.view_as(x)
+
+        return grad_x, None, None, grad_w, None, grad_w_off
+
+
+def cvmm(x: torch.Tensor, sel: torch.Tensor | CVMMSel, keys: torch.Tensor):
+    if not isinstance(sel, CVMMSel):
+        sel = cvmm_prepare_sel(sel, keys.shape[0])
+    assert x.dtype == keys.dtype, f"{x.dtype=} != {keys.dtype=}"
+
+    return CVMM.apply(x, sel.sel_index, sel.sel, keys, sel.out_index, sel.reduction_weight)
+
+
+def cvmm_prepare_sel2(sel: torch.Tensor, w: torch.Tensor | None = None) -> CVMMSel:
+    # Has multiple selections for each batch element
+    n_per_batch = sel.shape[-1]
+
+    # indices = torch.arange(sel.nelement() // n_per_batch, device=sel.device, dtype=torch.int32)
+    # indices = indices.repeat_interleave(n_per_batch).flatten()
+
+    fsel = sel.flatten()
+    ssel, sel_index = fsel.sort()
+
+    # in_index = indices[sel_index]
+    in_index = sel_index // n_per_batch
+
+    return CVMMSel(sel, ssel.view_as(sel), in_index, sel_index, w)
+
+#endregion
+# -----------------------------------------------------------------------------
+#region MoEUT
+def log_mean(x: torch.Tensor, dim: int = 0):
+    return x.logsumexp(dim) - torch.log(torch.tensor(x.shape[dim]))
+
+
+def entropy_l(l: torch.Tensor) -> torch.Tensor:
+    return - (l * l.exp()).sum(-1)
+
+
+def entropy_reg(sel: torch.Tensor, dim: int) -> torch.Tensor:
+    sel = F.log_softmax(sel, dim=-1)
+    sel = log_mean(sel, dim)
+    return - entropy_l(sel).mean()
+
+
+class SigmaMoE(torch.nn.Module):
+    def __init__(self, dmodel: int, n_experts: int, expert_size: int, k: int,
+                 activation=F.relu,
+                 v_dim: int | None = None,
+                 expert_dropout: float = 0.0):
+
+        super().__init__()
+        self.k_dim = dmodel
+        self.v_dim = v_dim if v_dim is not None else dmodel
+        self.n_experts = n_experts
+        self.expert_size = expert_size
+        self.size = self.n_experts * self.expert_size
+        self.k_vec_dim = self.k_dim
+        self.num_heads = k
+        self.activation = activation
+        self.expert_dropout = expert_dropout
+
+        self.sel_hist = []
+
+        self.keys = torch.nn.Parameter(torch.empty(self.n_experts, self.k_vec_dim, self.expert_size))
+        self.values = torch.nn.Parameter(torch.empty(self.n_experts, self.expert_size, self.v_dim))
+        self.expert_sel = torch.nn.Parameter(torch.empty(self.n_experts, self.k_vec_dim))
+
+    @torch.no_grad
+    def reset_parameters(self, std_scale: float):
+        torch.nn.init.normal_(self.expert_sel, 0, std_scale / (self.k_dim) ** 0.5)
+        torch.nn.init.normal_(self.keys, 0, std_scale / (self.k_dim) ** 0.5)
+        torch.nn.init.normal_(self.values, 0, std_scale / (self.n_experts * self.expert_size) ** 0.5)
+
+        # self.renorm_keep_std(self.expert_sel, dim=1)
+        std = self.expert_sel.std()
+        self.expert_sel.div_(self.expert_sel.norm(dim=1, keepdim=True))
+        self.expert_sel.mul_(std / self.expert_sel.std())
+
+    def get_reg_loss(self) -> torch.Tensor:
+        if not self.sel_hist:
+            return 0
+
+        # Average over time and layers.
+        loss = entropy_reg(torch.stack(self.sel_hist, dim=-2).flatten(-3, -2), -2)
+        self.sel_hist = []
+        return loss
+
+    def forward(self, input: torch.Tensor, sel_input: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        # Selection score calculation
+        sel = F.linear(sel_input if sel_input is not None else input, self.expert_sel, None)
+        if self.training:
+            self.sel_hist.append(sel)
+
+        # Selection activation and topk
+        sel = F.sigmoid(sel)
+
+        if self.training and self.expert_dropout > 0:
+            mask = torch.rand_like(sel) < self.expert_dropout
+            sel = sel.masked_fill(mask, float("-inf"))
+
+        sel_val, sel_index = sel.topk(self.num_heads, dim=-1, sorted=False)
+
+        # Preprocess the selection indices. They will be needed for both layers and save some time
+        sel_indices = cvmm_prepare_sel2(sel_index.int())
+
+        # "Up-projection" layer for each head
+        scores = cvmm(input, sel_indices, self.keys)
+        scores = self.activation(scores)
+
+        # Down projection layer for each head
+        sel_indices = sel_indices.clone()
+        sel_indices.reduction_weight = sel_val
+        sel_indices.sel_index = sel_indices.out_index
+        sel_indices.out_index = None
+
+        out = cvmm(scores, sel_indices, self.values)
+
+        res = out.view(*input.shape[:-1], self.v_dim)
+        return res
+
+
+class SwitchHeadRoPE(torch.nn.Module):
+    def __init__(self, state_size: int, num_heads: int, n_experts: int, max_seq_len: int,
+                 head_dim: int | None = None, expert_dropout: float = 0.0, moe_k: int = 2
+                 ):
+
+        super().__init__()
+
+        self.input_size = state_size
+        self.output_size = state_size
+        self.pe_size = self.input_size
+        self.expert_dropout = expert_dropout
+        self.moe_k = moe_k
+        self.attention_to_visualize = []
+        self.selections_to_visualize = {}
+        self.n_experts = n_experts
+
+        self.sel_hist = []
+
+        self.num_heads = num_heads
+        self.head_dim = head_dim or (state_size // num_heads)
+        self.rotary = Rotary(self.head_dim, max_seq_len)
+
+        self.q = torch.nn.Linear(self.input_size, self.head_dim * self.num_heads, bias=False)
+        self.k = torch.nn.Linear(self.input_size, self.head_dim * self.num_heads, bias=False)
+
+        if self.n_experts > 1:
+            self.v = torch.nn.Parameter(torch.empty(self.num_heads * self.n_experts, self.input_size, self.head_dim))
+            self.o = torch.nn.Parameter(torch.empty(self.num_heads * self.n_experts, self.head_dim, self.output_size))
+            self.sel_v = torch.nn.Parameter(torch.empty(self.num_heads * self.n_experts, self.input_size))
+        else:
+            self.v = torch.nn.Parameter(torch.empty(self.num_heads * self.head_dim, self.input_size))
+            self.o = torch.nn.Parameter(torch.empty(self.output_size, self.num_heads * self.head_dim))
+
+        self.sel_o = torch.nn.Parameter(torch.empty(self.num_heads * self.n_experts, self.input_size))
+
+        self.register_buffer("scale", torch.full([1], 1.0 / (self.head_dim) ** 0.5), persistent=False)
+
+    @torch.no_grad
+    def reset_parameters(self, std_scale: float):
+        def renorm_rows(x: torch.Tensor):
+            std_t = x.std(dim=-1, keepdim=True)
+            x.div_(x.norm(dim=-1, keepdim=True))
+            x.mul_(std_t / x.std())
+
+        if self.n_experts > 1:
+            torch.nn.init.normal_(self.sel_v, 0, std_scale / (self.input_size) ** 0.5)
+            renorm_rows(self.sel_v)
+
+        torch.nn.init.normal_(self.sel_o, 0, std_scale / (self.input_size) ** 0.5)
+        renorm_rows(self.sel_o)
+
+        torch.nn.init.normal_(self.k.weight, 0, std_scale / (self.input_size) ** 0.5)
+        torch.nn.init.normal_(self.q.weight, 0, std_scale / (self.input_size) ** 0.5)
+        torch.nn.init.normal_(self.v, 0, std_scale / (self.input_size) ** 0.5)
+        torch.nn.init.normal_(self.o, 0, std_scale / (self.num_heads * self.head_dim) ** 0.5)
+
+
+    def project_to_torch_order(self, x: torch.Tensor):
+        return x.view(*x.shape[:-1], self.num_heads, -1).transpose(-2, -3)
+
+
+    def get_sel(self, t: torch.Tensor, w: torch.Tensor) -> tuple[CVMMSel, torch.Tensor]:
+        sel = F.linear(t, w).float()
+        sel = sel_raw = sel.view(*sel.shape[:-1], self.num_heads, -1)
+        sel = sel.sigmoid()
+
+        with torch.no_grad():
+            if self.expert_dropout > 0 and self.training:
+                mask = torch.rand_like(sel) < self.expert_dropout
+                sel2 = sel.masked_fill(mask, float('-inf'))
+            else:
+                sel2 = sel
+            _, sel_index = sel2.topk(self.moe_k, dim=-1, sorted=False)
+        sel_val = torch.gather(sel, -1, sel_index)
+
+        sel_index_shifted = (torch.arange(self.num_heads, device=sel_index.device, dtype=sel_index.dtype) * self.n_experts).unsqueeze(-1) + sel_index
+        return cvmm_prepare_sel2(sel_index_shifted.flatten(-2,-1), sel_val), sel_raw
+
+    def get_reg_loss(self) -> torch.Tensor:
+        loss = 0
+        if self.sel_hist:
+            for i in range(len(self.sel_hist[0])):
+                loss = loss + entropy_reg(torch.stack([l[i] for l in self.sel_hist], dim=-3).flatten(-4,-3), -3)
+        self.sel_hist = []
+        return loss
+
+    def forward(self, q_src: torch.Tensor, k_src: torch.Tensor, v_src: torch.Tensor, ve: torch.Tensor | None, block_mask: BlockMask) -> torch.Tensor:
+        # *src: [batch_size, out_len, c]
+        B, T = q_src.size(0), q_src.size(1) # batch size, sequence length
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
+
+        pos_offset = q_src.shape[1] - k_src.shape[1]
+        assert pos_offset >= 0
+
+        scale = self.scale.sqrt()
+
+        q = self.q(q_src)
+        k = self.k(k_src)
+        q = q * scale.type_as(q)
+        k = k * scale.type_as(k)
+
+        if self.n_experts > 1:
+            v_sel, v_sel_r = self.get_sel(k_src, self.sel_v)
+            o_sel, o_sel_r = self.get_sel(q_src, self.sel_o)
+            if self.training:
+                self.sel_hist.append((o_sel_r, v_sel_r))
+
+            v = cvmm(v_src, v_sel, self.v).transpose(-2, -3)
+        else:
+            o_gate = F.sigmoid(F.linear(q_src, self.sel_o))
+            # v = self.project_to_torch_order(F.linear(v_src, self.v))
+            # return x.view(*x.shape[:-1], self.num_heads, -1).transpose(-2, -3)
+            v = F.linear(v_src, self.v).view(B, T, self.num_heads, self.head_dim).transpose(1,2)
+
+        q = q.view(B, T, self.num_heads, self.head_dim)
+        k = k.view(B, T, self.num_heads, self.head_dim)
+        v = v.type_as(q)
+
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = self.rotary(q).transpose(1,2), self.rotary(k).transpose(1,2)
+        # if ve is not None:
+        #     v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+        # else: # skip mid-layers token value embeddings by @YouJiacheng
+        #     v = self.lambdas[0] * v
+
+        res = flex_attention(q, k, v, block_mask=block_mask, scale=0.12)
+        res = res.transpose(1, 2)
+
+        if self.n_experts > 1:
+            # The output selection indices are calculated from the current state and are also used for projecting "q".
+            # But that projection needs to create multiple copies for the different heads. Here we already have the
+            # heads, but we have to create copies for the top-k elements. We can calculate that from the reduction
+            # weight. We also want to compute not only the weighted average between the top-k elements, but also
+            # of the different heads. So reshape the reduction weight accordingly.
+            o_sel.sel_index = o_sel.out_index // o_sel.reduction_weight.shape[-1]
+            o_sel.reduction_weight = o_sel.reduction_weight.flatten(-2)
+            out = cvmm(res, o_sel, self.o)
+        else:
+            res = res * o_gate[..., None]
+            out = F.linear(res.flatten(-2), self.o)
+
+        return out
+
+
+class MoEUTLayer(torch.nn.Module):
+    def __init__(self, d_model: int, num_heads: int, ff_expert_size: int, ff_n_experts: int,
+                 att_n_experts: int, max_seq_len: int, head_dim: int | None = None, att_k: int = 2,
+                 ff_k: int = 8, ff_expert_dropout: float = 0.0, att_expert_dropout: float = 0.0):
+
+        super().__init__()
+        self.attention = SwitchHeadRoPE(
+            d_model, num_heads, att_n_experts, max_seq_len=max_seq_len, head_dim=head_dim, moe_k=att_k,
+            expert_dropout=att_expert_dropout)
+        self.ffn = SigmaMoE(d_model, ff_n_experts, ff_expert_size, k=ff_k, expert_dropout=ff_expert_dropout)
+        self.ln1 = torch.nn.LayerNorm(d_model)
+        self.ln2 = torch.nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, ve: torch.Tensor | None, block_mask: BlockMask) -> torch.Tensor:
+        xnorm = self.ln1(x)
+        x = x + self.attention(xnorm, xnorm, x, ve, block_mask)
+        upd = self.ffn(x, self.ln2(x))
+        return x + upd
+
+
+class MoEUT(torch.nn.Module):
+    def __init__(self, d_model: int, n_layers: int, num_heads: int, ff_expert_size: int, ff_n_experts: int,
+                 att_n_experts: int, max_seq_len: int, head_dim: int | None = None, att_k: int = 2,
+                 ff_k: int = 8, ff_expert_dropout: float = 0.0, att_expert_dropout: float = 0.0,
+                 entropy_reg: float = 0.01, att_entropy_reg: float = 0.001,
+                 group_size: int = 2):
+        super().__init__()
+
+        self.entropy_reg = entropy_reg
+        self.att_entropy_reg = att_entropy_reg
+
+        self.n_repeats = n_layers // group_size
+        self.layers = torch.nn.ModuleList([
+            MoEUTLayer(d_model, num_heads, ff_expert_size, ff_n_experts, att_n_experts,
+                       max_seq_len, head_dim, att_k, ff_k,
+                       ff_expert_dropout, att_expert_dropout)
+            for _ in range(group_size)
+        ])
+
+        self.reset_parameters()
+
+    def forward(self, x: torch.Tensor, block_mask: BlockMask) -> tuple[torch.Tensor, torch.Tensor]:
+        # Run the model
+        for r in range(self.n_repeats):
+            for layer in self.layers:
+                x = layer(x, ve=None, block_mask=block_mask)
+
+        # Collect regularizaiton losses. Must be at the end because it is across the layers.
+        reg_loss = torch.zeros(1, device=x.device, dtype=torch.float32)
+        for layer in self.modules():
+            if isinstance(layer, SigmaMoE):
+                reg_loss = reg_loss + self.entropy_reg * layer.get_reg_loss()
+            elif isinstance(layer, SwitchHeadRoPE):
+                reg_loss = reg_loss + self.att_entropy_reg * layer.get_reg_loss()
+
+        return x, reg_loss
+
+    @torch.no_grad
+    def reset_parameters(self):
+        scale = (2 / (self.n_repeats * len(self.layers))) ** 0.5
+        for layer in self.modules():
+            if isinstance(layer, (SwitchHeadRoPE, SigmaMoE)):
+                layer.reset_parameters(scale)
+            elif isinstance(layer, torch.nn.LayerNorm):
+                torch.nn.init.ones_(layer.weight)
+                torch.nn.init.zeros_(layer.bias)
+
+
+class MoEUTWrapper(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        self.moeut = MoEUT(
+            d_model=model_dim,
+            n_layers=num_layers,
+            num_heads=num_heads,
+            ff_expert_size=128,
+            ff_n_experts=64,  # FIXME: Arbitrary decision
+            att_n_experts=10, # !! From MoEUT paper, but they also used really weird numbers like d_head=41 so I don't trust their judgement
+            max_seq_len=max_seq_len,
+            head_dim=None,
+            att_k=2,
+            ff_k=8,
+            ff_expert_dropout=0.0,
+            att_expert_dropout=0.0,
+            entropy_reg=0.01,
+            att_entropy_reg=0.001,
+            group_size=2,
+        )
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
+        self.lm_head.weight.detach().zero_() # @Grad62304977
+
+
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+        assert input_seq.ndim == 1
+
+        long_bm, _ = create_block_masks(input_seq, sliding_window_num_blocks)
+
+        x = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x, reg_loss = self.moeut(x, long_bm)
+        x = norm(x)
+        logits = self.lm_head(x)
+        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+        logits = 30 * torch.sigmoid(logits.float() / 7.5)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
+        if self.training:
+            loss = loss + reg_loss
+        return loss
+
+
 #endregion
 # -----------------------------------------------------------------------------
 #region Our own simple Distributed Data Loader
@@ -483,10 +1383,11 @@ def print0(s, console=True):
     if master_process:
         timestamp = time.strftime("%H:%M:%S.") + f"{time.time() % 1:.3f}"[2:]
         s = f"{timestamp}: {s}"
-        with open(logfile, "a") as f:
-            if console:
-                print(s)
-            print(s, file=f)
+        if console:
+            print(s)
+        if logfile:
+            with open(logfile, "a") as f:
+                print(s, file=f)
 
 def log_mem():
     print0(
@@ -510,6 +1411,7 @@ class Hyperparameters:
     seq_len: int = 48*1024 # FlexAttention sequence length
     val_seq_len: int = 4*64*1024 # FlexAttention sequence length for validation
     save_checkpoint: bool = False
+    dev: bool = False
 
 TEST_HPARAMS = Hyperparameters(
     train_files = "data/fineweb1B/fineweb_train_*.bin",
@@ -521,13 +1423,28 @@ TEST_HPARAMS = Hyperparameters(
     seq_len = 16*1024,
     val_seq_len = 4*16*1024,
     save_checkpoint = False,
+    dev=False,
 )
+DEV_HPARAMS = Hyperparameters(
+    train_files = "data/fineweb1B/fineweb_train_*.bin",
+    val_files = "data/fineweb1B/fineweb_val_*.bin",
+    val_tokens = 1024,
+    num_iterations = 20,
+    cooldown_frac = 0.4,
+    val_loss_every = 125,
+    seq_len = 512,
+    val_seq_len = 512,
+    save_checkpoint = False,
+    dev=True,
+)
+
 #endregion
 # -----------------------------------------------------------------------------
 #region main()
 master_process = None
 logfile = None
 def main(args = TEST_HPARAMS):
+# def main(args = DEV_HPARAMS):
     global master_process, logfile
     # torchrun sets these env variables
     rank = int(os.environ["RANK"])
@@ -541,7 +1458,7 @@ def main(args = TEST_HPARAMS):
     master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
     # begin logging
-    if master_process:
+    if master_process and not args.dev:
         run_id = uuid.uuid4()
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{run_id}.txt"
@@ -571,7 +1488,7 @@ def main(args = TEST_HPARAMS):
     torch.cuda.synchronize()
     print0("Init model")
     # REF: model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
-    model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=3, model_dim=384, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    model: nn.Module = MoEUTWrapper(vocab_size=50257, num_layers=12, num_heads=3, model_dim=384, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
     model.bfloat16()
     for m in model.modules():
         if isinstance(m, nn.Embedding):
@@ -590,7 +1507,7 @@ def main(args = TEST_HPARAMS):
     torch.cuda.synchronize()
     print0("Init optimizers")
     # collect the parameters to optimize
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+    hidden_matrix_params = [p for n, p in model.named_parameters() if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
     embed_params = [p for n, p in model.named_parameters() if "embed" in n]
     scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2]
     head_params = [model.lm_head.weight]
@@ -616,8 +1533,8 @@ def main(args = TEST_HPARAMS):
     def sw_num_blks(window_size: int):
         return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
-    # Compiling only on layers & output head saves startup time but slows by ~6%, uses ~10% more VRAM
-    model: nn.Module = torch.compile(model) #, dynamic=False)
+    if not args.dev:
+        model: nn.Module = torch.compile(model) #, dynamic=False)
 
     training_time_ms = 0
     # start the clock
@@ -720,7 +1637,7 @@ def main(args = TEST_HPARAMS):
             old_logfile = logfile
             logfile = f"logs/{new_logfile}.txt"
             os.rename(old_logfile, logfile)
-            print0("Renamed {old_logfile} -> {logfile}")
+            print0(f"Renamed {old_logfile} -> {logfile}")
     else:
         print(logfile)
 #endregion

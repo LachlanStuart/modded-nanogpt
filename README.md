@@ -26,7 +26,8 @@ Findings:
     * Total slowdown is much worse than one would expect based on FLOPS.
     * This failure is likely due to Muon being a orthogonalizing optimizer and keeping qkv from exploding.
     * 8 sinks optimized by Adam as scalars:  `val_loss:4.6776 step_avg:203.95ms`
-
+* MoEUT is slower but competitive with a smaller model
+    * 55M MoEUT: `val_loss:4.7876 step_avg:257.43ms`
 
 
 # Original README.md below

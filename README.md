@@ -28,6 +28,11 @@ Findings:
     * 8 sinks optimized by Adam as scalars:  `val_loss:4.6776 step_avg:203.95ms`
 * MoEUT is slower but competitive with a smaller model
     * 55M MoEUT: `val_loss:4.7876 step_avg:257.43ms`
+    * +LN->RMSNorm: `val_loss:5.0154 step_avg:255.81ms`
+    * +ReLU^2: nan @ step 9
+    * +RMSNorm MLP: `val_loss:5.4239 step_avg:251.43ms`
+    * +Adam Scalar on sel_: improved until step 500, then worsened back to init-levels by 900
+    * +Back to Muon, fix lr scaling (wasn't correcting for world_size 8 in original), tweaks to init: `val_loss:5.0411 step_avg:247.13ms`
 
 
 # Original README.md below

@@ -1,4 +1,4 @@
-from collections import defaultdict
+20:33:47.671: from collections import defaultdict
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -345,7 +345,7 @@ class ValueEmbedding(nn.Module):
     def forward(self, input_seq: Tensor) -> list[Tensor | None]:
         ve = [emb(input_seq) for emb in self.embed]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = list(ve) + [None] * (self.num_layers - 2 * self.num_embeddings) + list(ve)
+        ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 2 * self.num_embeddings) + [ve[0], ve[1], ve[2]]
         return ve
 #endregion
 # -----------------------------------------------------------------------------
@@ -1246,12 +1246,9 @@ class MoEUT(torch.nn.Module):
 
         if self.training:
             if self.training_step % 100 == 0:
-                for n, selsdict in zip(["o","v","f"], [o_sels, v_sels, ffn_sels]):
-                    for i, sels in selsdict.items():
-                        sels = torch.stack(sels).detach().flatten(0,2).softmax(-1)
-                        stats = sels.mean(0).cpu().float().numpy()
-                        print(f"{n}{i}: {stats}")
-
+                print(f"o: {torch.stack([t for ts in o_sels.values() for t in ts]).detach()}")
+                print(f"v: {torch.stack([t for ts in v_sels.values() for t in ts]).detach()}")
+                print(f"f: {torch.stack([t for ts in ffn_sels.values() for t in ts]).detach()}")
                 print(f"{att_reg_loss.detach()=}")
                 print(f"{ffn_reg_loss.detach()=}")
             self.training_step += 1
@@ -1275,9 +1272,9 @@ class MoEUT(torch.nn.Module):
 class MoEUTWrapper(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
-        group_size = 2
         self.embed = nn.Embedding(vocab_size, model_dim)
-        self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers, num_embeddings=group_size)
+        self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers)
+        group_size = 2
         # Select FF hparams for equal parameters & FLOPs compared to original
         ff_expert_size = 128 # ff_expert_size may be tuned without breaking comparability
         ff_k = (model_dim * 4) // ff_expert_size
@@ -1630,3 +1627,88 @@ def main(args = TEST_HPARAMS):
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
+
+20:33:47.671: ====================================================================================================
+20:33:47.671: Running Python 3.12.7 (main, Oct 16 2024, 04:37:19) [Clang 18.1.8 ]
+20:33:47.671: Running PyTorch 2.7.0.dev20250110+cu126 compiled for CUDA 12.6
+20:33:47.752: Sun Feb  2 20:33:47 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 560.35.02              Driver Version: 560.94         CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3090 Ti     On  |   00000000:2D:00.0 Off |                  Off |
+| 30%   42C    P2             95W /  450W |    1043MiB /  24564MiB |      2%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A        26      G   /Xwayland                                   N/A      |
+|    0   N/A  N/A    315945      C   /python3.12                                 N/A      |
++-----------------------------------------------------------------------------------------+
+
+20:33:47.752: ====================================================================================================
+20:33:47.753: Init data
+20:33:47.753: Init model
+20:33:48.117: ff_k=12 ff_n_experts=72
+20:33:48.501: torch.bfloat16: 111.834Mi params
+20:33:48.501: total: 111.834Mi params
+20:33:48.501: Init optimizers
+20:33:48.517: Starting train loop
+20:34:17.880: step:0/1000 val_loss:10.8258 step_avg:nanms train_time:0s
+20:34:50.649: step:1/1000 train_loss:10.6735 step_avg:nanms train_time:33s torch.cuda.max_memory_allocated()=6931580416
+20:34:51.098: step:2/1000 train_loss:10.6418 step_avg:nanms train_time:33s torch.cuda.max_memory_allocated()=6931580416
+20:34:51.335: step:3/1000 train_loss:10.4946 step_avg:nanms train_time:33s torch.cuda.max_memory_allocated()=6931580416
+20:34:51.572: step:4/1000 train_loss:10.3152 step_avg:nanms train_time:34s torch.cuda.max_memory_allocated()=6931580416
+20:34:51.813: step:5/1000 train_loss:10.1138 step_avg:nanms train_time:34s torch.cuda.max_memory_allocated()=6931580416
+20:34:52.050: step:6/1000 train_loss:9.9141 step_avg:nanms train_time:34s torch.cuda.max_memory_allocated()=6931580416
+20:34:52.286: step:7/1000 train_loss:9.7455 step_avg:nanms train_time:34s torch.cuda.max_memory_allocated()=6931580416
+20:34:52.522: step:8/1000 train_loss:9.5722 step_avg:nanms train_time:35s torch.cuda.max_memory_allocated()=6931580416
+20:34:52.760: step:9/1000 train_loss:9.4180 step_avg:nanms train_time:35s torch.cuda.max_memory_allocated()=6931580416
+20:34:52.998: step:10/1000 train_loss:9.3022 step_avg:nanms train_time:35s torch.cuda.max_memory_allocated()=6931580416
+20:34:53.234: step:11/1000 train_loss:9.0253 step_avg:nanms train_time:0s torch.cuda.max_memory_allocated()=6931580416
+20:34:53.470: step:12/1000 train_loss:8.7039 step_avg:nanms train_time:0s torch.cuda.max_memory_allocated()=6931580416
+20:34:53.707: step:13/1000 train_loss:8.3896 step_avg:236.14ms train_time:1s torch.cuda.max_memory_allocated()=6931580416
+20:34:53.944: step:14/1000 train_loss:8.1649 step_avg:236.33ms train_time:1s torch.cuda.max_memory_allocated()=6931580416
+20:34:54.180: step:15/1000 train_loss:8.0076 step_avg:236.38ms train_time:1s torch.cuda.max_memory_allocated()=6931580416
+20:34:54.417: step:16/1000 train_loss:7.8860 step_avg:236.42ms train_time:1s torch.cuda.max_memory_allocated()=6931580416
+20:34:54.654: step:17/1000 train_loss:7.7950 step_avg:236.50ms train_time:2s torch.cuda.max_memory_allocated()=6931580416
+20:34:54.893: step:18/1000 train_loss:7.7623 step_avg:236.79ms train_time:2s torch.cuda.max_memory_allocated()=6931580416
+20:34:55.131: step:19/1000 train_loss:7.6894 step_avg:236.93ms train_time:2s torch.cuda.max_memory_allocated()=6931580416
+20:34:55.368: step:20/1000 train_loss:7.6068 step_avg:236.94ms train_time:2s torch.cuda.max_memory_allocated()=6931580416
+20:35:02.444: step:50/1000 train_loss:6.4782 step_avg:236.15ms train_time:9s torch.cuda.max_memory_allocated()=6931580416
+20:35:14.257: step:100/1000 train_loss:6.1521 step_avg:236.21ms train_time:21s torch.cuda.max_memory_allocated()=6931580416
+20:35:23.329: step:125/1000 val_loss:6.1870 step_avg:236.47ms train_time:27s
+20:35:29.285: step:150/1000 train_loss:5.8779 step_avg:236.78ms train_time:33s torch.cuda.max_memory_allocated()=7367880704
+20:35:41.241: step:200/1000 train_loss:5.8404 step_avg:237.40ms train_time:45s torch.cuda.max_memory_allocated()=7367880704
+20:35:53.351: step:250/1000 train_loss:5.5569 step_avg:238.40ms train_time:57s torch.cuda.max_memory_allocated()=7367880704
+20:35:56.288: step:250/1000 val_loss:5.8256 step_avg:238.40ms train_time:57s
+20:36:08.516: step:300/1000 train_loss:5.4606 step_avg:239.46ms train_time:69s torch.cuda.max_memory_allocated()=7367880704
+20:36:20.782: step:350/1000 train_loss:5.4810 step_avg:240.32ms train_time:82s torch.cuda.max_memory_allocated()=7367880704
+20:36:29.895: step:375/1000 val_loss:5.5939 step_avg:240.73ms train_time:88s
+20:36:36.135: step:400/1000 train_loss:5.4473 step_avg:241.29ms train_time:94s torch.cuda.max_memory_allocated()=7367880704
+20:36:48.752: step:450/1000 train_loss:5.2711 step_avg:242.55ms train_time:107s torch.cuda.max_memory_allocated()=7367880704
+20:37:01.246: step:500/1000 train_loss:5.0981 step_avg:243.30ms train_time:119s torch.cuda.max_memory_allocated()=7367880704
+20:37:04.210: step:500/1000 val_loss:5.3978 step_avg:243.30ms train_time:119s
+20:37:16.929: step:550/1000 train_loss:5.1524 step_avg:244.32ms train_time:132s torch.cuda.max_memory_allocated()=7367880704
+20:37:29.587: step:600/1000 train_loss:5.1751 step_avg:245.07ms train_time:145s torch.cuda.max_memory_allocated()=7367880704
+20:37:38.912: step:625/1000 val_loss:5.2349 step_avg:245.41ms train_time:151s
+20:37:45.246: step:650/1000 train_loss:5.0633 step_avg:245.72ms train_time:157s torch.cuda.max_memory_allocated()=7367880704
+20:37:58.028: step:700/1000 train_loss:5.0838 step_avg:246.44ms train_time:170s torch.cuda.max_memory_allocated()=7367880704
+20:38:10.845: step:750/1000 train_loss:4.8796 step_avg:247.11ms train_time:183s torch.cuda.max_memory_allocated()=7367880704
+20:38:13.860: step:750/1000 val_loss:5.0715 step_avg:247.11ms train_time:183s
+20:38:26.668: step:800/1000 train_loss:4.9498 step_avg:247.68ms train_time:196s torch.cuda.max_memory_allocated()=7367880704
+20:38:39.592: step:850/1000 train_loss:4.8606 step_avg:248.32ms train_time:209s torch.cuda.max_memory_allocated()=7367880704
+20:38:49.059: step:875/1000 val_loss:4.9474 step_avg:248.58ms train_time:215s
+20:38:55.503: step:900/1000 train_loss:4.7680 step_avg:248.84ms train_time:221s torch.cuda.max_memory_allocated()=7367880704
+20:39:08.464: step:950/1000 train_loss:4.7411 step_avg:249.39ms train_time:234s torch.cuda.max_memory_allocated()=7367880704
+20:39:21.464: step:1000/1000 train_loss:4.5413 step_avg:249.93ms train_time:247s torch.cuda.max_memory_allocated()=7367880704
+20:39:24.512: step:1000/1000 val_loss:4.8793 step_avg:249.93ms train_time:247s
+20:40:15.898: Renamed logs/ed14917d-4e03-444a-997d-1d5c37e60233.txt -> logs/20250202_MoEUT2_ValueEmbeds.txt
+20:40:15.900: peak memory allocated: 7026 MiB reserved: 11474 MiB

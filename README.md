@@ -35,6 +35,8 @@ Findings:
     * +Back to Muon, fix lr scaling (wasn't correcting for world_size 8 in original), tweaks to init: `val_loss:5.0411 step_avg:247.13ms`
     * `20250202_MoEUT2_FixedSels`: Fixed initialization for sels, added lambdas in attention: `val_loss:4.9316 step_avg:266.86ms`
     * `20250202_MoEUT2_Skips`: Added per-layer weights/gates & unet-skip connections (both good, latter better): `val_loss:4.8662 step_avg:247.70ms`
+    * `20250202_MoEUT2_ValueEmbeds`: Added value embeds - `val_loss:4.8793 step_avg:249.93ms`
+    * `20250202_MoEUT2_ValueEmbeds2`: Tweaked to only 2 value embeds - `val_loss:4.8520 step_avg:249.41ms`
 
 
 # Original README.md below

@@ -1,4 +1,4 @@
-from collections import defaultdict
+20:48:33.475: from collections import defaultdict
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -1630,3 +1630,88 @@ def main(args = TEST_HPARAMS):
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
+
+20:48:33.475: ====================================================================================================
+20:48:33.475: Running Python 3.12.7 (main, Oct 16 2024, 04:37:19) [Clang 18.1.8 ]
+20:48:33.475: Running PyTorch 2.7.0.dev20250110+cu126 compiled for CUDA 12.6
+20:48:33.553: Sun Feb  2 20:48:33 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 560.35.02              Driver Version: 560.94         CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3090 Ti     On  |   00000000:2D:00.0  On |                  Off |
+| 30%   47C    P2             99W /  450W |    1043MiB /  24564MiB |      6%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A        26      G   /Xwayland                                   N/A      |
+|    0   N/A  N/A    319464      C   /python3.12                                 N/A      |
++-----------------------------------------------------------------------------------------+
+
+20:48:33.553: ====================================================================================================
+20:48:33.554: Init data
+20:48:33.554: Init model
+20:48:33.828: ff_k=12 ff_n_experts=72
+20:48:34.142: torch.bfloat16: 93.429Mi params
+20:48:34.142: total: 93.429Mi params
+20:48:34.142: Init optimizers
+20:48:34.158: Starting train loop
+20:48:52.791: step:0/1000 val_loss:10.8258 step_avg:nanms train_time:0s
+20:49:18.532: step:1/1000 train_loss:10.6735 step_avg:nanms train_time:26s torch.cuda.max_memory_allocated()=6892982784
+20:49:19.008: step:2/1000 train_loss:10.6398 step_avg:nanms train_time:26s torch.cuda.max_memory_allocated()=6892982784
+20:49:19.243: step:3/1000 train_loss:10.4875 step_avg:nanms train_time:26s torch.cuda.max_memory_allocated()=6892982784
+20:49:19.479: step:4/1000 train_loss:10.3025 step_avg:nanms train_time:27s torch.cuda.max_memory_allocated()=6892982784
+20:49:19.717: step:5/1000 train_loss:10.0979 step_avg:nanms train_time:27s torch.cuda.max_memory_allocated()=6892982784
+20:49:19.952: step:6/1000 train_loss:9.8953 step_avg:nanms train_time:27s torch.cuda.max_memory_allocated()=6892982784
+20:49:20.188: step:7/1000 train_loss:9.7253 step_avg:nanms train_time:27s torch.cuda.max_memory_allocated()=6892982784
+20:49:20.425: step:8/1000 train_loss:9.5512 step_avg:nanms train_time:28s torch.cuda.max_memory_allocated()=6892982784
+20:49:20.663: step:9/1000 train_loss:9.3969 step_avg:nanms train_time:28s torch.cuda.max_memory_allocated()=6892982784
+20:49:20.897: step:10/1000 train_loss:9.2818 step_avg:nanms train_time:28s torch.cuda.max_memory_allocated()=6892982784
+20:49:21.132: step:11/1000 train_loss:9.0036 step_avg:nanms train_time:0s torch.cuda.max_memory_allocated()=6892982784
+20:49:21.366: step:12/1000 train_loss:8.6810 step_avg:nanms train_time:0s torch.cuda.max_memory_allocated()=6892982784
+20:49:21.601: step:13/1000 train_loss:8.3674 step_avg:234.66ms train_time:1s torch.cuda.max_memory_allocated()=6892982784
+20:49:21.837: step:14/1000 train_loss:8.1448 step_avg:234.92ms train_time:1s torch.cuda.max_memory_allocated()=6892982784
+20:49:22.071: step:15/1000 train_loss:7.9903 step_avg:234.83ms train_time:1s torch.cuda.max_memory_allocated()=6892982784
+20:49:22.306: step:16/1000 train_loss:7.8726 step_avg:234.76ms train_time:1s torch.cuda.max_memory_allocated()=6892982784
+20:49:22.541: step:17/1000 train_loss:7.7869 step_avg:234.81ms train_time:2s torch.cuda.max_memory_allocated()=6892982784
+20:49:22.777: step:18/1000 train_loss:7.7632 step_avg:234.92ms train_time:2s torch.cuda.max_memory_allocated()=6892982784
+20:49:23.011: step:19/1000 train_loss:7.6929 step_avg:234.89ms train_time:2s torch.cuda.max_memory_allocated()=6892982784
+20:49:23.246: step:20/1000 train_loss:7.6094 step_avg:234.82ms train_time:2s torch.cuda.max_memory_allocated()=6892982784
+20:49:30.290: step:50/1000 train_loss:6.4813 step_avg:234.82ms train_time:9s torch.cuda.max_memory_allocated()=6892982784
+20:49:42.099: step:100/1000 train_loss:6.1575 step_avg:235.58ms train_time:21s torch.cuda.max_memory_allocated()=6892982784
+20:49:51.226: step:125/1000 val_loss:6.1935 step_avg:235.97ms train_time:27s
+20:49:57.166: step:150/1000 train_loss:5.8881 step_avg:236.25ms train_time:33s torch.cuda.max_memory_allocated()=7252087296
+20:50:09.098: step:200/1000 train_loss:5.8371 step_avg:236.88ms train_time:45s torch.cuda.max_memory_allocated()=7252087296
+20:50:21.158: step:250/1000 train_loss:5.5559 step_avg:237.78ms train_time:57s torch.cuda.max_memory_allocated()=7252087296
+20:50:24.107: step:250/1000 val_loss:5.8234 step_avg:237.78ms train_time:57s
+20:50:36.308: step:300/1000 train_loss:5.4573 step_avg:238.86ms train_time:69s torch.cuda.max_memory_allocated()=7252087296
+20:50:48.569: step:350/1000 train_loss:5.4715 step_avg:239.79ms train_time:82s torch.cuda.max_memory_allocated()=7252087296
+20:50:57.683: step:375/1000 val_loss:5.5686 step_avg:240.20ms train_time:88s
+20:51:03.895: step:400/1000 train_loss:5.4227 step_avg:240.73ms train_time:94s torch.cuda.max_memory_allocated()=7252087296
+20:51:16.321: step:450/1000 train_loss:5.2469 step_avg:241.62ms train_time:106s torch.cuda.max_memory_allocated()=7252087296
+20:51:28.780: step:500/1000 train_loss:5.0519 step_avg:242.39ms train_time:119s torch.cuda.max_memory_allocated()=7252087296
+20:51:31.752: step:500/1000 val_loss:5.3434 step_avg:242.39ms train_time:119s
+20:51:44.331: step:550/1000 train_loss:5.1035 step_avg:243.24ms train_time:131s torch.cuda.max_memory_allocated()=7252087296
+20:51:56.979: step:600/1000 train_loss:5.1263 step_avg:244.06ms train_time:144s torch.cuda.max_memory_allocated()=7252087296
+20:52:06.317: step:625/1000 val_loss:5.1834 step_avg:244.43ms train_time:150s
+20:52:12.664: step:650/1000 train_loss:5.0182 step_avg:244.80ms train_time:157s torch.cuda.max_memory_allocated()=7252087296
+20:52:25.461: step:700/1000 train_loss:5.0473 step_avg:245.60ms train_time:169s torch.cuda.max_memory_allocated()=7252087296
+20:52:38.289: step:750/1000 train_loss:4.8453 step_avg:246.34ms train_time:182s torch.cuda.max_memory_allocated()=7252087296
+20:52:41.325: step:750/1000 val_loss:5.0349 step_avg:246.34ms train_time:182s
+20:52:54.124: step:800/1000 train_loss:4.9238 step_avg:246.95ms train_time:195s torch.cuda.max_memory_allocated()=7252087296
+20:53:07.021: step:850/1000 train_loss:4.8338 step_avg:247.61ms train_time:208s torch.cuda.max_memory_allocated()=7252087296
+20:53:16.495: step:875/1000 val_loss:4.9170 step_avg:247.88ms train_time:214s
+20:53:22.994: step:900/1000 train_loss:4.7402 step_avg:248.22ms train_time:221s torch.cuda.max_memory_allocated()=7252087296
+20:53:35.987: step:950/1000 train_loss:4.7131 step_avg:248.84ms train_time:234s torch.cuda.max_memory_allocated()=7252087296
+20:53:48.992: step:1000/1000 train_loss:4.5200 step_avg:249.41ms train_time:247s torch.cuda.max_memory_allocated()=7252087296
+20:53:52.048: step:1000/1000 val_loss:4.8520 step_avg:249.41ms train_time:247s
+20:57:07.914: Renamed logs/54705c13-be1e-4e02-883e-5f83bd3bfa94.txt -> logs/20250202_MoEUT2_ValueEmbeds2.txt
+20:57:07.916: peak memory allocated: 6916 MiB reserved: 11414 MiB

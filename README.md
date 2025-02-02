@@ -16,7 +16,7 @@ Plan:
 Licenses: This repository combines several independently-licensed sources, each of which requires its own notice to be distributed - see the `LICENSE` files.
 
 Findings:
-* [cut-cross-entropy](https://github.com/apple/ml-cross-entropy) was slower (196ms/step vs 184ms), except when set to `impl="torch_compile"`, where it was the same speed. (both were wrapped in a compile)
+* [cut-cross-entropy](https://github.com/apple/ml-cross-entropy) was slower (196ms/step vs 184ms), except when set to `impl="torch_compile"`, where it was the same speed. (both were wrapped in module-level compiles, not a full-model compile)
 * Attempting to hack in attention KV sinks (skipping the qkv projection) using flex_attention's return_lse to combine 2 query results. 1k steps * 16k seqlen:
     * baseline: `val_loss:4.6727 step_avg:154.44ms`
     * 1 sink:   `val_loss:4.6840 step_avg:231.85ms`

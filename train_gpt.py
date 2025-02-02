@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 import atexit
-from pprint import pprint
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -21,10 +20,9 @@ from torch.profiler import profile, record_function, ProfilerActivity
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 # torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
-# from cut_cross_entropy import linear_cross_entropy
 
 # -----------------------------------------------------------------------------
-# Custom operators : FP8 matmul by @YouJiacheng
+#region  Custom operators : FP8 matmul by @YouJiacheng
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
     @torch.compile
@@ -105,9 +103,9 @@ def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
     ctx.set_materialize_grads(False)
 
 mm_op.register_autograd(backward, setup_context=setup_context)
-
+#endregion
 # -----------------------------------------------------------------------------
-# Muon optimizer
+#region Muon optimizer
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
@@ -217,9 +215,9 @@ class Muon(torch.optim.Optimizer):
                 handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
-
+#endregion
 # -----------------------------------------------------------------------------
-# PyTorch nn.Module definitions for the model
+#region PyTorch nn.Module definitions for the model
 
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
@@ -283,8 +281,6 @@ class CausalSelfAttention(nn.Module):
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
-        self.k_sink = nn.Parameter(norm(torch.randn(1, num_heads, 8, head_dim)))
-        self.v_sink = nn.Parameter(norm(torch.randn(1, num_heads, 8, head_dim)))
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -296,17 +292,7 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = self.lambdas[0] * v
-        # Attention sinks:  bypass
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
-        y, lse = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale, return_lse=True)
-        sink_v, sink_lse = flex_attention(q.transpose(1, 2), norm(self.k_sink.type_as(x)), norm(self.v_sink.type_as(x)), scale=self.attn_scale, return_lse=True)
-
-        max_lse = torch.maximum(lse, sink_lse)
-        lse = (lse - max_lse).exp2()
-        sink_lse = (sink_lse - max_lse).exp2()
-        frac_lse = sink_lse / (lse + sink_lse)
-
-        y = y.lerp(sink_v, frac_lse.type_as(y).unsqueeze(-1))
         y = y.transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -354,9 +340,9 @@ class ValueEmbedding(nn.Module):
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         ve = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 2 * self.num_embeddings) + [ve[0], ve[1], ve[2]]
         return ve
-
+#endregion
 # -----------------------------------------------------------------------------
-# The main model
+#region The main model
 
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
@@ -460,9 +446,9 @@ class GPT(nn.Module):
         logits = 30 * torch.sigmoid(logits.float() / 7.5)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
         return loss
-
+#endregion
 # -----------------------------------------------------------------------------
-# Our own simple Distributed Data Loader
+#region Our own simple Distributed Data Loader
 
 def _load_data_shard(file: Path):
     header = torch.from_file(f"{file}", False, 256, dtype=torch.int32) # header is 256 int32
@@ -490,10 +476,9 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn"t helpful.
         pos += batch_size
         yield inputs, targets
-
+#endregion
 # -----------------------------------------------------------------------------
-# int main
-
+#region utils, hyperparams
 def print0(s, console=True):
     if master_process:
         timestamp = time.strftime("%H:%M:%S.") + f"{time.time() % 1:.3f}"[2:]
@@ -537,6 +522,9 @@ TEST_HPARAMS = Hyperparameters(
     val_seq_len = 4*16*1024,
     save_checkpoint = False,
 )
+#endregion
+# -----------------------------------------------------------------------------
+#region main()
 master_process = None
 logfile = None
 def main(args = TEST_HPARAMS):
@@ -553,7 +541,6 @@ def main(args = TEST_HPARAMS):
     master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
     # begin logging
-    logfile = None
     if master_process:
         run_id = uuid.uuid4()
         os.makedirs("logs", exist_ok=True)
@@ -603,9 +590,9 @@ def main(args = TEST_HPARAMS):
     torch.cuda.synchronize()
     print0("Init optimizers")
     # collect the parameters to optimize
-    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n and "sink" not in n]
+    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
     embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2 or "sink" in n]
+    scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2]
     head_params = [model.lm_head.weight]
 
     # init the optimizer(s)
@@ -727,7 +714,16 @@ def main(args = TEST_HPARAMS):
         approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
         print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms {torch.cuda.memory_allocated()=}", console=True)
 
-
-
+    if master_process and logfile is not None:
+        new_logfile = input("Name run? ")
+        if new_logfile:
+            old_logfile = logfile
+            logfile = f"logs/{new_logfile}.txt"
+            os.rename(old_logfile, logfile)
+            print0("Renamed {old_logfile} -> {logfile}")
+    else:
+        print(logfile)
+#endregion
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     main()

@@ -1,0 +1,1759 @@
+21:11:48.443: from collections import defaultdict
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import time
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+import atexit
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import torch
+torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+from torch import Tensor, nn
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.profiler import profile, record_function, ProfilerActivity
+# use of FlexAttention contributed by @KoszarskyB
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
+# torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
+import triton
+import triton.language as tl
+
+try:
+    from lovely_tensors import monkey_patch
+    monkey_patch()
+except ImportError:
+    pass
+
+
+# -----------------------------------------------------------------------------
+#region  Custom operators : FP8 matmul by @YouJiacheng
+@torch.library.custom_op("nanogpt::mm", mutates_args=())
+def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
+    @torch.compile
+    def impl(x: Tensor, w: Tensor):
+        assert x.is_contiguous() and w.is_contiguous()
+        # x_f8 = x.mul(x_s).to(torch.float8_e4m3fn)
+        x_f8 = x.mul(x_s).to(torch.float8_e5m2)
+        # w_f8 = w.mul(w_s).to(torch.float8_e4m3fn)
+        w_f8 = w.mul(w_s).to(torch.float8_e5m2)
+        out = torch._scaled_mm(
+            x_f8,
+            w_f8.t(),
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(1 / x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(1 / w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+        return out, x_f8, w_f8
+
+    return impl(x, w)
+
+@mm_op.register_fake
+def _(x: Tensor, w: Tensor, *_):
+    assert x.ndim == w.ndim == 2
+    assert x.shape[1] == w.shape[1]
+    assert x.device == w.device
+    assert x.is_contiguous() and w.is_contiguous()
+    # return x @ w.t(), x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+    return x @ w.t(), x.to(torch.float8_e5m2), w.to(torch.float8_e5m2)
+
+@torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
+def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
+    @torch.compile
+    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
+        assert grad.is_contiguous()
+        x_inv_s = grad.new_tensor(1 / x_s, dtype=torch.float32)
+        w_inv_s = grad.new_tensor(1 / w_s, dtype=torch.float32)
+        grad_inv_s = grad.new_tensor(1 / grad_s, dtype=torch.float32)
+        grad_f8 = grad.mul(grad_s).to(torch.float8_e5m2)
+        grad_x = torch._scaled_mm(
+            grad_f8,
+            w_f8.t().contiguous().t(),
+            out_dtype=torch.bfloat16,
+            scale_a=grad_inv_s,
+            scale_b=w_inv_s,
+            use_fast_accum=False,
+        )
+        # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
+        grad_w = torch._scaled_mm(
+            x_f8.t().contiguous(),
+            grad_f8.t().contiguous().t(),
+            out_dtype=torch.float32,
+            scale_a=x_inv_s,
+            scale_b=grad_inv_s,
+            use_fast_accum=False,
+        ).t()
+        return grad_x, grad_w
+
+    return impl(g, x_f8, w_f8)
+
+@mm_backward_op.register_fake
+def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
+    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
+
+def backward(ctx, grad_out: Tensor, *_):
+    x_f8, w_f8 = ctx.saved_tensors
+    x_s, w_s, grad_s = ctx.scales
+    grad_x, grad_w = torch.ops.nanogpt.mm_backward(
+        grad_out, x_f8, w_f8, x_s, w_s, grad_s
+    )
+    return grad_x, grad_w, None, None, None
+
+def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+    *_, x_s, w_s, grad_s = inputs
+    _, x_f8, w_f8 = output
+    ctx.save_for_backward(x_f8, w_f8)
+    ctx.scales = x_s, w_s, grad_s
+    ctx.set_materialize_grads(False)
+
+mm_op.register_autograd(backward, setup_context=setup_context)
+#endregion
+# -----------------------------------------------------------------------------
+#region Muon optimizer
+@torch.compile
+def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer assumes that all parameters passed in are 2D.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe it is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven"t tested this.
+    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        ns_steps: The number of Newton-Schulz iteration steps to use.
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
+        self.rank = rank
+        self.world_size = world_size
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        params: list[Tensor] = [*params]
+        assert all(isinstance(p, Tensor) for p in params)
+        sizes = {p.numel() for p in params}
+        def create_update_buffer(size: int):
+            b = torch.empty(self.world_size, size, dtype=torch.bfloat16, device="cuda")
+            return dict(update_buffer=b, update_buffer_views=[b[i] for i in range(self.world_size)])
+        param_groups = [
+            dict(params=[p for p in params if p.numel() == size], **create_update_buffer(size)) for size in sizes]
+        super().__init__(param_groups, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+            update_buffer = group["update_buffer"]
+            update_buffer_views: list[Tensor] = group["update_buffer_views"]
+            # generate weight updates in distributed fashion
+            params: list[Tensor] = group["params"]
+            handle = None
+            params_world = None
+            def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
+                if params_world is None:
+                    return
+                assert handle is not None
+                handle.wait()
+                for p_world, g_world in zip(params_world, update_buffer_views):
+                    p_world.add_(
+                        g_world.view_as(p_world),
+                        alpha=-lr * max(1, p_world.size(-2) / p_world.size(-1)) ** 0.5,
+                    )
+            for base_i in range(len(params))[::self.world_size]:
+                if base_i + self.rank < len(params):
+                    p = params[base_i + self.rank]
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf: Tensor = state["momentum_buffer"]
+                    buf.lerp_(g, 1 - momentum)
+                    g = g.lerp_(buf, momentum) if nesterov else buf
+                    g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
+                else:
+                    g = update_buffer_views[self.rank]
+                update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
+                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
+                params_world = params[base_i : base_i + self.world_size]
+            update_prev()
+#endregion
+# -----------------------------------------------------------------------------
+#region PyTorch nn.Module definitions for the model
+
+def norm(x: Tensor):
+    return F.rms_norm(x, (x.size(-1),))
+
+class CastedLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, use_fp8: bool = False, x_s: float = 1.0, w_s: float = 1.0, grad_s: float = 1.0):
+        super().__init__(in_features, out_features, bias=False)
+        self.use_fp8 = use_fp8
+        self.x_s = x_s
+        self.w_s = w_s
+        self.grad_s = grad_s
+
+    def reset_parameters(self) -> None:
+        std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
+            self.weight.uniform_(-bound, bound)
+
+    def forward(self, x: Tensor):
+        if self.use_fp8 and self.training:
+            _x = x.flatten(0, -2)
+            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
+            return out.reshape(*x.shape[:-1], -1)
+        else:
+            return F.linear(x, self.weight.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int):
+        super().__init__()
+        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
+        self.cos = nn.Buffer(theta.cos(), persistent=False)
+        self.sin = nn.Buffer(theta.sin(), persistent=False)
+
+    def forward(self, x_BTHD: Tensor):
+        assert self.cos.size(0) >= x_BTHD.size(-3)
+        cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        hdim = num_heads * head_dim
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
+        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
+        # https://x.com/hi_tysam/status/1879699187107033311
+        self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.rotary = Rotary(head_dim, max_seq_len)
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
+        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        self.attn_scale = 0.12
+        # Scalable-Softmax params
+        # Using 1/log(512) to approximately negate the log(n), assuming 512 is the average window_size (unchecked).
+        # This hasn't been tuned. Assuming that self.attn_scale was tuned, so trying to avoid deviating too much.
+        self.softmax_temps = nn.Parameter(1/torch.tensor([512] * num_heads).log())
+
+
+    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, logn: Tensor):
+        B, T = x.size(0), x.size(1) # batch size, sequence length
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
+        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = self.rotary(q), self.rotary(k)
+        # Apply Scalable-Softmax
+        q = q * self.softmax_temps[None, None, :, None] * logn.type_as(q)[None, :, None, None]
+
+        if ve is not None:
+            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = self.lambdas[0] * v
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
+        assert not y.isnan().any()
+        y = y.transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.c_fc = CastedLinear(dim, hdim)
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+
+    def forward(self, x: Tensor):
+        x = self.c_fc(x)
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = self.c_proj(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim: int, num_heads: int, layer_idx: int, max_seq_len: int):
+        super().__init__()
+        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
+        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
+        self.mlp = MLP(dim)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+
+    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask, logn: Tensor):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        if self.attn is not None:
+            x = x + self.attn(norm(x), ve, block_mask, logn)
+        x = x + self.mlp(norm(x))
+        return x
+
+class ValueEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, embedding_dim: int, num_layers: int, num_embeddings: int = 3):
+        super().__init__()
+        self.num_layers = num_layers
+        self.num_embeddings = num_embeddings
+        self.embed = nn.ModuleList([nn.Embedding(vocab_size, embedding_dim) for _ in range(num_embeddings)])
+
+    def forward(self, input_seq: Tensor) -> list[Tensor | None]:
+        ve = [emb(input_seq) for emb in self.embed]
+        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
+        ve = list(ve) + [None] * (self.num_layers - 2 * self.num_embeddings) + list(ve)
+        return ve
+#endregion
+# -----------------------------------------------------------------------------
+#region The main model
+
+def next_multiple_of_n(v: float | int, *, n: int):
+    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+
+def create_block_masks(input_seq: Tensor, sliding_window_num_blocks: Tensor):
+    BLOCK_SIZE = 128
+    docs = (input_seq == 50256).cumsum(0)
+
+    def document_causal(b, h, q_idx, kv_idx):
+        causal_mask = q_idx >= kv_idx
+        document_mask = docs[q_idx] == docs[kv_idx]
+        return causal_mask & document_mask
+
+    def dense_to_ordered(dense_mask: Tensor):
+        num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
+        indices = dense_mask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
+        return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+
+    # manual block mask creation by @YouJiacheng
+    assert len(input_seq) % BLOCK_SIZE == 0
+    NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
+    block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
+    any_causal_bm = block_idx[:, None] >= block_idx
+    all_causal_bm = block_idx[:, None] > block_idx
+    docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
+    docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
+    any_document_bm = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
+    all_document_bm = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
+    any_bm = any_causal_bm & any_document_bm
+    all_bm = all_causal_bm & all_document_bm
+    partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(any_bm & ~all_bm)
+    full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
+    def build_bm(sw_num_blocks: Tensor) -> BlockMask:
+        return BlockMask.from_kv_blocks(
+            torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(sw_num_blocks - full_kv_num_blocks, 1)),
+            partial_kv_indices,
+            torch.clamp_max(full_kv_num_blocks, sw_num_blocks - 1),
+            full_kv_indices,
+            BLOCK_SIZE=BLOCK_SIZE,
+            mask_mod=document_causal,
+        )
+
+    # Scalable-Softmax needs to know the number of visible keys for each position's query
+    # Gah, I give up. No SWA with SSMax.
+    full_bm = build_bm(NUM_BLOCKS)
+    input_pos = torch.arange(len(input_seq), device=input_seq.device)
+    seq_pos = input_pos - input_pos.masked_fill((input_seq != 50256), 0).cummax(0).values
+    logn = (seq_pos + 1).log()
+    return full_bm, full_bm, logn, logn
+
+    # # Does this work? Hard to test
+    # right_partial = input_pos - input_pos.masked_fill((input_seq != 50256) & (input_pos % BLOCK_SIZE != 0), 0).cummax(0).values
+    # long_window_size = (max(0, sliding_window_num_blocks - 1) * BLOCK_SIZE + right_partial).clamp_max(seq_pos)
+    # short_window_size = (max(0, sliding_window_num_blocks // 2 - 1) * BLOCK_SIZE + right_partial).clamp_max(seq_pos)
+    # long_logn = (long_window_size + 1).log()
+    # short_logn = (short_window_size + 1).log()
+
+    # breakpoint()
+
+    # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
+    # return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2), long_logn, short_logn
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
+        self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers)
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx, max_seq_len) for layer_idx in range(num_layers)])
+        # U-net design by @brendanh0gan
+        self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
+        self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
+        # Add learnable skip connection weights for decoder layers
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+        # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
+        # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
+        # self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
+        self.lm_head.weight.detach().zero_() # @Grad62304977
+
+
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+        assert input_seq.ndim == 1
+
+        long_bm, short_bm, long_ws, short_ws = create_block_masks(input_seq, sliding_window_num_blocks)
+
+        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        ve = self.value_embeds(input_seq)
+        assert len(ve) == len(self.blocks)
+        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
+        assert len(ve_enc) == self.num_encoder_layers and len(ve_dec) == self.num_decoder_layers
+
+        # Store outputs for U-Net skip connections
+        skip_connections = []
+        # Encoder pass - process only the first half of the blocks
+        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
+        logns = [long_ws, short_ws, short_ws, short_ws, long_ws, short_ws]
+        assert len(block_masks) == self.num_encoder_layers
+        for i, block in enumerate(self.blocks[:self.num_encoder_layers]):
+            x = block(x, ve_enc[i], x0, block_masks[i], logns[i])
+            skip_connections.append(x)
+        # Decoder pass - process the remaining blocks with weighted skip connections
+        block_masks.reverse()
+        logns.reverse()
+        assert len(block_masks) == self.num_decoder_layers
+        for i, block in enumerate(self.blocks[self.num_encoder_layers:]):
+            x = x + self.skip_weights[i] * skip_connections.pop()
+            x = block(x, ve_dec[i], x0, block_masks[i], logns[i])
+
+        x = norm(x)
+        logits = self.lm_head(x)
+        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+        logits = 30 * torch.sigmoid(logits.float() / 7.5)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
+        return loss
+
+#endregion
+# -----------------------------------------------------------------------------
+#region MoEUT Triton kernels
+# From https://github.com/RobertCsordas/moeut/blob/master/moeut/cvmm.py
+
+@dataclass
+class CVMMSel:
+    raw_sel: torch.Tensor
+    sel: torch.Tensor
+    sel_index: torch.Tensor
+    out_index: torch.Tensor | None = None
+    reduction_weight: torch.Tensor | None = None
+
+    def clone(self) -> 'CVMMSel':
+        return CVMMSel(self.raw_sel, self.sel, self.sel_index, self.out_index, self.reduction_weight)
+
+
+def cvmm_prepare_sel(sel: torch.Tensor, n_experts: int) -> CVMMSel:
+    fsel = sel.flatten()
+    ssel, sel_index = fsel.sort()
+    return CVMMSel(sel, ssel.view_as(sel), sel_index, None)
+
+
+def dtype_to_type_id(dtype: torch.dtype):
+    if dtype == torch.float32:
+        return 0
+    elif dtype == torch.float16:
+        return 1
+    elif dtype == torch.bfloat16:
+        return 2
+
+    raise ValueError("Unknown dtype")
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+    ],
+    key=['M', 'N', 'K', 'dtype_id', 'allow_tf32']
+)
+@triton.jit
+def cvmm_kernel(
+    # Pointers to matrices
+    a_ptr, b_ptr, c_ptr, index_ptr, sel_ptr, out_index_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # The stride variables represent how much to increase the ptr by when moving by 1
+    # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
+    # by to get the element one row down (A has M rows).
+    stride_am, stride_ak,
+    stride_bo, stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    stride_index, stride_sel, stride_out_index,
+    out_index_is_none: tl.constexpr,
+    dtype_id: tl.constexpr, allow_tf32: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr
+):
+    """Kernel for computing the matmul C = A x B.
+    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    # See above `L2 Cache Optimizations` section for details.
+    pid = tl.program_id(axis=0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    pid_m = first_pid_m + (pid % group_size_m)
+
+    sel_first = tl.load(sel_ptr + pid_m * BLOCK_SIZE_M * stride_sel)
+    sel_last = tl.load(sel_ptr + (min((pid_m + 1) * BLOCK_SIZE_M, M) - 1) * stride_sel)
+    sel_all = tl.load(sel_ptr + stride_sel * ((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M))
+
+    for matrix_id in range(sel_first, sel_last + 1):
+        # ----------------------------------------------------------
+        # Create pointers for the first blocks of A and B.
+        # We will advance this pointer as we move in the K direction
+        # and accumulate
+        # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+        # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+        # See above `Pointer Arithmetics` section for details
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+        remap_offs_am = tl.load(index_ptr + stride_index * offs_am)
+
+        # Create offset pointers
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        a_ptrs = a_ptr + (remap_offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = b_ptr + matrix_id * stride_bo + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+        # -----------------------------------------------------------
+        # Iterate to compute a block of the C matrix.
+        # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+        # of fp32 values for higher accuracy.
+        # `accumulator` will be converted back to fp16 after the loop.
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            # Load the next block of A and B, generate a mask by checking the K dimension.
+            # If it is out of bounds, set it to 0.
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            # We accumulate along the K dimension.
+
+            # Triton was unhappy with passing dtypes as vars.
+            if dtype_id == 1:
+                a = a.to(tl.float16)
+                b = b.to(tl.float16)
+            elif dtype_id == 2:
+                a = a.to(tl.bfloat16)
+                b = b.to(tl.bfloat16)
+
+            accumulator += tl.dot(a, b, allow_tf32=allow_tf32)
+
+            # Advance the ptrs to the next K block.
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+
+
+        if dtype_id == 1:
+            c = accumulator.to(tl.float16)
+        elif dtype_id == 2:
+            c = accumulator.to(tl.bfloat16)
+        else:
+            c = accumulator
+
+        # -----------------------------------------------------------
+        # Write back the block of the output matrix C with masks.
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+
+        if out_index_is_none:
+            remap_offs_cm = remap_offs_am
+        else:
+            remap_offs_cm = tl.load(out_index_ptr + stride_out_index * offs_am)
+
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * remap_offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = ((offs_cm[:, None] < M) & (sel_all[:, None] == matrix_id)) & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
+        # triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 128}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 4}, num_stages=4, num_warps=4),
+
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
+        # triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 128}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 8}, num_stages=4, num_warps=4),
+
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 16}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 16}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
+    ],
+    key=['M', 'N', 'K', 'out_dtype_id', 'allow_tf32', 'dtype_id'], reset_to_zero = ['c_ptr']
+)
+@triton.jit
+def cvmm_backward_kernel3(
+    # Pointers to matrices
+    a_ptr, b_ptr, c_ptr, index_ptr, sel_ptr, out_index_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # The stride variables represent how much to increase the ptr by when moving by 1
+    # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
+    # by to get the element one row down (A has M rows).
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_co, stride_cm, stride_cn,
+    stride_index, stride_sel, stride_out_index,
+    out_index_is_none: tl.constexpr,
+    out_dtype_id: tl.constexpr, allow_tf32: tl.constexpr, dtype_id: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr, K_BLOCKS: tl.constexpr
+):
+    """Kernel for computing the matmul C = A x B.
+    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    # See above `L2 Cache Optimizations` section for details.
+    pid = tl.program_id(axis=0)
+    k_block_id = tl.program_id(axis=1)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # ----------------------------------------------------------
+    # Create pointers for the first blocks of A and B.
+    # We will advance this pointer as we move in the K direction
+    # and accumulate
+    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    # See above `Pointer Arithmetics` section for details
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+    # -----------------------------------------------------------
+    # Iterate to compute a block of the C matrix.
+    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+    # of fp32 values for higher accuracy.
+    # `accumulator` will be converted back to fp16 after the loop.
+
+    a_ptrs_this = a_ptr + offs_am[:, None] * stride_am
+    b_ptrs_this = b_ptr + offs_bn[None, :] * stride_bn
+
+    # Kactual = end_i - start_i
+    # Nblocks = (Kactual + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+
+    # WORK_PER_WORKER = (Nblocks + K_BLOCKS - 1) // K_BLOCKS
+    # WORK_PER_WORKER = WORK_PER_WORKER if WORK_PER_WORKER > MIN_WORK_SIZE else MIN_WORK_SIZE
+
+
+    # # Kloop_start = (Kactual + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+
+    # first_block_k = k_block_id * WORK_PER_WORKER
+    # last_block_k = min((k_block_id+1) * WORK_PER_WORKER, Nblocks)
+
+    block_start_index = k_block_id * BLOCK_SIZE_K * K_BLOCKS
+    block_end_index = min(block_start_index + BLOCK_SIZE_K * K_BLOCKS, K) - 1
+
+    first_mat = tl.load(sel_ptr + stride_sel * block_start_index)
+    last_mat = tl.load(sel_ptr + stride_sel * block_end_index)
+
+
+    for matrix_index in range(first_mat, last_mat + 1):
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+        start_i = block_start_index
+        end_i = block_end_index + 1
+        while start_i < end_i:
+            middle = (start_i + end_i) // 2
+            middle_matrix = tl.load(sel_ptr + middle * stride_sel)
+            if middle_matrix < matrix_index:
+                start_i = middle + 1
+            else:
+                end_i = middle
+
+
+        # # Continue binary search: find the first matrix that is > matrix_index
+        start_i2 = start_i
+        end_i = block_end_index + 1
+        while start_i2 < end_i:
+            middle = (start_i2 + end_i) // 2
+            middle_matrix = tl.load(sel_ptr + middle * stride_sel)
+            if middle_matrix <= matrix_index:
+                start_i2 = middle + 1
+            else:
+                end_i = middle
+
+        end_i = start_i2
+
+        count = end_i - start_i
+
+        block_mem_indices_f_base = start_i  + tl.arange(0, BLOCK_SIZE_K)
+
+        if count > 0:
+            for k in range((count + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K):
+                # block_mem_indices = (k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)) % K
+                block_mem_indices_f = block_mem_indices_f_base + k * BLOCK_SIZE_K
+                block_mem_indices = block_mem_indices_f % K
+                a_index = tl.load(index_ptr + stride_index * block_mem_indices)
+                if out_index_is_none:
+                    b_index = a_index
+                else:
+                    b_index = tl.load(out_index_ptr + stride_out_index * block_mem_indices)
+                sel_ok = block_mem_indices_f < end_i
+
+                a_ptrs = a_ptrs_this + a_index[None, :] * stride_ak
+                b_ptrs = b_ptrs_this + b_index[:, None] * stride_bk
+
+                # Load the next block of A and B, generate a mask by checking the K dimension.
+                # If it is out of bounds, set it to 0.
+                a = tl.load(a_ptrs, mask=sel_ok[None, :], other=0.0)
+                b = tl.load(b_ptrs, mask=sel_ok[:, None], other=0.0)
+
+                if dtype_id == 1:
+                    a = a.to(tl.float16)
+                    b = b.to(tl.float16)
+                elif dtype_id == 2:
+                    a = a.to(tl.bfloat16)
+                    b = b.to(tl.bfloat16)
+
+                # We accumulate along the K dimension.
+                accumulator += tl.dot(a, b, allow_tf32=allow_tf32)
+
+            if out_dtype_id == 1:
+                c = accumulator.to(tl.float16)
+            elif out_dtype_id == 2:
+                c = accumulator.to(tl.bfloat16)
+            else:
+                c = accumulator
+
+            # -----------------------------------------------------------
+            # Write back the block of the output matrix C with masks.
+            offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            c_ptrs = c_ptr + stride_co * matrix_index + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            # tl.store(c_ptrs, c, mask=c_mask)
+            tl.atomic_add(c_ptrs, c, mask=c_mask)
+
+
+torch.library.define("mylib::cvmm_triton", "(Tensor x, Tensor sel_index, Tensor sel, Tensor keys, ScalarType out_dtype, Tensor out_index) -> Tensor")
+@torch.library.impl("mylib::cvmm_triton", "default")
+def cvmm_triton(
+    x: torch.Tensor,
+    sel_index: torch.Tensor,
+    sel: torch.Tensor,
+    keys: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_index: torch.Tensor
+):
+    x = x.flatten(end_dim=-2)
+    assert x.shape[-1] == keys.shape[1]
+
+    sel_shape = sel.shape
+    sel = sel.flatten()
+
+    M = sel.shape[0]
+    O, K, N = keys.shape
+    # Allocates output.
+    out = torch.empty((M, N), device=x.device, dtype=out_dtype)
+    # out = torch.zeros((M, N), device=x.device, dtype=out_dtype)
+    # 1D launch kernel where each block gets its own program.
+
+    # expected_m_per_matrix = int(math.ceil(M / O * 1.5))
+    # expected_m_per_matrix = M
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+    )
+
+    out_index_is_none = False
+    if out_index.numel() == 1 and out_index == -1:
+        out_index_is_none = True
+
+    cvmm_kernel[grid](
+        x, keys, out, sel_index, sel, out_index,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        keys.stride(0), keys.stride(1), keys.stride(2),
+        out.stride(0), out.stride(1),
+        sel_index.stride(0), sel.stride(0), 0 if out_index_is_none else out_index.stride(0),
+        out_index_is_none=out_index_is_none,
+        dtype_id = dtype_to_type_id(out.dtype), allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+    )
+
+    return out.view(*sel_shape, N)
+
+
+@torch.library.register_fake("mylib::cvmm_triton", cvmm_triton)
+def cvmm_triton_abstract(x, sel_idx, sel, keys, out_dtype, out_index):
+    sel_shape = sel.shape
+    sel = sel.flatten()
+    M = sel.shape[0]
+    O, K, N = keys.shape
+    out = torch.empty((M, N), device=x.device, dtype=out_dtype)
+    sel_shape = sel.shape
+    return out.view(*sel_shape, N)
+
+
+def cvmm_triton_backward(
+    x: torch.Tensor,
+    sel_index: torch.Tensor,
+    sel: torch.Tensor,
+    grads: torch.Tensor,
+    n_experts: int,
+    key_dtype: torch.dtype,
+    op_dtype: torch.dtype,
+    out_index: torch.Tensor
+):
+    x = x.flatten(end_dim=-2)
+    x = x.transpose(0, 1)
+    grads = grads.flatten(end_dim=-2)
+    sel = sel.flatten()
+    M, _ = x.shape
+    K, N = grads.shape
+    # FIX: out must be atomic_add'able, which excludes bfloat16. Cast to key_dtype after. Maybe this could be f16
+    out = torch.zeros((n_experts, M, N), device=x.device, dtype=torch.float32)
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), triton.cdiv(K, META['BLOCK_SIZE_K'] * META['K_BLOCKS'])
+    )
+    out_index_is_none = False
+    if out_index.numel() == 1 and out_index == -1:
+        out_index_is_none = True
+
+    cvmm_backward_kernel3[grid](
+        x, grads, out, sel_index, sel, out_index,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        grads.stride(0), grads.stride(1),
+        out.stride(0), out.stride(1), out.stride(2),
+        sel_index.stride(0), sel.stride(0), 0 if out_index_is_none else out_index.stride(0),
+        out_index_is_none=out_index_is_none,
+        out_dtype_id=dtype_to_type_id(out.dtype),
+        dtype_id=dtype_to_type_id(op_dtype),
+        allow_tf32=False #torch.backends.cuda.matmul.allow_tf32
+    )
+    return out.to(dtype=key_dtype)
+
+
+class CVMM(torch.autograd.Function):
+    warned = False
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        sel_index: torch.Tensor,
+        sel: torch.Tensor,
+        keys: torch.Tensor,
+        out_index: torch.Tensor | None = None,
+        reduction_weight: torch.Tensor | None = None
+    ):
+        ctx.save_for_backward(x, keys, sel, sel_index, out_index, reduction_weight)
+
+        # out_type = get_dtype()
+        out_type = x.dtype
+        # out_type = torch.float32
+        if out_index is None:
+            out_index = torch.tensor(-1).cuda()
+        res = torch.ops.mylib.cvmm_triton(x, sel_index, sel, keys, out_type, out_index)
+
+        if reduction_weight is not None:
+            res = res.view(*reduction_weight.shape, res.shape[-1])
+            res = (reduction_weight.unsqueeze(-2).type_as(res) @ res).squeeze(-2)
+
+        ctx.op_type = out_type
+        ctx.keys_type = keys.dtype
+        ctx.dtype = out_type
+        return res.type_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, keys, sel, sel_index, out_index, reduction_weight = ctx.saved_tensors
+        keys_dt = keys
+
+        # Backward for weight
+        if reduction_weight is not None:
+            # Project back the grads with he reduction weight, so the grad for the weight matrix is ok
+            grad_output_w = reduction_weight.unsqueeze(-1).type_as(grad_output) @ grad_output.unsqueeze(-2)
+        else:
+            grad_output_w  = grad_output
+
+        out_index_is_none = False
+        if out_index is None:
+            out_index_is_none = True
+            out_index = torch.tensor(-1).cuda()
+
+        grad_w = cvmm_triton_backward(
+            x,
+            sel_index,
+            sel,
+            grad_output_w,
+            keys_dt.shape[0],
+            ctx.keys_type,
+            ctx.dtype,
+            out_index=out_index
+        )
+
+        # Backward for input and reduction weight
+        grad_w_off = None
+
+        bw_index = sel_index if out_index_is_none else out_index
+        bw_index_out = torch.tensor(-1).cuda()
+        if reduction_weight is not None:
+            # Hack the output indices to emulate repeats
+            bw_index_out = bw_index
+            bw_index = bw_index // reduction_weight.shape[-1]
+
+        grad_x_full = torch.ops.mylib.cvmm_triton(
+            grad_output,
+            bw_index,
+            sel,
+            keys_dt.transpose(1,2),
+            ctx.op_type,
+            bw_index_out
+        )
+
+        grad_x_full = grad_x_full.view(*x.shape[:-1], -1, x.shape[-1])
+        if reduction_weight is not None:
+            # grad_x_full is the unscaled grad. For the input, we have to scale it, for the reduction wegiht,
+            # we have to compute dot products with the input.
+            grad_x = (reduction_weight.view(*grad_x_full.shape[:-1]).unsqueeze(-2).type_as(grad_x_full) @ grad_x_full).squeeze(-2)
+            grad_w_off = (grad_x_full.type_as(reduction_weight) @ x.unsqueeze(-1).type_as(reduction_weight)).squeeze(-1).view_as(reduction_weight)
+        elif grad_x_full.shape[-2] != 1:
+            grad_x = grad_x_full.sum(-2)
+        else:
+            grad_x = grad_x_full
+
+        grad_x = grad_x.view_as(x)
+
+        return grad_x, None, None, grad_w, None, grad_w_off
+
+
+def cvmm(x: torch.Tensor, sel: torch.Tensor | CVMMSel, keys: torch.Tensor):
+    if not isinstance(sel, CVMMSel):
+        sel = cvmm_prepare_sel(sel, keys.shape[0])
+    assert x.dtype == keys.dtype, f"{x.dtype=} != {keys.dtype=}"
+
+    return CVMM.apply(x, sel.sel_index, sel.sel, keys, sel.out_index, sel.reduction_weight)
+
+
+def cvmm_prepare_sel2(sel: torch.Tensor, w: torch.Tensor | None = None) -> CVMMSel:
+    # Has multiple selections for each batch element
+    n_per_batch = sel.shape[-1]
+
+    # indices = torch.arange(sel.nelement() // n_per_batch, device=sel.device, dtype=torch.int32)
+    # indices = indices.repeat_interleave(n_per_batch).flatten()
+
+    fsel = sel.flatten()
+    ssel, sel_index = fsel.sort()
+
+    # in_index = indices[sel_index]
+    in_index = sel_index // n_per_batch
+
+    return CVMMSel(sel, ssel.view_as(sel), in_index, sel_index, w)
+
+#endregion
+# -----------------------------------------------------------------------------
+#region MoEUT
+
+
+class SigmaMoE(torch.nn.Module):
+    def __init__(self, dmodel: int, n_experts: int, expert_size: int, k: int,
+                 v_dim: int | None = None):
+
+        super().__init__()
+        self.k_dim = dmodel
+        self.v_dim = v_dim if v_dim is not None else dmodel
+        self.n_experts = n_experts
+        self.expert_size = expert_size
+        self.size = self.n_experts * self.expert_size
+        self.k_vec_dim = self.k_dim
+        self.num_heads = k
+
+        self.keys = torch.nn.Parameter(torch.empty(self.n_experts, self.k_vec_dim, self.expert_size))
+        self.values = torch.nn.Parameter(torch.empty(self.n_experts, self.expert_size, self.v_dim))
+        self.sel_expert = torch.nn.Parameter(torch.empty(self.n_experts, self.k_vec_dim))
+
+    @torch.no_grad
+    def reset_parameters(self, std_scale: float):
+        # nanogpt equivalence would be std_scale=(3 ** 0.5) * 0.5
+        kbound = std_scale / (self.k_dim ** 0.5)
+        self.keys.uniform_(-kbound, kbound)
+        self.values.zero_()
+        self.sel_expert.normal_()
+        self.sel_expert.div_(self.sel_expert.norm(dim=1, keepdim=True))
+        self.sel_expert.mul_(std_scale / (self.k_dim) ** 0.5)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Selection score calculation
+        xnorm = norm(x)
+        sel = F.linear(xnorm, self.sel_expert, None)
+        sel_r = sel
+
+        # Selection activation and topk
+        sel = F.sigmoid(sel)
+
+        sel_val, sel_index = sel.topk(self.num_heads, dim=-1, sorted=False)
+
+        # Preprocess the selection indices. They will be needed for both layers and save some time
+        sel_indices = cvmm_prepare_sel2(sel_index.int())
+
+        # "Up-projection" layer for each head
+        scores = cvmm(xnorm, sel_indices, self.keys)
+        scores = F.relu(scores).square()
+
+        # Down projection layer for each head
+        sel_indices = sel_indices.clone()
+        sel_indices.reduction_weight = sel_val
+        sel_indices.sel_index = sel_indices.out_index
+        sel_indices.out_index = None
+
+        out = cvmm(scores, sel_indices, self.values)
+
+        res = out.view(*x.shape[:-1], self.v_dim)
+        return x + res, sel_r
+
+
+class SwitchHeadRoPE(torch.nn.Module):
+    def __init__(self, state_size: int, num_heads: int, n_experts: int, max_seq_len: int,
+                 head_dim: int | None = None, moe_k: int = 2
+                 ):
+
+        super().__init__()
+
+        self.input_size = state_size
+        self.output_size = state_size
+        self.pe_size = self.input_size
+        self.moe_k = moe_k
+        self.n_experts = n_experts
+
+        self.num_heads = num_heads
+        self.head_dim = head_dim or (state_size // num_heads)
+        self.rotary = Rotary(self.head_dim, max_seq_len)
+
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+
+        self.q = torch.nn.Linear(self.input_size, self.head_dim * self.num_heads, bias=False)
+        self.k = torch.nn.Linear(self.input_size, self.head_dim * self.num_heads, bias=False)
+
+        self.v = torch.nn.Parameter(torch.empty(self.num_heads * self.n_experts, self.input_size, self.head_dim))
+        self.o = torch.nn.Parameter(torch.empty(self.num_heads * self.n_experts, self.head_dim, self.output_size))
+        self.sel_v = torch.nn.Parameter(torch.empty(self.num_heads * self.n_experts, self.input_size))
+
+        self.sel_o = torch.nn.Parameter(torch.empty(self.num_heads * self.n_experts, self.input_size))
+
+    @torch.no_grad
+    def reset_parameters(self, std_scale: float):
+        bound = (3 ** 0.5) * 0.5 * (self.input_size ** -0.5)
+        self.q.weight.uniform_(-bound, bound)
+        self.k.weight.uniform_(-bound, bound)
+
+        self.v.normal_(0, std_scale / self.input_size ** 0.5)
+        self.o.zero_()
+
+        self.sel_v.normal_()
+        self.sel_v.div_(self.sel_v.norm(dim=1, keepdim=True))
+        self.sel_v.mul_(std_scale / self.input_size ** 0.5)
+
+        self.sel_o.normal_()
+        self.sel_o.div_(self.sel_o.norm(dim=1, keepdim=True))
+        self.sel_o.mul_(std_scale / self.input_size ** 0.5)
+
+
+    def get_sel(self, t: torch.Tensor, w: torch.Tensor) -> tuple[CVMMSel, torch.Tensor]:
+        sel = F.linear(t, w)
+        sel = sel_raw = sel.view(*sel.shape[:-1], self.num_heads, -1)
+        sel = sel.sigmoid()
+
+        with torch.no_grad():
+            _, sel_index = sel.topk(self.moe_k, dim=-1, sorted=False)
+        sel_val = torch.gather(sel, -1, sel_index)
+
+        sel_index_shifted = (torch.arange(self.num_heads, device=sel_index.device, dtype=sel_index.dtype) * self.n_experts).unsqueeze(-1) + sel_index
+        return cvmm_prepare_sel2(sel_index_shifted.flatten(-2,-1), sel_val), sel_raw
+
+
+    def forward(self, x: torch.Tensor, ve: torch.Tensor | None, block_mask: BlockMask
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # *src: [batch_size, out_len, c]
+        B, T = x.size(0), x.size(1) # batch size, sequence length
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
+
+        xnorm = norm(x)
+        q = self.q(xnorm)
+        k = self.k(xnorm)
+
+        v_sel, v_sel_r = self.get_sel(xnorm, self.sel_v)
+        o_sel, o_sel_r = self.get_sel(xnorm, self.sel_o)
+
+        v = cvmm(x, v_sel, self.v).transpose(-2, -3)
+
+        q = q.view(B, T, self.num_heads, self.head_dim)
+        k = k.view(B, T, self.num_heads, self.head_dim)
+
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = self.rotary(q).transpose(1,2), self.rotary(k).transpose(1,2)
+        if ve is not None:
+            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = self.lambdas[0] * v
+
+        res = flex_attention(q, k, v, block_mask=block_mask, scale=0.12)
+        res = res.transpose(1, 2)
+
+        # The output selection indices are calculated from the current state and are also used for projecting "q".
+        # But that projection needs to create multiple copies for the different heads. Here we already have the
+        # heads, but we have to create copies for the top-k elements. We can calculate that from the reduction
+        # weight. We also want to compute not only the weighted average between the top-k elements, but also
+        # of the different heads. So reshape the reduction weight accordingly.
+        o_sel.sel_index = o_sel.out_index // o_sel.reduction_weight.shape[-1]
+        o_sel.reduction_weight = o_sel.reduction_weight.flatten(-2)
+        out = cvmm(res, o_sel, self.o)
+
+        return x + out, o_sel_r, v_sel_r
+
+
+class MoEUTLayer(torch.nn.Module):
+    def __init__(self, d_model: int, num_heads: int, ff_expert_size: int, ff_n_experts: int,
+                 att_n_experts: int, max_seq_len: int, head_dim: int | None = None, att_k: int = 2,
+                 ff_k: int = 8):
+
+        super().__init__()
+        self.attention = SwitchHeadRoPE(
+            d_model, num_heads, att_n_experts, max_seq_len=max_seq_len, head_dim=head_dim, moe_k=att_k)
+        self.ffn = SigmaMoE(d_model, ff_n_experts, ff_expert_size, k=ff_k)
+
+    def forward(self, x: torch.Tensor, ve: torch.Tensor | None, block_mask: BlockMask) -> torch.Tensor:
+        x, o_sel_r, v_sel_r = self.attention(x, ve, block_mask)
+        x, ffn_sel_r = self.ffn(x)
+        return x, o_sel_r, v_sel_r, ffn_sel_r
+
+
+class MoEUT(torch.nn.Module):
+    def __init__(self, d_model: int, n_layers: int, num_heads: int, ff_expert_size: int, ff_n_experts: int,
+                 att_n_experts: int, max_seq_len: int, head_dim: int | None = None, att_k: int = 2,
+                 ff_k: int = 8,
+                 entropy_reg: float = 0.01, att_entropy_reg: float = 0.01,
+                 group_size: int = 2):
+        super().__init__()
+
+        self.entropy_reg = entropy_reg
+        self.att_entropy_reg = att_entropy_reg
+
+        self.n_repeats = n_layers // group_size
+        self.layers = torch.nn.ModuleList([
+            MoEUTLayer(d_model, num_heads, ff_expert_size, ff_n_experts, att_n_experts,
+                       max_seq_len, head_dim, att_k, ff_k)
+            for _ in range(group_size)
+        ])
+        self.training_step = 0
+
+        self.embed_layer_gates = nn.Embedding(n_layers, d_model)
+        self.embed_layer_biases = nn.Embedding(n_layers, d_model)
+        self.lambdas = nn.Parameter(torch.tensor([[1., 0.]]).repeat(n_layers, 1))
+
+        self.skip_weights = nn.Parameter(torch.ones(n_layers//2))
+
+        self.reset_parameters()
+
+    def forward(self, x: torch.Tensor, block_masks: list[BlockMask], ves: list[torch.Tensor | None]) -> tuple[torch.Tensor, torch.Tensor]:
+        # Run the model
+        x0 = x
+        o_sels = {i: [] for i in range(len(self.layers))}
+        v_sels = {i: [] for i in range(len(self.layers))}
+        ffn_sels = {i: [] for i in range(len(self.layers))}
+
+        skip_connections = []
+        n_encoder_layers = self.n_repeats * len(self.layers) // 2
+        for i in range(self.n_repeats * len(self.layers)):
+            li = i % len(self.layers)
+
+            gate = self.embed_layer_gates.weight[i]
+            bias = self.embed_layer_biases.weight[i]
+            while gate.ndim < x.ndim:
+                gate = gate.unsqueeze(0)
+                bias = bias.unsqueeze(0)
+            x = x * (gate + 1) + bias
+
+            if i > n_encoder_layers:
+                x = x + skip_connections.pop()
+
+            block_mask = block_masks[i % len(block_masks)]
+            layer_x = x * self.lambdas[i, 0] + x0 * self.lambdas[i, 1]
+            x, o_sel_r, v_sel_r, ffn_sel_r = self.layers[li](layer_x, ve=ves[i], block_mask=block_mask)
+
+            o_sels[li].append(o_sel_r)
+            v_sels[li].append(v_sel_r)
+            ffn_sels[li].append(ffn_sel_r)
+
+            if i < n_encoder_layers:
+                skip_connections.append(x * self.skip_weights[i])
+
+        def entropy_reg(sel: torch.Tensor) -> torch.Tensor:
+            sel = F.log_softmax(sel, dim=-1).logsumexp(0)
+            return (sel * sel.exp()).sum(-1).mean()
+
+        ffn_reg_loss = torch.stack([
+            entropy_reg(torch.stack(sel_hist, dim=1).flatten(0, 1))
+            for sel_hist in ffn_sels.values()
+        ]).mean()
+        att_reg_loss = torch.stack([
+            entropy_reg(torch.stack(sel_hist, dim=1).flatten(0, 1))
+            for sel_hist in [*o_sels.values(), *v_sels.values()]
+        ]).mean()
+
+        if self.training:
+            # if self.training_step % 100 == 0:
+            #     for n, selsdict in zip(["o","v","f"], [o_sels, v_sels, ffn_sels]):
+            #         for i, sels in selsdict.items():
+            #             sels = torch.stack(sels).detach().flatten(0,2).softmax(-1)
+            #             stats = sels.mean(0).cpu().float().numpy()
+            #             print(f"{n}{i}: {stats}")
+
+            #     print(f"{att_reg_loss.detach()=}")
+            #     print(f"{ffn_reg_loss.detach()=}")
+            # self.training_step += 1
+
+            reg_loss = self.entropy_reg * ffn_reg_loss + self.att_entropy_reg * att_reg_loss
+        else:
+            reg_loss = None
+
+        return x, reg_loss
+
+    @torch.no_grad
+    def reset_parameters(self):
+        scale = (2 / (self.n_repeats * len(self.layers))) ** 0.5
+        for layer in self.modules():
+            if isinstance(layer, (SwitchHeadRoPE, SigmaMoE)):
+                layer.reset_parameters(scale)
+        self.embed_layer_gates.weight.zero_()
+        self.embed_layer_biases.weight.zero_()
+
+
+class MoEUTWrapper(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+        super().__init__()
+        group_size = 2
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers, num_embeddings=group_size)
+        # Select FF hparams for equal parameters & FLOPs compared to original
+        ff_expert_size = 128 # ff_expert_size may be tuned without breaking comparability
+        ff_k = (model_dim * 4) // ff_expert_size
+        ff_n_experts = ff_k * (num_layers // group_size)
+        print0(f"{ff_k=} {ff_n_experts=}")
+
+        self.moeut = MoEUT(
+            d_model=model_dim,
+            n_layers=num_layers,
+            num_heads=num_heads,
+            ff_expert_size=ff_expert_size,
+            ff_n_experts=ff_n_experts,
+            att_n_experts=10, # Slightly lower params but higher FLOPs due to MoE
+            max_seq_len=max_seq_len,
+            head_dim=None,
+            att_k=2,
+            ff_k=ff_k,
+            entropy_reg=0.01,
+            att_entropy_reg=0.001,
+            group_size=group_size,
+        )
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
+        self.lm_head.weight.detach().zero_() # @Grad62304977
+
+
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+        assert input_seq.ndim == 1
+
+        long_bm, short_bm = create_block_masks(input_seq, sliding_window_num_blocks)
+        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
+        ve = self.value_embeds(input_seq)
+        x = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x, reg_loss = self.moeut(x, block_masks, ve)
+        x = norm(x)
+        logits = self.lm_head(x)
+        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+        logits = 30 * torch.sigmoid(logits.float() / 7.5)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
+        if self.training:
+            loss = loss + reg_loss
+        return loss
+
+
+#endregion
+# -----------------------------------------------------------------------------
+#region Our own simple Distributed Data Loader
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(f"{file}", False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % world_size == 0
+    local_batch_size = batch_size // world_size
+    file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn"t helpful.
+        pos += batch_size
+        yield inputs, targets
+#endregion
+# -----------------------------------------------------------------------------
+#region utils, hyperparams
+def print0(s, console=True):
+    if master_process:
+        timestamp = time.strftime("%H:%M:%S.") + f"{time.time() % 1:.3f}"[2:]
+        s = f"{timestamp}: {s}"
+        if console:
+            print(s)
+        if logfile:
+            with open(logfile, "a") as f:
+                print(s, file=f)
+
+def log_mem():
+    print0(
+        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB",
+        console=True,
+    )
+
+@dataclass(frozen=True, kw_only=True)
+class Hyperparameters:
+    # data
+    train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    # optimization
+    num_iterations: int = 1770 # number of iterations to run
+    cooldown_frac: float = 0.4 # fraction of training spent cooling down the learning rate
+    # evaluation and logging
+    val_loss_every: int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    # implementation
+    seq_len: int = 48*1024 # FlexAttention sequence length
+    val_seq_len: int = 4*64*1024 # FlexAttention sequence length for validation
+    save_checkpoint: bool = False
+    dev: bool = False
+
+TEST_HPARAMS = Hyperparameters(
+    train_files = "data/fineweb1B/fineweb_train_*.bin",
+    val_files = "data/fineweb1B/fineweb_val_*.bin",
+    val_tokens = 1048576,
+    num_iterations = 1000, #770,
+    cooldown_frac = 0.4,
+    val_loss_every = 125,
+    seq_len = 8*1024,
+    val_seq_len = 8*1024,
+    save_checkpoint = False,
+    dev=False,
+)
+DEV_HPARAMS = Hyperparameters(
+    train_files = "data/fineweb1B/fineweb_train_*.bin",
+    val_files = "data/fineweb1B/fineweb_val_*.bin",
+    val_tokens = 1024,
+    num_iterations = 20,
+    cooldown_frac = 0.4,
+    val_loss_every = 125,
+    seq_len = 512,
+    val_seq_len = 512,
+    save_checkpoint = False,
+    dev=True,
+)
+
+#endregion
+# -----------------------------------------------------------------------------
+#region main()
+master_process = None
+logfile = None
+if custom_logfile := len(sys.argv) > 1:
+    run_id = sys.argv[1]
+else:
+    run_id = uuid.uuid4()
+def main(args = TEST_HPARAMS):
+# def main(args = DEV_HPARAMS):
+    global master_process, logfile
+    # torchrun sets these env variables
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    assert torch.cuda.is_available()
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    atexit.register(dist.destroy_process_group)
+    dist.barrier()
+    master_process = (rank == 0) # this process will do logging, checkpointing etc.
+
+    # begin logging
+    if master_process and not args.dev:
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{run_id}.txt"
+        print(logfile)
+
+
+    # begin by printing this file (the Python code)
+    print0(code, console=False)
+    print0("="*100, console=False)
+    # log information about the hardware/software environment this is running on
+    print0(f"Running Python {sys.version}", console=False)
+    print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}", console=False)
+    def nvidia_smi():
+        import subprocess  # avoid top level import
+        return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
+    print0(nvidia_smi(), console=False)
+    print0("="*100, console=False)
+    atexit.register(log_mem)
+
+    torch.random.manual_seed(0)
+    torch.cuda.synchronize()
+    print0("Init data")
+    # load data
+    train_batch_size = world_size * args.seq_len
+    train_loader = distributed_data_generator(args.train_files, train_batch_size, rank, world_size)
+
+    torch.cuda.synchronize()
+    print0("Init model")
+    # REF: model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=3, model_dim=384, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    # model: nn.Module = MoEUTWrapper(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    model.bfloat16()
+    for m in model.modules():
+        if isinstance(m, nn.Embedding):
+            m.bfloat16()
+
+    # count parameters
+    n_params_by_dtype = defaultdict(lambda: 0)
+    for name, param in model.named_parameters():
+        dist.broadcast(param.detach(), 0)
+        n_params_by_dtype[param.dtype] += param.numel()
+    for dt, n_params in n_params_by_dtype.items():
+        print0(f"{dt}: {n_params/1024/1024:.3f}Mi params")
+    print0(f"total: {sum(n_params_by_dtype.values())/1024/1024:.3f}Mi params")
+
+
+    torch.cuda.synchronize()
+    print0("Init optimizers")
+    # collect the parameters to optimize
+    hidden_matrix_params = [p for n, p in model.named_parameters() if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+    scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2]
+    head_params = [model.lm_head.weight]
+    params_sets = [hidden_matrix_params, embed_params, scalar_params, head_params]
+    assert all(set(a).isdisjoint(b) for a in params_sets for b in params_sets if a is not b)
+
+    assert set().union(*params_sets) == set(model.parameters())
+
+    # init the optimizer(s)
+    lr_mod = (args.seq_len/Hyperparameters().seq_len/8) ** 0.5  # Correct LR based on difference in batch size vs original w/ 8 nodes
+    print(f"{lr_mod=}")
+    adam_params = [dict(params=head_params, lr=0.008*lr_mod), dict(params=embed_params, lr=0.6*lr_mod), dict(params=scalar_params, lr=0.04*lr_mod)]
+    # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
+    # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
+    optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
+    optimizer2 = Muon(hidden_matrix_params, lr=0.05*lr_mod, momentum=0.95, rank=rank, world_size=world_size)
+    optimizers = [optimizer1, optimizer2]
+
+    # learning rate schedule: stable then decay
+    def get_lr(step: int):
+        t = 1 - step / args.num_iterations # time remaining in training
+        assert 1 >= t >= 0
+        w = min(t / args.cooldown_frac, 1.0) # 1 -> 0
+        return w * 1.0 + (1 - w) * 0.1
+    schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+    @lru_cache(1)
+    def sw_num_blks(window_size: int):
+        return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+    if not args.dev:
+        model: nn.Module = torch.compile(model) #, dynamic=False)
+
+    training_time_ms = 0
+    # start the clock
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    # begin training
+    print0("Starting train loop")
+    train_steps = args.num_iterations
+    prof = None
+    train_losses = []
+    val_losses = {}
+
+    for step in range(train_steps + 1):
+        last_step = (step == train_steps)
+        # if step == 5:
+        #     prof = profile(record_shapes=True, profile_memory=True, with_stack=True)
+        #     prof.__enter__()
+        #     prof.start()
+        # if prof is not None:
+        #     if step == 9:
+        #         prof.__exit__(None, None, None)
+        #         prof.export_chrome_trace("trace.json")
+        #         prof = None
+        #     else:
+        #         prof.step()
+
+        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+        # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+        # steps with dummy data first, and then re-initialize the model and reset the loader.
+        if step == 10:
+            training_time_ms = 0
+            t0 = time.perf_counter()
+        timed_steps = float("nan") if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+
+        # Linearly increase the block-wise sliding window size over training 128 -> 1792:
+        # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
+        window_size = next_multiple_of_n(1728 * step / train_steps, n=128)
+
+        # --------------- VALIDATION SECTION -----------------
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            model.eval()
+            val_batch_size = world_size * args.val_seq_len
+            assert args.val_tokens % val_batch_size == 0
+            val_steps = args.val_tokens // val_batch_size
+            val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+            val_loss = 0
+            with torch.no_grad():
+                for i in range(val_steps):
+                    x, y = next(val_loader)
+                    val_loss += model(x, y, sw_num_blks(window_size))
+            val_loss /= val_steps
+            val_losses[step] = val_loss.item()
+            del val_loader
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} step_avg:{training_time_ms/(timed_steps-1):.2f}ms train_time:{training_time_ms/1000:.0f}s", console=True)
+            model.train()
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if last_step:
+            if master_process and args.save_checkpoint:
+                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+                os.makedirs(f"logs/{run_id}", exist_ok=True)
+                torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            # the last step only has the validation loop, so break to avoid training
+            break
+
+        # --------------- TRAINING SECTION -----------------
+        inputs, targets = next(train_loader)
+        step_train_losses = []
+        for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
+            loss = model(input_seq, target_seq, sw_num_blks(window_size))
+            loss.backward()
+            dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+            step_train_losses.append(loss.detach().item())
+            del loss
+        train_losses.append(sum(step_train_losses) / len(step_train_losses))
+        train_loss = sum(train_losses[-10:]) / len(train_losses[-10:])
+        for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        del param
+        # momentum warmup for Muon
+        frac = min(step / 300, 1)
+        for group in optimizer2.param_groups:
+            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        # step the optimizers and schedulers
+        for opt, sched in zip(optimizers, schedulers):
+            opt.step()
+            sched.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
+
+        # logging
+        if step < 20 or (step+1) % 50 == 0:
+            approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+            print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} step_avg:{approx_time/timed_steps:.2f}ms train_time:{approx_time/1000:.0f}s {torch.cuda.max_memory_allocated()=}", console=True)
+
+    print0(f"{train_losses=}")
+    print0(f"{val_losses=}")
+    if master_process and logfile is not None and not custom_logfile:
+        try:
+            new_logfile = input("Name run? ")
+        except KeyboardInterrupt:
+            breakpoint()
+        if new_logfile:
+            old_logfile = logfile
+            logfile = f"logs/{new_logfile}.txt"
+            os.rename(old_logfile, logfile)
+            print0(f"Renamed {old_logfile} -> {logfile}")
+    else:
+        print(logfile)
+#endregion
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
+
+21:11:48.443: ====================================================================================================
+21:11:48.443: Running Python 3.12.7 (main, Oct 16 2024, 04:37:19) [Clang 18.1.8 ]
+21:11:48.443: Running PyTorch 2.7.0.dev20250110+cu126 compiled for CUDA 12.6
+21:11:48.522: Tue Feb  4 21:11:48 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 560.35.02              Driver Version: 560.94         CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3090 Ti     On  |   00000000:2D:00.0 Off |                  Off |
+|  0%   41C    P2             92W /  450W |     968MiB /  24564MiB |      6%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A        26      G   /Xwayland                                   N/A      |
+|    0   N/A  N/A    365510      C   /python3.12                                 N/A      |
++-----------------------------------------------------------------------------------------+
+
+21:11:48.522: ====================================================================================================
+21:11:48.523: Init data
+21:11:48.523: Init model
+21:11:49.487: torch.bfloat16: 111.728Mi params
+21:11:49.488: total: 111.728Mi params
+21:11:49.488: Init optimizers
+21:11:49.504: Starting train loop
+21:16:06.863: step:0/1000 val_loss:10.8258 step_avg:nanms train_time:0s
+21:16:29.041: step:1/1000 train_loss:10.8259 step_avg:nanms train_time:22s torch.cuda.max_memory_allocated()=9225594880
+21:16:29.274: step:2/1000 train_loss:10.8054 step_avg:nanms train_time:22s torch.cuda.max_memory_allocated()=9661506560
+21:16:29.530: step:3/1000 train_loss:10.7699 step_avg:nanms train_time:23s torch.cuda.max_memory_allocated()=9667798016
+21:16:29.793: step:4/1000 train_loss:10.7295 step_avg:nanms train_time:23s torch.cuda.max_memory_allocated()=9674089472
+21:16:30.025: step:5/1000 train_loss:10.6701 step_avg:nanms train_time:23s torch.cuda.max_memory_allocated()=9680380928
+21:16:30.220: step:6/1000 train_loss:10.6058 step_avg:nanms train_time:23s torch.cuda.max_memory_allocated()=9686672384
+21:16:30.408: step:7/1000 train_loss:10.5422 step_avg:nanms train_time:24s torch.cuda.max_memory_allocated()=9692963840
+21:16:30.598: step:8/1000 train_loss:10.4630 step_avg:nanms train_time:24s torch.cuda.max_memory_allocated()=9699255296
+21:16:30.786: step:9/1000 train_loss:10.3637 step_avg:nanms train_time:24s torch.cuda.max_memory_allocated()=9705546752
+21:16:30.976: step:10/1000 train_loss:10.2608 step_avg:nanms train_time:24s torch.cuda.max_memory_allocated()=9711838208
+21:16:31.170: step:11/1000 train_loss:10.0721 step_avg:nanms train_time:0s torch.cuda.max_memory_allocated()=9718129664
+21:16:31.377: step:12/1000 train_loss:9.8762 step_avg:nanms train_time:0s torch.cuda.max_memory_allocated()=9724421120
+21:16:31.568: step:13/1000 train_loss:9.6604 step_avg:197.29ms train_time:1s torch.cuda.max_memory_allocated()=9730712576
+21:16:31.754: step:14/1000 train_loss:9.4594 step_avg:194.52ms train_time:1s torch.cuda.max_memory_allocated()=9737004032
+21:16:31.940: step:15/1000 train_loss:9.2162 step_avg:192.79ms train_time:1s torch.cuda.max_memory_allocated()=9743295488
+21:16:32.129: step:16/1000 train_loss:8.9675 step_avg:192.05ms train_time:1s torch.cuda.max_memory_allocated()=9749586944
+21:16:32.319: step:17/1000 train_loss:8.7168 step_avg:191.78ms train_time:1s torch.cuda.max_memory_allocated()=9755878400
+21:16:32.507: step:18/1000 train_loss:8.5025 step_avg:191.38ms train_time:2s torch.cuda.max_memory_allocated()=9762169856
+21:16:32.722: step:19/1000 train_loss:8.3538 step_avg:194.00ms train_time:2s torch.cuda.max_memory_allocated()=9768461312
+21:16:32.916: step:20/1000 train_loss:8.2092 step_avg:193.93ms train_time:2s torch.cuda.max_memory_allocated()=9774752768
+21:16:39.028: step:50/1000 train_loss:6.9129 step_avg:201.29ms train_time:8s torch.cuda.max_memory_allocated()=9963496448
+21:16:49.066: step:100/1000 train_loss:6.5387 step_avg:201.00ms train_time:18s torch.cuda.max_memory_allocated()=10278069248
+21:16:59.708: step:125/1000 val_loss:6.5537 step_avg:200.63ms train_time:23s
+21:17:04.662: step:150/1000 train_loss:6.3687 step_avg:200.18ms train_time:28s torch.cuda.max_memory_allocated()=11397948416
+21:17:14.504: step:200/1000 train_loss:6.0506 step_avg:199.30ms train_time:38s torch.cuda.max_memory_allocated()=11712521216
+21:17:24.208: step:250/1000 train_loss:6.2161 step_avg:198.22ms train_time:48s torch.cuda.max_memory_allocated()=12027094016
+21:17:29.791: step:250/1000 val_loss:6.1150 step_avg:198.36ms train_time:48s
+21:17:39.829: step:300/1000 train_loss:5.8354 step_avg:198.77ms train_time:58s torch.cuda.max_memory_allocated()=13146973184
+21:17:49.732: step:350/1000 train_loss:5.8064 step_avg:198.67ms train_time:68s torch.cuda.max_memory_allocated()=13461545984
+21:18:00.232: step:375/1000 val_loss:5.8890 step_avg:198.63ms train_time:72s
+21:18:05.159: step:400/1000 train_loss:5.8224 step_avg:198.53ms train_time:77s torch.cuda.max_memory_allocated()=14581425152
+21:18:15.287: step:450/1000 train_loss:5.7611 step_avg:198.99ms train_time:88s torch.cuda.max_memory_allocated()=14895997952
+21:18:25.365: step:500/1000 train_loss:5.7490 step_avg:199.25ms train_time:98s torch.cuda.max_memory_allocated()=15210570752
+21:18:30.961: step:500/1000 val_loss:5.7450 step_avg:199.32ms train_time:98s
+21:18:41.346: step:550/1000 train_loss:5.7505 step_avg:200.09ms train_time:108s torch.cuda.max_memory_allocated()=16330449920
+21:18:51.220: step:600/1000 train_loss:5.5613 step_avg:199.87ms train_time:118s torch.cuda.max_memory_allocated()=16645022720
+21:19:01.758: step:625/1000 val_loss:5.5860 step_avg:199.82ms train_time:123s
+21:19:06.838: step:650/1000 train_loss:5.5344 step_avg:199.95ms train_time:128s torch.cuda.max_memory_allocated()=17764901888
+21:19:16.859: step:700/1000 train_loss:5.5116 step_avg:199.98ms train_time:138s torch.cuda.max_memory_allocated()=18079474688
+21:19:26.840: step:750/1000 train_loss:5.4780 step_avg:199.96ms train_time:148s torch.cuda.max_memory_allocated()=18394047488
+21:19:32.438: step:750/1000 val_loss:5.4125 step_avg:200.00ms train_time:148s
+21:19:42.587: step:800/1000 train_loss:5.3474 step_avg:200.19ms train_time:158s torch.cuda.max_memory_allocated()=19513926656
+21:19:52.467: step:850/1000 train_loss:5.2499 step_avg:200.04ms train_time:168s torch.cuda.max_memory_allocated()=19828499456
+21:20:02.992: step:875/1000 val_loss:5.2777 step_avg:199.99ms train_time:173s
+21:20:07.965: step:900/1000 train_loss:5.2488 step_avg:199.96ms train_time:178s torch.cuda.max_memory_allocated()=20948378624
+21:20:17.949: step:950/1000 train_loss:5.3148 step_avg:199.95ms train_time:188s torch.cuda.max_memory_allocated()=21262951424
+21:20:27.863: step:1000/1000 train_loss:5.0525 step_avg:199.86ms train_time:198s torch.cuda.max_memory_allocated()=21577524224
+21:20:33.464: step:1000/1000 val_loss:5.2083 step_avg:199.90ms train_time:198s
+21:20:33.465: train_losses=[10.82585620880127, 10.784880638122559, 10.6990966796875, 10.608137130737305, 10.432588577270508, 10.283947944641113, 10.160778045654297, 9.908447265625, 9.56949520111084, 9.334404945373535, 8.93903636932373, 8.826272964477539, 8.541008949279785, 8.597908020019531, 8.00085735321045, 7.79691743850708, 7.6539764404296875, 7.765488624572754, 8.08206844329834, 7.888340473175049, 7.456092357635498, 7.452683925628662, 7.174588203430176, 6.826504707336426, 6.5846428871154785, 6.528995990753174, 7.0138936042785645, 7.413959503173828, 7.305871963500977, 7.576719284057617, 7.4402618408203125, 7.448306083679199, 7.322869777679443, 7.826598167419434, 8.1632080078125, 7.625283718109131, 7.342625617980957, 7.080624103546143, 7.042506694793701, 7.301779270172119, 7.155970573425293, 7.116724014282227, 6.92051887512207, 7.089314937591553, 6.993305683135986, 6.623861312866211, 6.520788669586182, 7.0321736335754395, 6.72363805770874, 6.952775001525879, 6.722699165344238, 6.769631862640381, 6.910158634185791, 6.7870025634765625, 6.935604095458984, 7.292320728302002, 7.060254096984863, 7.114717483520508, 6.448941707611084, 7.088356971740723, 7.182822227478027, 6.561558723449707, 6.551821231842041, 6.649876117706299, 6.755725383758545, 6.7654805183410645, 6.43822717666626, 6.475429058074951, 7.0437164306640625, 6.793208599090576, 6.606142997741699, 6.523770332336426, 7.155673503875732, 6.123226642608643, 6.233341217041016, 6.728267192840576, 6.846681594848633, 6.515232563018799, 6.4678168296813965, 6.405113220214844, 6.531309127807617, 6.393085956573486, 6.414703845977783, 6.3523969650268555, 6.615847110748291, 6.434752464294434, 6.225631237030029, 6.2308735847473145, 6.707691192626953, 7.5513811111450195, 6.357928276062012, 6.433048248291016, 6.354658603668213, 6.57757568359375, 6.731783390045166, 6.787339210510254, 6.500916481018066, 6.533957481384277, 6.619957447052002, 6.489711761474609, 6.2576799392700195, 6.514112949371338, 6.719130516052246, 6.631857395172119, 6.485073566436768, 5.545802116394043, 6.516592502593994, 6.310449600219727, 7.034059524536133, 6.773095607757568, 6.248698711395264, 6.262816905975342, 6.4700188636779785, 6.578821659088135, 6.256589889526367, 6.646221160888672, 6.27316951751709, 6.173842430114746, 6.468696594238281, 6.693908214569092, 7.026430130004883, 6.510178565979004, 6.514156341552734, 6.798733234405518, 6.81086540222168, 6.278931140899658, 6.300365924835205, 6.728982925415039, 6.69676399230957, 6.51323938369751, 6.045736312866211, 6.467806816101074, 6.507924556732178, 6.884615421295166, 6.210558891296387, 6.376993656158447, 5.874655723571777, 6.4777021408081055, 6.11655330657959, 6.418272018432617, 6.592095375061035, 6.538657188415527, 6.533216953277588, 6.334221839904785, 6.463944911956787, 6.157311916351318, 6.620831489562988, 6.296313285827637, 6.190921306610107, 5.959702491760254, 6.2227911949157715, 6.391923904418945, 6.054676532745361, 6.401974678039551, 6.302579402923584, 5.853846549987793, 6.480225563049316, 6.236186504364014, 5.957942008972168, 6.232265949249268, 6.000586032867432, 6.164960861206055, 6.081474781036377, 6.261346817016602, 6.262304782867432, 6.629276752471924, 6.579275131225586, 6.7386794090271, 6.368825435638428, 5.918819904327393, 6.454821586608887, 6.399744033813477, 6.266772747039795, 6.476525783538818, 6.317871570587158, 6.166080474853516, 6.220389366149902, 6.149013042449951, 6.419507026672363, 6.240653991699219, 6.420868873596191, 5.938660144805908, 6.401304721832275, 6.533816814422607, 7.276991367340088, 6.602691650390625, 6.177964687347412, 6.055017948150635, 6.257345676422119, 6.254475116729736, 6.029576301574707, 5.874240398406982, 5.83833122253418, 6.260675430297852, 6.258495330810547, 6.350877285003662, 5.770514488220215, 5.710880279541016, 6.1968207359313965, 6.2157883644104, 6.3371782302856445, 5.9487104415893555, 5.831474304199219, 5.96868896484375, 6.066019058227539, 5.994121074676514, 5.9624433517456055, 6.043508529663086, 5.869746685028076, 6.283603191375732, 6.198479652404785, 6.538374900817871, 6.065130233764648, 6.1803975105285645, 6.0836100578308105, 6.3073320388793945, 6.200476169586182, 6.1451616287231445, 5.886046409606934, 5.582698822021484, 6.0610785484313965, 6.007529258728027, 6.03468656539917, 6.357754230499268, 5.948261260986328, 5.908740997314453, 5.921627521514893, 5.975696086883545, 5.960643291473389, 5.762600421905518, 6.300854682922363, 5.8409423828125, 6.212132453918457, 6.080208778381348, 6.112234592437744, 5.801150798797607, 6.074677467346191, 5.57920503616333, 5.716797828674316, 5.705429553985596, 6.202625751495361, 6.77477502822876, 6.390930652618408, 6.289892196655273, 6.064563274383545, 6.125527858734131, 6.165822505950928, 5.967133522033691, 5.930405616760254, 6.249086856842041, 6.0736236572265625, 6.86621618270874, 6.387789249420166, 6.2464680671691895, 5.978222370147705, 6.10701847076416, 5.655599594116211, 5.983280658721924, 6.247879981994629, 6.306643009185791, 5.913511276245117, 6.102771759033203, 6.049382209777832, 6.147899627685547, 6.026295185089111, 6.1779093742370605, 6.176857948303223, 5.81687593460083, 6.095120429992676, 6.937154769897461, 6.135717391967773, 6.077595233917236, 6.055369853973389, 5.9088897705078125, 6.045284748077393, 5.855443954467773, 6.004875183105469, 6.480801105499268, 5.849123954772949, 5.583090782165527, 5.987932205200195, 6.095710754394531, 6.019157409667969, 5.891687393188477, 6.020927429199219, 6.0220136642456055, 6.40143346786499, 6.397446632385254, 5.9644060134887695, 5.989126682281494, 6.015266418457031, 6.266961574554443, 5.975499153137207, 5.956084251403809, 5.895081520080566, 5.433041095733643, 5.400272846221924, 5.981148719787598, 5.760838508605957, 5.670237064361572, 5.845357894897461, 5.839349269866943, 6.021749973297119, 6.107962608337402, 5.768333911895752, 6.067845821380615, 5.886244297027588, 6.0018181800842285, 5.91918420791626, 5.597175598144531, 5.8132829666137695, 6.294167995452881, 6.005967140197754, 5.959519386291504, 5.793619632720947, 6.147627830505371, 5.9065399169921875, 5.7112812995910645, 5.744060516357422, 5.908823013305664, 5.649531364440918, 5.745658874511719, 5.823487758636475, 5.946718215942383, 5.561007022857666, 6.01697301864624, 5.606359004974365, 5.686007976531982, 5.859426021575928, 5.665935039520264, 5.6301774978637695, 5.724796295166016, 5.805757999420166, 6.047088623046875, 6.358712673187256, 5.712946891784668, 5.467329025268555, 5.8449320793151855, 5.890450954437256, 5.498689651489258, 5.575255870819092, 6.075952529907227, 5.935315132141113, 5.641355037689209, 5.774849891662598, 5.462024211883545, 5.844214916229248, 6.016788005828857, 6.067754745483398, 5.670418739318848, 6.0373358726501465, 5.685266017913818, 5.728575706481934, 5.696843147277832, 5.7097320556640625, 6.083316802978516, 5.872762203216553, 5.601158618927002, 5.918758869171143, 5.364268779754639, 5.835238933563232, 5.799561500549316, 5.618314743041992, 5.523403644561768, 5.615954875946045, 5.853361129760742, 6.617393970489502, 5.052337169647217, 5.7063798904418945, 5.608389377593994, 5.765954494476318, 5.816861152648926, 6.054316997528076, 5.678779602050781, 6.160250186920166, 5.900005340576172, 5.871984481811523, 5.851475238800049, 5.945876121520996, 5.854629993438721, 5.8927226066589355, 5.891788005828857, 6.059042930603027, 6.027201175689697, 6.116600036621094, 5.587366580963135, 5.735865592956543, 5.8217387199401855, 6.392678737640381, 6.25793981552124, 6.247001647949219, 6.011718273162842, 5.616421699523926, 5.762818813323975, 5.60843563079834, 5.904599666595459, 5.697356224060059, 5.8082380294799805, 5.688162326812744, 5.879039764404297, 5.678139686584473, 5.625529766082764, 6.090422630310059, 5.750339508056641, 5.7088141441345215, 6.25057315826416, 5.347949028015137, 5.650809288024902, 5.992448329925537, 6.2639851570129395, 6.2101359367370605, 6.008402347564697, 6.258988857269287, 5.7012939453125, 6.063119888305664, 5.810507297515869, 5.840731143951416, 5.604563236236572, 6.173894882202148, 5.796119213104248, 5.925931930541992, 5.92219877243042, 5.86536979675293, 5.941733360290527, 5.818667411804199, 5.804078578948975, 5.471201419830322, 5.8511061668396, 5.728431701660156, 5.8712897300720215, 5.786444187164307, 6.069352149963379, 5.5369038581848145, 5.764482498168945, 5.714674949645996, 5.7530927658081055, 5.704172134399414, 5.849807262420654, 5.628445625305176, 5.893184185028076, 6.242439270019531, 5.6753387451171875, 5.646298885345459, 6.029741287231445, 5.823479175567627, 5.741197109222412, 5.586863994598389, 5.691661357879639, 5.585826873779297, 5.587854385375977, 6.528314590454102, 6.211322784423828, 5.684725284576416, 5.656140327453613, 5.59467077255249, 5.686540603637695, 5.460567474365234, 5.862893581390381, 5.5370659828186035, 5.859163761138916, 5.963477611541748, 5.820428371429443, 5.497456073760986, 5.598527908325195, 6.1262431144714355, 5.651837348937988, 5.575857639312744, 5.457406520843506, 5.892261028289795, 5.690864562988281, 5.244014263153076, 5.844915866851807, 5.314231872558594, 5.570207595825195, 5.913182258605957, 5.326052188873291, 5.572244167327881, 5.888057231903076, 5.696257591247559, 5.356265068054199, 4.469374179840088, 4.861632347106934, 5.76597785949707, 5.590156078338623, 5.705541610717773, 5.982632637023926, 5.670414447784424, 5.423191070556641, 5.655693054199219, 5.5042338371276855, 5.2807393074035645, 5.936582565307617, 5.861693382263184, 5.754704475402832, 5.746605396270752, 5.404297351837158, 5.948519229888916, 6.202834129333496, 5.625030040740967, 5.728869438171387, 5.475068092346191, 5.481683254241943, 5.792826175689697, 5.677883148193359, 5.4506731033325195, 5.291764736175537, 5.378326416015625, 5.210826396942139, 5.2747955322265625, 5.674410820007324, 5.748626708984375, 5.636696815490723, 5.885875225067139, 5.856495380401611, 5.871489524841309, 5.373839855194092, 5.482123374938965, 5.935791492462158, 5.827237129211426, 5.638439178466797, 5.8710618019104, 5.9312872886657715, 5.5213470458984375, 5.561307430267334, 5.551671981811523, 5.800052165985107, 5.674206256866455, 5.55178689956665, 5.760741710662842, 5.795047283172607, 5.517581939697266, 5.5709452629089355, 5.8632965087890625, 5.63878870010376, 5.55740213394165, 5.830319404602051, 5.73906946182251, 5.710470676422119, 5.709169864654541, 5.872033596038818, 5.690972805023193, 5.664299011230469, 5.638384819030762, 6.229616641998291, 5.741873264312744, 5.768802165985107, 5.5872931480407715, 5.777556896209717, 5.796839714050293, 5.608935832977295, 6.128883361816406, 5.81013822555542, 5.440651893615723, 5.651726245880127, 5.397670745849609, 5.591416358947754, 5.834839820861816, 5.4290547370910645, 5.7379961013793945, 5.633859634399414, 5.458295822143555, 5.484851360321045, 5.573428630828857, 5.465212821960449, 5.729116916656494, 5.1034626960754395, 5.859755992889404, 5.4065141677856445, 5.649065971374512, 6.041294097900391, 6.887099266052246, 6.443948745727539, 5.808934688568115, 6.527940273284912, 5.694581031799316, 6.054720878601074, 5.604702949523926, 6.182004928588867, 5.390415191650391, 5.834214210510254, 5.193598747253418, 5.206955909729004, 6.115958213806152, 5.6798295974731445, 5.494800090789795, 5.206104278564453, 5.283638000488281, 5.338168621063232, 5.338927268981934, 5.768185138702393, 5.4413557052612305, 5.749757289886475, 5.598018646240234, 5.382681846618652, 5.463992595672607, 5.227985858917236, 5.596580982208252, 5.880986213684082, 5.7957658767700195, 5.475543022155762, 5.343746185302734, 5.547591686248779, 5.1515021324157715, 5.2056565284729, 5.029978275299072, 5.72969388961792, 5.536269664764404, 5.708659648895264, 5.698227882385254, 5.216768741607666, 5.644904613494873, 5.828047752380371, 5.465641498565674, 5.540733814239502, 5.885371208190918, 5.412378787994385, 5.5981855392456055, 5.194221496582031, 5.612721920013428, 5.483850479125977, 5.466777801513672, 5.375182628631592, 5.482782363891602, 5.541299343109131, 5.224986553192139, 5.463261127471924, 5.706939697265625, 5.333202362060547, 5.633912086486816, 5.836627006530762, 5.974548816680908, 5.255207061767578, 5.501152515411377, 5.462813377380371, 5.4576873779296875, 5.430466651916504, 5.589463710784912, 5.631910800933838, 5.691384792327881, 5.139714241027832, 4.92720365524292, 5.763906478881836, 5.570552825927734, 5.512942790985107, 5.901918888092041, 5.484519958496094, 5.550894737243652, 5.671889781951904, 5.525747776031494, 5.434035778045654, 5.355439186096191, 5.669473171234131, 5.650969982147217, 5.399927616119385, 5.487706661224365, 5.5384697914123535, 5.553055763244629, 5.551137447357178, 5.25601863861084, 5.507266998291016, 5.386678695678711, 5.377140045166016, 6.251989364624023, 5.352185249328613, 5.356300354003906, 5.271110534667969, 5.18992280960083, 5.356988906860352, 5.577735424041748, 5.635621547698975, 5.189168930053711, 5.449824333190918, 5.3608784675598145, 5.759643077850342, 5.575029373168945, 5.417577743530273, 5.748820781707764, 5.421264171600342, 5.5839409828186035, 5.3348188400268555, 5.201325416564941, 5.369802951812744, 5.342089653015137, 5.534829139709473, 5.392975807189941, 5.372797012329102, 5.636729717254639, 5.564701080322266, 5.638014793395996, 5.315607070922852, 5.408867835998535, 5.124212265014648, 5.357346057891846, 5.505221366882324, 5.000692844390869, 5.668193340301514, 6.529182434082031, 5.789928913116455, 5.318154335021973, 5.414188861846924, 5.838808536529541, 5.223846435546875, 5.29207706451416, 5.385893821716309, 5.615672588348389, 5.274952411651611, 5.4714579582214355, 5.606874465942383, 5.336581230163574, 5.417585372924805, 5.467796325683594, 5.321090221405029, 5.667682647705078, 5.241640090942383, 5.113544940948486, 5.182219982147217, 6.10218620300293, 5.0964155197143555, 5.386025428771973, 5.501247882843018, 5.300382614135742, 5.679003715515137, 5.448155879974365, 5.442475318908691, 5.2140583992004395, 5.579960346221924, 5.024358749389648, 5.218372821807861, 5.235824108123779, 5.34967565536499, 5.35419225692749, 5.364425182342529, 5.188290596008301, 5.118271350860596, 5.715517044067383, 5.549782752990723, 5.466100692749023, 5.240900039672852, 5.18193244934082, 5.344643592834473, 5.536938667297363, 5.454422950744629, 5.345248699188232, 5.076200485229492, 5.142927169799805, 5.824478626251221, 5.306467056274414, 5.632652282714844, 5.277116298675537, 6.1832499504089355, 6.165722370147705, 5.313141822814941, 5.29921817779541, 5.461101531982422, 5.571989059448242, 5.539208889007568, 5.589401721954346, 5.34315299987793, 5.297715187072754, 5.213974475860596, 4.835277557373047, 5.532865524291992, 5.364620208740234, 5.622178554534912, 5.63447380065918, 5.3884735107421875, 5.570889472961426, 5.039861679077148, 5.172367572784424, 5.3443193435668945, 5.242828369140625, 5.230264186859131, 5.395712852478027, 5.393282413482666, 5.638762950897217, 5.039927959442139, 5.384886264801025, 5.220768928527832, 5.470816612243652, 5.455074787139893, 5.361629009246826, 5.359414100646973, 5.4023332595825195, 5.340902328491211, 5.495936870574951, 5.5247907638549805, 5.700245380401611, 5.32749080657959, 5.22927713394165, 5.761882305145264, 5.383120059967041, 5.334978103637695, 5.5474724769592285, 5.049428462982178, 5.0233001708984375, 5.424752235412598, 5.570937633514404, 5.615767955780029, 5.38301944732666, 5.1410675048828125, 5.259554386138916, 5.292890548706055, 5.462588787078857, 5.334794521331787, 5.202171325683594, 5.674699783325195, 5.273695945739746, 5.246124744415283, 4.918796539306641, 5.431621074676514, 5.247473239898682, 5.023876190185547, 5.391635894775391, 5.418959617614746, 5.239113807678223, 5.042668342590332, 5.438253402709961, 5.728262901306152, 5.502519607543945, 5.2353997230529785, 5.350951194763184, 5.242989540100098, 5.343756675720215, 5.713426113128662, 5.6904096603393555, 5.1100616455078125, 5.149363040924072, 5.042675971984863, 5.443427085876465, 4.995906829833984, 5.10377311706543, 5.410019397735596, 5.08161735534668, 5.307133674621582, 5.292069435119629, 5.255267143249512, 5.156691074371338, 5.561367034912109, 5.096119403839111, 5.433117389678955, 5.341620922088623, 5.419081211090088, 5.570847034454346, 5.170494079589844, 5.2772297859191895, 5.245430946350098, 5.111738204956055, 5.443270683288574, 4.961241245269775, 4.958014488220215, 5.085393905639648, 5.095254898071289, 5.199220180511475, 5.132205009460449, 5.204760551452637, 5.144446849822998, 5.412058353424072, 5.584427356719971, 5.911064147949219, 5.751983642578125, 5.281275749206543, 5.314406394958496, 5.744341850280762, 4.626309871673584, 5.054619789123535, 5.633773326873779, 5.419430732727051, 5.471550941467285, 5.132818222045898, 5.13505744934082, 5.15376091003418, 4.991021156311035, 5.15557861328125, 4.995131492614746, 5.143355369567871, 5.118399143218994, 4.758315563201904, 5.031304359436035, 5.181886672973633, 4.789873123168945, 5.245849609375, 5.16688346862793, 4.9148406982421875, 5.381389617919922, 5.276390552520752, 5.3202996253967285, 5.275509834289551, 4.938802719116211, 5.388436794281006, 5.24534273147583, 5.265542030334473, 5.24481201171875, 5.160165786743164, 5.435546398162842, 5.279983043670654, 5.318422317504883, 4.736410140991211, 5.465132713317871, 5.393467903137207, 5.188449382781982, 5.055899143218994, 5.3045830726623535, 5.0841965675354, 5.487054824829102, 5.061253547668457, 5.111061096191406, 5.2657012939453125, 5.092281818389893, 5.477118968963623, 5.024427890777588, 5.31233024597168, 5.436662673950195, 5.1077399253845215, 5.312851905822754, 5.254987716674805, 5.124186038970947, 5.2129669189453125, 5.116581439971924, 5.137977600097656, 5.438777923583984, 5.147928714752197, 5.06557559967041, 4.923976898193359, 5.268826961517334, 5.497862815856934, 5.126601696014404, 5.311047077178955, 5.474635124206543, 5.3226776123046875, 5.268956661224365, 5.309335708618164, 5.455187797546387, 5.305100917816162, 5.105838298797607, 5.164857864379883, 5.08190393447876, 5.217720031738281, 5.365724563598633, 5.149499416351318, 4.9489665031433105, 5.208736419677734, 5.07710599899292, 5.341139316558838, 5.349327087402344, 5.2774882316589355, 5.040478706359863, 5.450251579284668, 5.397568702697754, 5.404848575592041, 5.601272106170654, 5.37244176864624, 5.356063365936279, 4.941473007202148, 5.169097900390625, 5.3034892082214355, 5.117247104644775, 5.702087879180908, 5.435567855834961, 4.908302307128906, 5.155994415283203, 5.638440132141113, 5.1563029289245605, 5.134635925292969, 4.896514892578125, 5.139523029327393, 5.059229850769043, 5.119204044342041, 5.406469345092773, 5.3972673416137695, 5.288425445556641, 5.197020053863525, 5.106208324432373, 5.015985488891602, 5.396910667419434, 4.94264030456543, 5.272867202758789, 5.017120838165283, 5.135209560394287, 5.127645015716553, 5.520988941192627, 4.954178810119629, 5.04573392868042, 4.835503101348877, 5.319645881652832, 4.981767654418945, 4.8417744636535645, 5.13225793838501, 6.055591106414795, 4.8408284187316895, 4.744532108306885, 5.087967395782471, 4.88917350769043, 5.1240386962890625, 4.867646217346191, 4.910617351531982, 5.231966018676758, 5.067509651184082, 5.476629734039307, 5.013774871826172, 4.856022834777832]
+21:20:33.466: val_losses={0: 10.825848579406738, 125: 6.5537190437316895, 250: 6.114950656890869, 375: 5.888970375061035, 500: 5.745011806488037, 625: 5.5859527587890625, 750: 5.412529945373535, 875: 5.277693748474121, 1000: 5.208320617675781}
+21:22:02.901: Renamed logs/b238c4bf-a5d9-417f-bc93-6261e02c35ba.txt -> logs/20250204_SSMax.txt
+21:22:02.903: peak memory allocated: 20577 MiB reserved: 21536 MiB

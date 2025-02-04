@@ -37,6 +37,12 @@ Findings:
     * `20250202_MoEUT2_Skips`: Added per-layer weights/gates & unet-skip connections (both good, latter better): `val_loss:4.8662 step_avg:247.70ms`
     * `20250202_MoEUT2_ValueEmbeds`: Added value embeds - `val_loss:4.8793 step_avg:249.93ms`
     * `20250202_MoEUT2_ValueEmbeds2`: Tweaked to only 2 value embeds - `val_loss:4.8520 step_avg:249.41ms`
+    * reverted: attk=4: `val_loss:4.8260 step_avg:260.60ms`
+    * reverted: att_experts=4: `val_loss:4.8825 step_avg:249.86ms`
+    * `20250202_MoEUT2_x0skips`: Add skips back to x0 - `val_loss:4.8208 step_avg:253.83ms`
+
+* Testing out [Scalable-Softmax](https://arxiv.org/abs/2501.19399)
+    * `20250203_BaseGPT`: val_loss:4.6718 step_avg:223.76ms
 
 
 # Original README.md below

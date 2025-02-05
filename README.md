@@ -42,7 +42,24 @@ Findings:
     * `20250202_MoEUT2_x0skips`: Add skips back to x0 - `val_loss:4.8208 step_avg:253.83ms`
 
 * Testing out [Scalable-Softmax](https://arxiv.org/abs/2501.19399)
-    * `20250203_BaseGPT`: val_loss:4.6718 step_avg:223.76ms
+    * n_layers=12, d_model=384, n_heads=3
+    * `20250204_SSMax320M  `: step:20000/20000 val_loss:3.7410 step_avg:236.09ms train_time:4720s
+    * `20250204_NoSSMax320M`: step:20000/20000 val_loss:3.7385 step_avg:236.40ms train_time:4726s
+    * ![SSMax training curve showing near-identical loss with base run being slightly better](./experiment_logs/20250204_SSMax320M.png)
+    * Learned the following softmax scaling values:
+    ```
+    [[ 0.16308594,  0.12158203,  0.09863281],
+    [ 0.41992188,  0.26367188,  0.21582031],
+    [ 0.234375  ,  0.25585938,  0.26953125],
+    [ 0.20800781,  1.015625  ,  0.19238281],
+    [ 0.15625   ,  0.25390625,  0.22753906],
+    [ 0.21484375,  0.25390625,  0.2734375 ],
+    [ 0.22460938,  0.13769531,  0.20605469],
+    [ 0.2421875 , -0.13476562,  0.23339844],
+    [ 0.22558594,  0.19628906,  0.24511719],
+    [ 0.21972656,  0.21484375,  0.23242188],
+    [ 0.26757812,  0.2578125 ,  0.22949219]]
+    ```
 
 
 # Original README.md below

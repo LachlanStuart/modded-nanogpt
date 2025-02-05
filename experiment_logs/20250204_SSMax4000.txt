@@ -1,0 +1,1842 @@
+21:51:50.582: from collections import defaultdict
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import time
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+import atexit
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import torch
+torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+from torch import Tensor, nn
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.profiler import profile, record_function, ProfilerActivity
+# use of FlexAttention contributed by @KoszarskyB
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
+# torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
+import triton
+import triton.language as tl
+
+try:
+    from lovely_tensors import monkey_patch
+    monkey_patch()
+except ImportError:
+    pass
+
+
+# -----------------------------------------------------------------------------
+#region  Custom operators : FP8 matmul by @YouJiacheng
+@torch.library.custom_op("nanogpt::mm", mutates_args=())
+def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
+    @torch.compile
+    def impl(x: Tensor, w: Tensor):
+        assert x.is_contiguous() and w.is_contiguous()
+        # x_f8 = x.mul(x_s).to(torch.float8_e4m3fn)
+        x_f8 = x.mul(x_s).to(torch.float8_e5m2)
+        # w_f8 = w.mul(w_s).to(torch.float8_e4m3fn)
+        w_f8 = w.mul(w_s).to(torch.float8_e5m2)
+        out = torch._scaled_mm(
+            x_f8,
+            w_f8.t(),
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(1 / x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(1 / w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+        return out, x_f8, w_f8
+
+    return impl(x, w)
+
+@mm_op.register_fake
+def _(x: Tensor, w: Tensor, *_):
+    assert x.ndim == w.ndim == 2
+    assert x.shape[1] == w.shape[1]
+    assert x.device == w.device
+    assert x.is_contiguous() and w.is_contiguous()
+    # return x @ w.t(), x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+    return x @ w.t(), x.to(torch.float8_e5m2), w.to(torch.float8_e5m2)
+
+@torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
+def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
+    @torch.compile
+    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
+        assert grad.is_contiguous()
+        x_inv_s = grad.new_tensor(1 / x_s, dtype=torch.float32)
+        w_inv_s = grad.new_tensor(1 / w_s, dtype=torch.float32)
+        grad_inv_s = grad.new_tensor(1 / grad_s, dtype=torch.float32)
+        grad_f8 = grad.mul(grad_s).to(torch.float8_e5m2)
+        grad_x = torch._scaled_mm(
+            grad_f8,
+            w_f8.t().contiguous().t(),
+            out_dtype=torch.bfloat16,
+            scale_a=grad_inv_s,
+            scale_b=w_inv_s,
+            use_fast_accum=False,
+        )
+        # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
+        grad_w = torch._scaled_mm(
+            x_f8.t().contiguous(),
+            grad_f8.t().contiguous().t(),
+            out_dtype=torch.float32,
+            scale_a=x_inv_s,
+            scale_b=grad_inv_s,
+            use_fast_accum=False,
+        ).t()
+        return grad_x, grad_w
+
+    return impl(g, x_f8, w_f8)
+
+@mm_backward_op.register_fake
+def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
+    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
+
+def backward(ctx, grad_out: Tensor, *_):
+    x_f8, w_f8 = ctx.saved_tensors
+    x_s, w_s, grad_s = ctx.scales
+    grad_x, grad_w = torch.ops.nanogpt.mm_backward(
+        grad_out, x_f8, w_f8, x_s, w_s, grad_s
+    )
+    return grad_x, grad_w, None, None, None
+
+def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+    *_, x_s, w_s, grad_s = inputs
+    _, x_f8, w_f8 = output
+    ctx.save_for_backward(x_f8, w_f8)
+    ctx.scales = x_s, w_s, grad_s
+    ctx.set_materialize_grads(False)
+
+mm_op.register_autograd(backward, setup_context=setup_context)
+#endregion
+# -----------------------------------------------------------------------------
+#region Muon optimizer
+@torch.compile
+def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer assumes that all parameters passed in are 2D.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe it is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven"t tested this.
+    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        ns_steps: The number of Newton-Schulz iteration steps to use.
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
+        self.rank = rank
+        self.world_size = world_size
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        params: list[Tensor] = [*params]
+        assert all(isinstance(p, Tensor) for p in params)
+        sizes = {p.numel() for p in params}
+        def create_update_buffer(size: int):
+            b = torch.empty(self.world_size, size, dtype=torch.bfloat16, device="cuda")
+            return dict(update_buffer=b, update_buffer_views=[b[i] for i in range(self.world_size)])
+        param_groups = [
+            dict(params=[p for p in params if p.numel() == size], **create_update_buffer(size)) for size in sizes]
+        super().__init__(param_groups, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            nesterov = group["nesterov"]
+            ns_steps = group["ns_steps"]
+            update_buffer = group["update_buffer"]
+            update_buffer_views: list[Tensor] = group["update_buffer_views"]
+            # generate weight updates in distributed fashion
+            params: list[Tensor] = group["params"]
+            handle = None
+            params_world = None
+            def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
+                if params_world is None:
+                    return
+                assert handle is not None
+                handle.wait()
+                for p_world, g_world in zip(params_world, update_buffer_views):
+                    p_world.add_(
+                        g_world.view_as(p_world),
+                        alpha=-lr * max(1, p_world.size(-2) / p_world.size(-1)) ** 0.5,
+                    )
+            for base_i in range(len(params))[::self.world_size]:
+                if base_i + self.rank < len(params):
+                    p = params[base_i + self.rank]
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf: Tensor = state["momentum_buffer"]
+                    buf.lerp_(g, 1 - momentum)
+                    g = g.lerp_(buf, momentum) if nesterov else buf
+                    g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
+                else:
+                    g = update_buffer_views[self.rank]
+                update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
+                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
+                params_world = params[base_i : base_i + self.world_size]
+            update_prev()
+#endregion
+# -----------------------------------------------------------------------------
+#region PyTorch nn.Module definitions for the model
+
+def norm(x: Tensor):
+    return F.rms_norm(x, (x.size(-1),))
+
+class CastedLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, use_fp8: bool = False, x_s: float = 1.0, w_s: float = 1.0, grad_s: float = 1.0):
+        super().__init__(in_features, out_features, bias=False)
+        self.use_fp8 = use_fp8
+        self.x_s = x_s
+        self.w_s = w_s
+        self.grad_s = grad_s
+
+    def reset_parameters(self) -> None:
+        std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
+            self.weight.uniform_(-bound, bound)
+
+    def forward(self, x: Tensor):
+        if self.use_fp8 and self.training:
+            _x = x.flatten(0, -2)
+            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
+            return out.reshape(*x.shape[:-1], -1)
+        else:
+            return F.linear(x, self.weight.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int):
+        super().__init__()
+        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
+        self.cos = nn.Buffer(theta.cos(), persistent=False)
+        self.sin = nn.Buffer(theta.sin(), persistent=False)
+
+    def forward(self, x_BTHD: Tensor):
+        assert self.cos.size(0) >= x_BTHD.size(-3)
+        cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        hdim = num_heads * head_dim
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
+        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
+        # https://x.com/hi_tysam/status/1879699187107033311
+        self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.rotary = Rotary(head_dim, max_seq_len)
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
+        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        self.attn_scale = 0.12
+        # Scalable-Softmax params
+        # Using 1/log(512) to approximately negate the log(n), assuming 512 is the average window_size (unchecked).
+        # This hasn't been tuned. Assuming that self.attn_scale was tuned, so trying to avoid deviating too much.
+        self.softmax_temps = nn.Parameter(1/torch.tensor([512] * num_heads).log())
+
+
+    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, logn: Tensor):
+        B, T = x.size(0), x.size(1) # batch size, sequence length
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
+        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = self.rotary(q), self.rotary(k)
+        # Apply Scalable-Softmax
+        q = q * self.softmax_temps[None, None, :, None] * logn.type_as(q)[None, :, None, None]
+
+        if ve is not None:
+            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = self.lambdas[0] * v
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
+        y = y.transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.c_fc = CastedLinear(dim, hdim)
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+
+    def forward(self, x: Tensor):
+        x = self.c_fc(x)
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = self.c_proj(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim: int, num_heads: int, layer_idx: int, max_seq_len: int):
+        super().__init__()
+        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
+        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
+        self.mlp = MLP(dim)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+
+    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask, logn: Tensor):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        if self.attn is not None:
+            x = x + self.attn(norm(x), ve, block_mask, logn)
+        x = x + self.mlp(norm(x))
+        return x
+
+class ValueEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, embedding_dim: int, num_layers: int, num_embeddings: int = 3):
+        super().__init__()
+        self.num_layers = num_layers
+        self.num_embeddings = num_embeddings
+        self.embed = nn.ModuleList([nn.Embedding(vocab_size, embedding_dim) for _ in range(num_embeddings)])
+
+    def forward(self, input_seq: Tensor) -> list[Tensor | None]:
+        ve = [emb(input_seq) for emb in self.embed]
+        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
+        ve = list(ve) + [None] * (self.num_layers - 2 * self.num_embeddings) + list(ve)
+        return ve
+#endregion
+# -----------------------------------------------------------------------------
+#region The main model
+
+def next_multiple_of_n(v: float | int, *, n: int):
+    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+
+def create_block_masks(input_seq: Tensor, sliding_window_num_blocks: Tensor):
+    BLOCK_SIZE = 128
+    docs = (input_seq == 50256).cumsum(0)
+
+    def document_causal(b, h, q_idx, kv_idx):
+        causal_mask = q_idx >= kv_idx
+        document_mask = docs[q_idx] == docs[kv_idx]
+        return causal_mask & document_mask
+
+    def dense_to_ordered(dense_mask: Tensor):
+        num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
+        indices = dense_mask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
+        return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+
+    # manual block mask creation by @YouJiacheng
+    assert len(input_seq) % BLOCK_SIZE == 0
+    NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
+    block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
+    any_causal_bm = block_idx[:, None] >= block_idx
+    all_causal_bm = block_idx[:, None] > block_idx
+    docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
+    docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
+    any_document_bm = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
+    all_document_bm = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
+    any_bm = any_causal_bm & any_document_bm
+    all_bm = all_causal_bm & all_document_bm
+    partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(any_bm & ~all_bm)
+    full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
+    def build_bm(sw_num_blocks: Tensor) -> BlockMask:
+        return BlockMask.from_kv_blocks(
+            torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(sw_num_blocks - full_kv_num_blocks, 1)),
+            partial_kv_indices,
+            torch.clamp_max(full_kv_num_blocks, sw_num_blocks - 1),
+            full_kv_indices,
+            BLOCK_SIZE=BLOCK_SIZE,
+            mask_mod=document_causal,
+        )
+
+    # Scalable-Softmax needs to know the number of visible keys for each position's query
+    # Gah, I give up. No SWA with SSMax.
+    full_bm = build_bm(NUM_BLOCKS)
+    input_pos = torch.arange(len(input_seq), device=input_seq.device)
+    seq_pos = input_pos - input_pos.masked_fill((input_seq != 50256), 0).cummax(0).values
+    logn = (seq_pos + 1).log()
+    return full_bm, full_bm, logn, logn
+
+    # # Does this work? Hard to test
+    # right_partial = input_pos - input_pos.masked_fill((input_seq != 50256) & (input_pos % BLOCK_SIZE != 0), 0).cummax(0).values
+    # long_window_size = (max(0, sliding_window_num_blocks - 1) * BLOCK_SIZE + right_partial).clamp_max(seq_pos)
+    # short_window_size = (max(0, sliding_window_num_blocks // 2 - 1) * BLOCK_SIZE + right_partial).clamp_max(seq_pos)
+    # long_logn = (long_window_size + 1).log()
+    # short_logn = (short_window_size + 1).log()
+
+    # breakpoint()
+
+    # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
+    # return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2), long_logn, short_logn
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
+        self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers)
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, layer_idx, max_seq_len) for layer_idx in range(num_layers)])
+        # U-net design by @brendanh0gan
+        self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
+        self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
+        # Add learnable skip connection weights for decoder layers
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+        # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
+        # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
+        # self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
+        self.lm_head.weight.detach().zero_() # @Grad62304977
+
+
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+        assert input_seq.ndim == 1
+
+        long_bm, short_bm, long_ws, short_ws = create_block_masks(input_seq, sliding_window_num_blocks)
+
+        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        ve = self.value_embeds(input_seq)
+        assert len(ve) == len(self.blocks)
+        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
+        assert len(ve_enc) == self.num_encoder_layers and len(ve_dec) == self.num_decoder_layers
+
+        # Store outputs for U-Net skip connections
+        skip_connections = []
+        # Encoder pass - process only the first half of the blocks
+        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
+        logns = [long_ws, short_ws, short_ws, short_ws, long_ws, short_ws]
+        assert len(block_masks) == self.num_encoder_layers
+        for i, block in enumerate(self.blocks[:self.num_encoder_layers]):
+            x = block(x, ve_enc[i], x0, block_masks[i], logns[i])
+            skip_connections.append(x)
+        # Decoder pass - process the remaining blocks with weighted skip connections
+        block_masks.reverse()
+        logns.reverse()
+        assert len(block_masks) == self.num_decoder_layers
+        for i, block in enumerate(self.blocks[self.num_encoder_layers:]):
+            x = x + self.skip_weights[i] * skip_connections.pop()
+            x = block(x, ve_dec[i], x0, block_masks[i], logns[i])
+
+        x = norm(x)
+        logits = self.lm_head(x)
+        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+        logits = 30 * torch.sigmoid(logits.float() / 7.5)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
+        return loss
+
+#endregion
+# -----------------------------------------------------------------------------
+#region MoEUT Triton kernels
+# From https://github.com/RobertCsordas/moeut/blob/master/moeut/cvmm.py
+
+@dataclass
+class CVMMSel:
+    raw_sel: torch.Tensor
+    sel: torch.Tensor
+    sel_index: torch.Tensor
+    out_index: torch.Tensor | None = None
+    reduction_weight: torch.Tensor | None = None
+
+    def clone(self) -> 'CVMMSel':
+        return CVMMSel(self.raw_sel, self.sel, self.sel_index, self.out_index, self.reduction_weight)
+
+
+def cvmm_prepare_sel(sel: torch.Tensor, n_experts: int) -> CVMMSel:
+    fsel = sel.flatten()
+    ssel, sel_index = fsel.sort()
+    return CVMMSel(sel, ssel.view_as(sel), sel_index, None)
+
+
+def dtype_to_type_id(dtype: torch.dtype):
+    if dtype == torch.float32:
+        return 0
+    elif dtype == torch.float16:
+        return 1
+    elif dtype == torch.bfloat16:
+        return 2
+
+    raise ValueError("Unknown dtype")
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+    ],
+    key=['M', 'N', 'K', 'dtype_id', 'allow_tf32']
+)
+@triton.jit
+def cvmm_kernel(
+    # Pointers to matrices
+    a_ptr, b_ptr, c_ptr, index_ptr, sel_ptr, out_index_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # The stride variables represent how much to increase the ptr by when moving by 1
+    # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
+    # by to get the element one row down (A has M rows).
+    stride_am, stride_ak,
+    stride_bo, stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    stride_index, stride_sel, stride_out_index,
+    out_index_is_none: tl.constexpr,
+    dtype_id: tl.constexpr, allow_tf32: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr
+):
+    """Kernel for computing the matmul C = A x B.
+    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    # See above `L2 Cache Optimizations` section for details.
+    pid = tl.program_id(axis=0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    pid_m = first_pid_m + (pid % group_size_m)
+
+    sel_first = tl.load(sel_ptr + pid_m * BLOCK_SIZE_M * stride_sel)
+    sel_last = tl.load(sel_ptr + (min((pid_m + 1) * BLOCK_SIZE_M, M) - 1) * stride_sel)
+    sel_all = tl.load(sel_ptr + stride_sel * ((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M))
+
+    for matrix_id in range(sel_first, sel_last + 1):
+        # ----------------------------------------------------------
+        # Create pointers for the first blocks of A and B.
+        # We will advance this pointer as we move in the K direction
+        # and accumulate
+        # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+        # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+        # See above `Pointer Arithmetics` section for details
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+        remap_offs_am = tl.load(index_ptr + stride_index * offs_am)
+
+        # Create offset pointers
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        a_ptrs = a_ptr + (remap_offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = b_ptr + matrix_id * stride_bo + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+        # -----------------------------------------------------------
+        # Iterate to compute a block of the C matrix.
+        # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+        # of fp32 values for higher accuracy.
+        # `accumulator` will be converted back to fp16 after the loop.
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            # Load the next block of A and B, generate a mask by checking the K dimension.
+            # If it is out of bounds, set it to 0.
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            # We accumulate along the K dimension.
+
+            # Triton was unhappy with passing dtypes as vars.
+            if dtype_id == 1:
+                a = a.to(tl.float16)
+                b = b.to(tl.float16)
+            elif dtype_id == 2:
+                a = a.to(tl.bfloat16)
+                b = b.to(tl.bfloat16)
+
+            accumulator += tl.dot(a, b, allow_tf32=allow_tf32)
+
+            # Advance the ptrs to the next K block.
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+
+
+        if dtype_id == 1:
+            c = accumulator.to(tl.float16)
+        elif dtype_id == 2:
+            c = accumulator.to(tl.bfloat16)
+        else:
+            c = accumulator
+
+        # -----------------------------------------------------------
+        # Write back the block of the output matrix C with masks.
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+
+        if out_index_is_none:
+            remap_offs_cm = remap_offs_am
+        else:
+            remap_offs_cm = tl.load(out_index_ptr + stride_out_index * offs_am)
+
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * remap_offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = ((offs_cm[:, None] < M) & (sel_all[:, None] == matrix_id)) & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
+        # triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 128}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 4}, num_stages=4, num_warps=4),
+
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
+        # triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 128}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 8}, num_stages=4, num_warps=4),
+
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 16}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 16}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
+    ],
+    key=['M', 'N', 'K', 'out_dtype_id', 'allow_tf32', 'dtype_id'], reset_to_zero = ['c_ptr']
+)
+@triton.jit
+def cvmm_backward_kernel3(
+    # Pointers to matrices
+    a_ptr, b_ptr, c_ptr, index_ptr, sel_ptr, out_index_ptr,
+    # Matrix dimensions
+    M, N, K,
+    # The stride variables represent how much to increase the ptr by when moving by 1
+    # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
+    # by to get the element one row down (A has M rows).
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_co, stride_cm, stride_cn,
+    stride_index, stride_sel, stride_out_index,
+    out_index_is_none: tl.constexpr,
+    out_dtype_id: tl.constexpr, allow_tf32: tl.constexpr, dtype_id: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr, K_BLOCKS: tl.constexpr
+):
+    """Kernel for computing the matmul C = A x B.
+    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    # See above `L2 Cache Optimizations` section for details.
+    pid = tl.program_id(axis=0)
+    k_block_id = tl.program_id(axis=1)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # ----------------------------------------------------------
+    # Create pointers for the first blocks of A and B.
+    # We will advance this pointer as we move in the K direction
+    # and accumulate
+    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    # See above `Pointer Arithmetics` section for details
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+    # -----------------------------------------------------------
+    # Iterate to compute a block of the C matrix.
+    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+    # of fp32 values for higher accuracy.
+    # `accumulator` will be converted back to fp16 after the loop.
+
+    a_ptrs_this = a_ptr + offs_am[:, None] * stride_am
+    b_ptrs_this = b_ptr + offs_bn[None, :] * stride_bn
+
+    # Kactual = end_i - start_i
+    # Nblocks = (Kactual + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+
+    # WORK_PER_WORKER = (Nblocks + K_BLOCKS - 1) // K_BLOCKS
+    # WORK_PER_WORKER = WORK_PER_WORKER if WORK_PER_WORKER > MIN_WORK_SIZE else MIN_WORK_SIZE
+
+
+    # # Kloop_start = (Kactual + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+
+    # first_block_k = k_block_id * WORK_PER_WORKER
+    # last_block_k = min((k_block_id+1) * WORK_PER_WORKER, Nblocks)
+
+    block_start_index = k_block_id * BLOCK_SIZE_K * K_BLOCKS
+    block_end_index = min(block_start_index + BLOCK_SIZE_K * K_BLOCKS, K) - 1
+
+    first_mat = tl.load(sel_ptr + stride_sel * block_start_index)
+    last_mat = tl.load(sel_ptr + stride_sel * block_end_index)
+
+
+    for matrix_index in range(first_mat, last_mat + 1):
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+        start_i = block_start_index
+        end_i = block_end_index + 1
+        while start_i < end_i:
+            middle = (start_i + end_i) // 2
+            middle_matrix = tl.load(sel_ptr + middle * stride_sel)
+            if middle_matrix < matrix_index:
+                start_i = middle + 1
+            else:
+                end_i = middle
+
+
+        # # Continue binary search: find the first matrix that is > matrix_index
+        start_i2 = start_i
+        end_i = block_end_index + 1
+        while start_i2 < end_i:
+            middle = (start_i2 + end_i) // 2
+            middle_matrix = tl.load(sel_ptr + middle * stride_sel)
+            if middle_matrix <= matrix_index:
+                start_i2 = middle + 1
+            else:
+                end_i = middle
+
+        end_i = start_i2
+
+        count = end_i - start_i
+
+        block_mem_indices_f_base = start_i  + tl.arange(0, BLOCK_SIZE_K)
+
+        if count > 0:
+            for k in range((count + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K):
+                # block_mem_indices = (k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)) % K
+                block_mem_indices_f = block_mem_indices_f_base + k * BLOCK_SIZE_K
+                block_mem_indices = block_mem_indices_f % K
+                a_index = tl.load(index_ptr + stride_index * block_mem_indices)
+                if out_index_is_none:
+                    b_index = a_index
+                else:
+                    b_index = tl.load(out_index_ptr + stride_out_index * block_mem_indices)
+                sel_ok = block_mem_indices_f < end_i
+
+                a_ptrs = a_ptrs_this + a_index[None, :] * stride_ak
+                b_ptrs = b_ptrs_this + b_index[:, None] * stride_bk
+
+                # Load the next block of A and B, generate a mask by checking the K dimension.
+                # If it is out of bounds, set it to 0.
+                a = tl.load(a_ptrs, mask=sel_ok[None, :], other=0.0)
+                b = tl.load(b_ptrs, mask=sel_ok[:, None], other=0.0)
+
+                if dtype_id == 1:
+                    a = a.to(tl.float16)
+                    b = b.to(tl.float16)
+                elif dtype_id == 2:
+                    a = a.to(tl.bfloat16)
+                    b = b.to(tl.bfloat16)
+
+                # We accumulate along the K dimension.
+                accumulator += tl.dot(a, b, allow_tf32=allow_tf32)
+
+            if out_dtype_id == 1:
+                c = accumulator.to(tl.float16)
+            elif out_dtype_id == 2:
+                c = accumulator.to(tl.bfloat16)
+            else:
+                c = accumulator
+
+            # -----------------------------------------------------------
+            # Write back the block of the output matrix C with masks.
+            offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            c_ptrs = c_ptr + stride_co * matrix_index + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            # tl.store(c_ptrs, c, mask=c_mask)
+            tl.atomic_add(c_ptrs, c, mask=c_mask)
+
+
+torch.library.define("mylib::cvmm_triton", "(Tensor x, Tensor sel_index, Tensor sel, Tensor keys, ScalarType out_dtype, Tensor out_index) -> Tensor")
+@torch.library.impl("mylib::cvmm_triton", "default")
+def cvmm_triton(
+    x: torch.Tensor,
+    sel_index: torch.Tensor,
+    sel: torch.Tensor,
+    keys: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_index: torch.Tensor
+):
+    x = x.flatten(end_dim=-2)
+    assert x.shape[-1] == keys.shape[1]
+
+    sel_shape = sel.shape
+    sel = sel.flatten()
+
+    M = sel.shape[0]
+    O, K, N = keys.shape
+    # Allocates output.
+    out = torch.empty((M, N), device=x.device, dtype=out_dtype)
+    # out = torch.zeros((M, N), device=x.device, dtype=out_dtype)
+    # 1D launch kernel where each block gets its own program.
+
+    # expected_m_per_matrix = int(math.ceil(M / O * 1.5))
+    # expected_m_per_matrix = M
+
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+    )
+
+    out_index_is_none = False
+    if out_index.numel() == 1 and out_index == -1:
+        out_index_is_none = True
+
+    cvmm_kernel[grid](
+        x, keys, out, sel_index, sel, out_index,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        keys.stride(0), keys.stride(1), keys.stride(2),
+        out.stride(0), out.stride(1),
+        sel_index.stride(0), sel.stride(0), 0 if out_index_is_none else out_index.stride(0),
+        out_index_is_none=out_index_is_none,
+        dtype_id = dtype_to_type_id(out.dtype), allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+    )
+
+    return out.view(*sel_shape, N)
+
+
+@torch.library.register_fake("mylib::cvmm_triton", cvmm_triton)
+def cvmm_triton_abstract(x, sel_idx, sel, keys, out_dtype, out_index):
+    sel_shape = sel.shape
+    sel = sel.flatten()
+    M = sel.shape[0]
+    O, K, N = keys.shape
+    out = torch.empty((M, N), device=x.device, dtype=out_dtype)
+    sel_shape = sel.shape
+    return out.view(*sel_shape, N)
+
+
+def cvmm_triton_backward(
+    x: torch.Tensor,
+    sel_index: torch.Tensor,
+    sel: torch.Tensor,
+    grads: torch.Tensor,
+    n_experts: int,
+    key_dtype: torch.dtype,
+    op_dtype: torch.dtype,
+    out_index: torch.Tensor
+):
+    x = x.flatten(end_dim=-2)
+    x = x.transpose(0, 1)
+    grads = grads.flatten(end_dim=-2)
+    sel = sel.flatten()
+    M, _ = x.shape
+    K, N = grads.shape
+    # FIX: out must be atomic_add'able, which excludes bfloat16. Cast to key_dtype after. Maybe this could be f16
+    out = torch.zeros((n_experts, M, N), device=x.device, dtype=torch.float32)
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), triton.cdiv(K, META['BLOCK_SIZE_K'] * META['K_BLOCKS'])
+    )
+    out_index_is_none = False
+    if out_index.numel() == 1 and out_index == -1:
+        out_index_is_none = True
+
+    cvmm_backward_kernel3[grid](
+        x, grads, out, sel_index, sel, out_index,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        grads.stride(0), grads.stride(1),
+        out.stride(0), out.stride(1), out.stride(2),
+        sel_index.stride(0), sel.stride(0), 0 if out_index_is_none else out_index.stride(0),
+        out_index_is_none=out_index_is_none,
+        out_dtype_id=dtype_to_type_id(out.dtype),
+        dtype_id=dtype_to_type_id(op_dtype),
+        allow_tf32=False #torch.backends.cuda.matmul.allow_tf32
+    )
+    return out.to(dtype=key_dtype)
+
+
+class CVMM(torch.autograd.Function):
+    warned = False
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        sel_index: torch.Tensor,
+        sel: torch.Tensor,
+        keys: torch.Tensor,
+        out_index: torch.Tensor | None = None,
+        reduction_weight: torch.Tensor | None = None
+    ):
+        ctx.save_for_backward(x, keys, sel, sel_index, out_index, reduction_weight)
+
+        # out_type = get_dtype()
+        out_type = x.dtype
+        # out_type = torch.float32
+        if out_index is None:
+            out_index = torch.tensor(-1).cuda()
+        res = torch.ops.mylib.cvmm_triton(x, sel_index, sel, keys, out_type, out_index)
+
+        if reduction_weight is not None:
+            res = res.view(*reduction_weight.shape, res.shape[-1])
+            res = (reduction_weight.unsqueeze(-2).type_as(res) @ res).squeeze(-2)
+
+        ctx.op_type = out_type
+        ctx.keys_type = keys.dtype
+        ctx.dtype = out_type
+        return res.type_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, keys, sel, sel_index, out_index, reduction_weight = ctx.saved_tensors
+        keys_dt = keys
+
+        # Backward for weight
+        if reduction_weight is not None:
+            # Project back the grads with he reduction weight, so the grad for the weight matrix is ok
+            grad_output_w = reduction_weight.unsqueeze(-1).type_as(grad_output) @ grad_output.unsqueeze(-2)
+        else:
+            grad_output_w  = grad_output
+
+        out_index_is_none = False
+        if out_index is None:
+            out_index_is_none = True
+            out_index = torch.tensor(-1).cuda()
+
+        grad_w = cvmm_triton_backward(
+            x,
+            sel_index,
+            sel,
+            grad_output_w,
+            keys_dt.shape[0],
+            ctx.keys_type,
+            ctx.dtype,
+            out_index=out_index
+        )
+
+        # Backward for input and reduction weight
+        grad_w_off = None
+
+        bw_index = sel_index if out_index_is_none else out_index
+        bw_index_out = torch.tensor(-1).cuda()
+        if reduction_weight is not None:
+            # Hack the output indices to emulate repeats
+            bw_index_out = bw_index
+            bw_index = bw_index // reduction_weight.shape[-1]
+
+        grad_x_full = torch.ops.mylib.cvmm_triton(
+            grad_output,
+            bw_index,
+            sel,
+            keys_dt.transpose(1,2),
+            ctx.op_type,
+            bw_index_out
+        )
+
+        grad_x_full = grad_x_full.view(*x.shape[:-1], -1, x.shape[-1])
+        if reduction_weight is not None:
+            # grad_x_full is the unscaled grad. For the input, we have to scale it, for the reduction wegiht,
+            # we have to compute dot products with the input.
+            grad_x = (reduction_weight.view(*grad_x_full.shape[:-1]).unsqueeze(-2).type_as(grad_x_full) @ grad_x_full).squeeze(-2)
+            grad_w_off = (grad_x_full.type_as(reduction_weight) @ x.unsqueeze(-1).type_as(reduction_weight)).squeeze(-1).view_as(reduction_weight)
+        elif grad_x_full.shape[-2] != 1:
+            grad_x = grad_x_full.sum(-2)
+        else:
+            grad_x = grad_x_full
+
+        grad_x = grad_x.view_as(x)
+
+        return grad_x, None, None, grad_w, None, grad_w_off
+
+
+def cvmm(x: torch.Tensor, sel: torch.Tensor | CVMMSel, keys: torch.Tensor):
+    if not isinstance(sel, CVMMSel):
+        sel = cvmm_prepare_sel(sel, keys.shape[0])
+    assert x.dtype == keys.dtype, f"{x.dtype=} != {keys.dtype=}"
+
+    return CVMM.apply(x, sel.sel_index, sel.sel, keys, sel.out_index, sel.reduction_weight)
+
+
+def cvmm_prepare_sel2(sel: torch.Tensor, w: torch.Tensor | None = None) -> CVMMSel:
+    # Has multiple selections for each batch element
+    n_per_batch = sel.shape[-1]
+
+    # indices = torch.arange(sel.nelement() // n_per_batch, device=sel.device, dtype=torch.int32)
+    # indices = indices.repeat_interleave(n_per_batch).flatten()
+
+    fsel = sel.flatten()
+    ssel, sel_index = fsel.sort()
+
+    # in_index = indices[sel_index]
+    in_index = sel_index // n_per_batch
+
+    return CVMMSel(sel, ssel.view_as(sel), in_index, sel_index, w)
+
+#endregion
+# -----------------------------------------------------------------------------
+#region MoEUT
+
+
+class SigmaMoE(torch.nn.Module):
+    def __init__(self, dmodel: int, n_experts: int, expert_size: int, k: int,
+                 v_dim: int | None = None):
+
+        super().__init__()
+        self.k_dim = dmodel
+        self.v_dim = v_dim if v_dim is not None else dmodel
+        self.n_experts = n_experts
+        self.expert_size = expert_size
+        self.size = self.n_experts * self.expert_size
+        self.k_vec_dim = self.k_dim
+        self.num_heads = k
+
+        self.keys = torch.nn.Parameter(torch.empty(self.n_experts, self.k_vec_dim, self.expert_size))
+        self.values = torch.nn.Parameter(torch.empty(self.n_experts, self.expert_size, self.v_dim))
+        self.sel_expert = torch.nn.Parameter(torch.empty(self.n_experts, self.k_vec_dim))
+
+    @torch.no_grad
+    def reset_parameters(self, std_scale: float):
+        # nanogpt equivalence would be std_scale=(3 ** 0.5) * 0.5
+        kbound = std_scale / (self.k_dim ** 0.5)
+        self.keys.uniform_(-kbound, kbound)
+        self.values.zero_()
+        self.sel_expert.normal_()
+        self.sel_expert.div_(self.sel_expert.norm(dim=1, keepdim=True))
+        self.sel_expert.mul_(std_scale / (self.k_dim) ** 0.5)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Selection score calculation
+        xnorm = norm(x)
+        sel = F.linear(xnorm, self.sel_expert, None)
+        sel_r = sel
+
+        # Selection activation and topk
+        sel = F.sigmoid(sel)
+
+        sel_val, sel_index = sel.topk(self.num_heads, dim=-1, sorted=False)
+
+        # Preprocess the selection indices. They will be needed for both layers and save some time
+        sel_indices = cvmm_prepare_sel2(sel_index.int())
+
+        # "Up-projection" layer for each head
+        scores = cvmm(xnorm, sel_indices, self.keys)
+        scores = F.relu(scores).square()
+
+        # Down projection layer for each head
+        sel_indices = sel_indices.clone()
+        sel_indices.reduction_weight = sel_val
+        sel_indices.sel_index = sel_indices.out_index
+        sel_indices.out_index = None
+
+        out = cvmm(scores, sel_indices, self.values)
+
+        res = out.view(*x.shape[:-1], self.v_dim)
+        return x + res, sel_r
+
+
+class SwitchHeadRoPE(torch.nn.Module):
+    def __init__(self, state_size: int, num_heads: int, n_experts: int, max_seq_len: int,
+                 head_dim: int | None = None, moe_k: int = 2
+                 ):
+
+        super().__init__()
+
+        self.input_size = state_size
+        self.output_size = state_size
+        self.pe_size = self.input_size
+        self.moe_k = moe_k
+        self.n_experts = n_experts
+
+        self.num_heads = num_heads
+        self.head_dim = head_dim or (state_size // num_heads)
+        self.rotary = Rotary(self.head_dim, max_seq_len)
+
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+
+        self.q = torch.nn.Linear(self.input_size, self.head_dim * self.num_heads, bias=False)
+        self.k = torch.nn.Linear(self.input_size, self.head_dim * self.num_heads, bias=False)
+
+        self.v = torch.nn.Parameter(torch.empty(self.num_heads * self.n_experts, self.input_size, self.head_dim))
+        self.o = torch.nn.Parameter(torch.empty(self.num_heads * self.n_experts, self.head_dim, self.output_size))
+        self.sel_v = torch.nn.Parameter(torch.empty(self.num_heads * self.n_experts, self.input_size))
+
+        self.sel_o = torch.nn.Parameter(torch.empty(self.num_heads * self.n_experts, self.input_size))
+
+    @torch.no_grad
+    def reset_parameters(self, std_scale: float):
+        bound = (3 ** 0.5) * 0.5 * (self.input_size ** -0.5)
+        self.q.weight.uniform_(-bound, bound)
+        self.k.weight.uniform_(-bound, bound)
+
+        self.v.normal_(0, std_scale / self.input_size ** 0.5)
+        self.o.zero_()
+
+        self.sel_v.normal_()
+        self.sel_v.div_(self.sel_v.norm(dim=1, keepdim=True))
+        self.sel_v.mul_(std_scale / self.input_size ** 0.5)
+
+        self.sel_o.normal_()
+        self.sel_o.div_(self.sel_o.norm(dim=1, keepdim=True))
+        self.sel_o.mul_(std_scale / self.input_size ** 0.5)
+
+
+    def get_sel(self, t: torch.Tensor, w: torch.Tensor) -> tuple[CVMMSel, torch.Tensor]:
+        sel = F.linear(t, w)
+        sel = sel_raw = sel.view(*sel.shape[:-1], self.num_heads, -1)
+        sel = sel.sigmoid()
+
+        with torch.no_grad():
+            _, sel_index = sel.topk(self.moe_k, dim=-1, sorted=False)
+        sel_val = torch.gather(sel, -1, sel_index)
+
+        sel_index_shifted = (torch.arange(self.num_heads, device=sel_index.device, dtype=sel_index.dtype) * self.n_experts).unsqueeze(-1) + sel_index
+        return cvmm_prepare_sel2(sel_index_shifted.flatten(-2,-1), sel_val), sel_raw
+
+
+    def forward(self, x: torch.Tensor, ve: torch.Tensor | None, block_mask: BlockMask
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # *src: [batch_size, out_len, c]
+        B, T = x.size(0), x.size(1) # batch size, sequence length
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
+
+        xnorm = norm(x)
+        q = self.q(xnorm)
+        k = self.k(xnorm)
+
+        v_sel, v_sel_r = self.get_sel(xnorm, self.sel_v)
+        o_sel, o_sel_r = self.get_sel(xnorm, self.sel_o)
+
+        v = cvmm(x, v_sel, self.v).transpose(-2, -3)
+
+        q = q.view(B, T, self.num_heads, self.head_dim)
+        k = k.view(B, T, self.num_heads, self.head_dim)
+
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = self.rotary(q).transpose(1,2), self.rotary(k).transpose(1,2)
+        if ve is not None:
+            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = self.lambdas[0] * v
+
+        res = flex_attention(q, k, v, block_mask=block_mask, scale=0.12)
+        res = res.transpose(1, 2)
+
+        # The output selection indices are calculated from the current state and are also used for projecting "q".
+        # But that projection needs to create multiple copies for the different heads. Here we already have the
+        # heads, but we have to create copies for the top-k elements. We can calculate that from the reduction
+        # weight. We also want to compute not only the weighted average between the top-k elements, but also
+        # of the different heads. So reshape the reduction weight accordingly.
+        o_sel.sel_index = o_sel.out_index // o_sel.reduction_weight.shape[-1]
+        o_sel.reduction_weight = o_sel.reduction_weight.flatten(-2)
+        out = cvmm(res, o_sel, self.o)
+
+        return x + out, o_sel_r, v_sel_r
+
+
+class MoEUTLayer(torch.nn.Module):
+    def __init__(self, d_model: int, num_heads: int, ff_expert_size: int, ff_n_experts: int,
+                 att_n_experts: int, max_seq_len: int, head_dim: int | None = None, att_k: int = 2,
+                 ff_k: int = 8):
+
+        super().__init__()
+        self.attention = SwitchHeadRoPE(
+            d_model, num_heads, att_n_experts, max_seq_len=max_seq_len, head_dim=head_dim, moe_k=att_k)
+        self.ffn = SigmaMoE(d_model, ff_n_experts, ff_expert_size, k=ff_k)
+
+    def forward(self, x: torch.Tensor, ve: torch.Tensor | None, block_mask: BlockMask) -> torch.Tensor:
+        x, o_sel_r, v_sel_r = self.attention(x, ve, block_mask)
+        x, ffn_sel_r = self.ffn(x)
+        return x, o_sel_r, v_sel_r, ffn_sel_r
+
+
+class MoEUT(torch.nn.Module):
+    def __init__(self, d_model: int, n_layers: int, num_heads: int, ff_expert_size: int, ff_n_experts: int,
+                 att_n_experts: int, max_seq_len: int, head_dim: int | None = None, att_k: int = 2,
+                 ff_k: int = 8,
+                 entropy_reg: float = 0.01, att_entropy_reg: float = 0.01,
+                 group_size: int = 2):
+        super().__init__()
+
+        self.entropy_reg = entropy_reg
+        self.att_entropy_reg = att_entropy_reg
+
+        self.n_repeats = n_layers // group_size
+        self.layers = torch.nn.ModuleList([
+            MoEUTLayer(d_model, num_heads, ff_expert_size, ff_n_experts, att_n_experts,
+                       max_seq_len, head_dim, att_k, ff_k)
+            for _ in range(group_size)
+        ])
+        self.training_step = 0
+
+        self.embed_layer_gates = nn.Embedding(n_layers, d_model)
+        self.embed_layer_biases = nn.Embedding(n_layers, d_model)
+        self.lambdas = nn.Parameter(torch.tensor([[1., 0.]]).repeat(n_layers, 1))
+
+        self.skip_weights = nn.Parameter(torch.ones(n_layers//2))
+
+        self.reset_parameters()
+
+    def forward(self, x: torch.Tensor, block_masks: list[BlockMask], ves: list[torch.Tensor | None]) -> tuple[torch.Tensor, torch.Tensor]:
+        # Run the model
+        x0 = x
+        o_sels = {i: [] for i in range(len(self.layers))}
+        v_sels = {i: [] for i in range(len(self.layers))}
+        ffn_sels = {i: [] for i in range(len(self.layers))}
+
+        skip_connections = []
+        n_encoder_layers = self.n_repeats * len(self.layers) // 2
+        for i in range(self.n_repeats * len(self.layers)):
+            li = i % len(self.layers)
+
+            gate = self.embed_layer_gates.weight[i]
+            bias = self.embed_layer_biases.weight[i]
+            while gate.ndim < x.ndim:
+                gate = gate.unsqueeze(0)
+                bias = bias.unsqueeze(0)
+            x = x * (gate + 1) + bias
+
+            if i > n_encoder_layers:
+                x = x + skip_connections.pop()
+
+            block_mask = block_masks[i % len(block_masks)]
+            layer_x = x * self.lambdas[i, 0] + x0 * self.lambdas[i, 1]
+            x, o_sel_r, v_sel_r, ffn_sel_r = self.layers[li](layer_x, ve=ves[i], block_mask=block_mask)
+
+            o_sels[li].append(o_sel_r)
+            v_sels[li].append(v_sel_r)
+            ffn_sels[li].append(ffn_sel_r)
+
+            if i < n_encoder_layers:
+                skip_connections.append(x * self.skip_weights[i])
+
+        def entropy_reg(sel: torch.Tensor) -> torch.Tensor:
+            sel = F.log_softmax(sel, dim=-1).logsumexp(0)
+            return (sel * sel.exp()).sum(-1).mean()
+
+        ffn_reg_loss = torch.stack([
+            entropy_reg(torch.stack(sel_hist, dim=1).flatten(0, 1))
+            for sel_hist in ffn_sels.values()
+        ]).mean()
+        att_reg_loss = torch.stack([
+            entropy_reg(torch.stack(sel_hist, dim=1).flatten(0, 1))
+            for sel_hist in [*o_sels.values(), *v_sels.values()]
+        ]).mean()
+
+        if self.training:
+            # if self.training_step % 100 == 0:
+            #     for n, selsdict in zip(["o","v","f"], [o_sels, v_sels, ffn_sels]):
+            #         for i, sels in selsdict.items():
+            #             sels = torch.stack(sels).detach().flatten(0,2).softmax(-1)
+            #             stats = sels.mean(0).cpu().float().numpy()
+            #             print(f"{n}{i}: {stats}")
+
+            #     print(f"{att_reg_loss.detach()=}")
+            #     print(f"{ffn_reg_loss.detach()=}")
+            # self.training_step += 1
+
+            reg_loss = self.entropy_reg * ffn_reg_loss + self.att_entropy_reg * att_reg_loss
+        else:
+            reg_loss = None
+
+        return x, reg_loss
+
+    @torch.no_grad
+    def reset_parameters(self):
+        scale = (2 / (self.n_repeats * len(self.layers))) ** 0.5
+        for layer in self.modules():
+            if isinstance(layer, (SwitchHeadRoPE, SigmaMoE)):
+                layer.reset_parameters(scale)
+        self.embed_layer_gates.weight.zero_()
+        self.embed_layer_biases.weight.zero_()
+
+
+class MoEUTWrapper(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+        super().__init__()
+        group_size = 2
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers, num_embeddings=group_size)
+        # Select FF hparams for equal parameters & FLOPs compared to original
+        ff_expert_size = 128 # ff_expert_size may be tuned without breaking comparability
+        ff_k = (model_dim * 4) // ff_expert_size
+        ff_n_experts = ff_k * (num_layers // group_size)
+        print0(f"{ff_k=} {ff_n_experts=}")
+
+        self.moeut = MoEUT(
+            d_model=model_dim,
+            n_layers=num_layers,
+            num_heads=num_heads,
+            ff_expert_size=ff_expert_size,
+            ff_n_experts=ff_n_experts,
+            att_n_experts=10, # Slightly lower params but higher FLOPs due to MoE
+            max_seq_len=max_seq_len,
+            head_dim=None,
+            att_k=2,
+            ff_k=ff_k,
+            entropy_reg=0.01,
+            att_entropy_reg=0.001,
+            group_size=group_size,
+        )
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
+        self.lm_head.weight.detach().zero_() # @Grad62304977
+
+
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+        assert input_seq.ndim == 1
+
+        long_bm, short_bm = create_block_masks(input_seq, sliding_window_num_blocks)
+        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
+        ve = self.value_embeds(input_seq)
+        x = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x, reg_loss = self.moeut(x, block_masks, ve)
+        x = norm(x)
+        logits = self.lm_head(x)
+        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+        logits = 30 * torch.sigmoid(logits.float() / 7.5)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
+        if self.training:
+            loss = loss + reg_loss
+        return loss
+
+
+#endregion
+# -----------------------------------------------------------------------------
+#region Our own simple Distributed Data Loader
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(f"{file}", False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % world_size == 0
+    local_batch_size = batch_size // world_size
+    file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn"t helpful.
+        pos += batch_size
+        yield inputs, targets
+#endregion
+# -----------------------------------------------------------------------------
+#region utils, hyperparams
+def print0(s, console=True):
+    if master_process:
+        timestamp = time.strftime("%H:%M:%S.") + f"{time.time() % 1:.3f}"[2:]
+        s = f"{timestamp}: {s}"
+        if console:
+            print(s)
+        if logfile:
+            with open(logfile, "a") as f:
+                print(s, file=f)
+
+def log_mem():
+    print0(
+        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB",
+        console=True,
+    )
+
+@dataclass(frozen=True, kw_only=True)
+class Hyperparameters:
+    # data
+    train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    # optimization
+    num_iterations: int = 1770 # number of iterations to run
+    cooldown_frac: float = 0.4 # fraction of training spent cooling down the learning rate
+    # evaluation and logging
+    val_loss_every: int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    # implementation
+    seq_len: int = 48*1024 # FlexAttention sequence length
+    val_seq_len: int = 4*64*1024 # FlexAttention sequence length for validation
+    save_checkpoint: bool = False
+    dev: bool = False
+
+TEST_HPARAMS = Hyperparameters(
+    train_files = "data/fineweb1B/fineweb_train_*.bin",
+    val_files = "data/fineweb1B/fineweb_val_*.bin",
+    val_tokens = 1048576,
+    num_iterations = 4000,
+    cooldown_frac = 0.4,
+    val_loss_every = 125,
+    seq_len = 16*1024,
+    val_seq_len = 2*16*1024,
+    save_checkpoint = False,
+    dev=False,
+)
+DEV_HPARAMS = Hyperparameters(
+    train_files = "data/fineweb1B/fineweb_train_*.bin",
+    val_files = "data/fineweb1B/fineweb_val_*.bin",
+    val_tokens = 1024,
+    num_iterations = 20,
+    cooldown_frac = 0.4,
+    val_loss_every = 125,
+    seq_len = 512,
+    val_seq_len = 512,
+    save_checkpoint = False,
+    dev=True,
+)
+
+#endregion
+# -----------------------------------------------------------------------------
+#region main()
+master_process = None
+logfile = None
+if custom_logfile := len(sys.argv) > 1:
+    run_id = sys.argv[1]
+else:
+    run_id = uuid.uuid4()
+def main(args = TEST_HPARAMS):
+# def main(args = DEV_HPARAMS):
+    global master_process, logfile
+    # torchrun sets these env variables
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    assert torch.cuda.is_available()
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    atexit.register(dist.destroy_process_group)
+    dist.barrier()
+    master_process = (rank == 0) # this process will do logging, checkpointing etc.
+
+    # begin logging
+    if master_process and not args.dev:
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{run_id}.txt"
+        print(logfile)
+
+
+    # begin by printing this file (the Python code)
+    print0(code, console=False)
+    print0("="*100, console=False)
+    # log information about the hardware/software environment this is running on
+    print0(f"Running Python {sys.version}", console=False)
+    print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}", console=False)
+    def nvidia_smi():
+        import subprocess  # avoid top level import
+        return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
+    print0(nvidia_smi(), console=False)
+    print0("="*100, console=False)
+    atexit.register(log_mem)
+
+    torch.random.manual_seed(0)
+    torch.cuda.synchronize()
+    print0("Init data")
+    # load data
+    train_batch_size = world_size * args.seq_len
+    train_loader = distributed_data_generator(args.train_files, train_batch_size, rank, world_size)
+
+    torch.cuda.synchronize()
+    print0("Init model")
+    # REF: model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=3, model_dim=384, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    # model: nn.Module = MoEUTWrapper(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    model.bfloat16()
+    for m in model.modules():
+        if isinstance(m, nn.Embedding):
+            m.bfloat16()
+
+    # count parameters
+    n_params_by_dtype = defaultdict(lambda: 0)
+    for name, param in model.named_parameters():
+        dist.broadcast(param.detach(), 0)
+        n_params_by_dtype[param.dtype] += param.numel()
+    for dt, n_params in n_params_by_dtype.items():
+        print0(f"{dt}: {n_params/1024/1024:.3f}Mi params")
+    print0(f"total: {sum(n_params_by_dtype.values())/1024/1024:.3f}Mi params")
+
+
+    torch.cuda.synchronize()
+    print0("Init optimizers")
+    # collect the parameters to optimize
+    hidden_matrix_params = [p for n, p in model.named_parameters() if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+    scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2]
+    head_params = [model.lm_head.weight]
+    params_sets = [hidden_matrix_params, embed_params, scalar_params, head_params]
+    assert all(set(a).isdisjoint(b) for a in params_sets for b in params_sets if a is not b)
+
+    assert set().union(*params_sets) == set(model.parameters())
+
+    # init the optimizer(s)
+    lr_mod = (args.seq_len/Hyperparameters().seq_len/8) ** 0.5  # Correct LR based on difference in batch size vs original w/ 8 nodes
+    print(f"{lr_mod=}")
+    adam_params = [dict(params=head_params, lr=0.008*lr_mod), dict(params=embed_params, lr=0.6*lr_mod), dict(params=scalar_params, lr=0.04*lr_mod)]
+    # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
+    # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
+    optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
+    optimizer2 = Muon(hidden_matrix_params, lr=0.05*lr_mod, momentum=0.95, rank=rank, world_size=world_size)
+    optimizers = [optimizer1, optimizer2]
+
+    # learning rate schedule: stable then decay
+    def get_lr(step: int):
+        t = 1 - step / args.num_iterations # time remaining in training
+        assert 1 >= t >= 0
+        w = min(t / args.cooldown_frac, 1.0) # 1 -> 0
+        return w * 1.0 + (1 - w) * 0.1
+    schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+    @lru_cache(1)
+    def sw_num_blks(window_size: int):
+        return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+    if not args.dev:
+        model: nn.Module = torch.compile(model) #, dynamic=False)
+
+    training_time_ms = 0
+    # start the clock
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    # begin training
+    print0("Starting train loop")
+    train_steps = args.num_iterations
+    prof = None
+    train_losses = []
+    val_losses = {}
+
+    for step in range(train_steps + 1):
+        last_step = (step == train_steps)
+        # if step == 5:
+        #     prof = profile(record_shapes=True, profile_memory=True, with_stack=True)
+        #     prof.__enter__()
+        #     prof.start()
+        # if prof is not None:
+        #     if step == 9:
+        #         prof.__exit__(None, None, None)
+        #         prof.export_chrome_trace("trace.json")
+        #         prof = None
+        #     else:
+        #         prof.step()
+
+        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+        # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+        # steps with dummy data first, and then re-initialize the model and reset the loader.
+        if step == 10:
+            training_time_ms = 0
+            t0 = time.perf_counter()
+        timed_steps = float("nan") if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+
+        # Linearly increase the block-wise sliding window size over training 128 -> 1792:
+        # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
+        window_size = next_multiple_of_n(1728 * step / train_steps, n=128)
+
+        # --------------- VALIDATION SECTION -----------------
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            model.eval()
+            val_batch_size = world_size * args.val_seq_len
+            assert args.val_tokens % val_batch_size == 0
+            val_steps = args.val_tokens // val_batch_size
+            val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
+            val_loss = 0
+            with torch.no_grad():
+                for i in range(val_steps):
+                    x, y = next(val_loader)
+                    val_loss += model(x, y, sw_num_blks(window_size))
+            val_loss /= val_steps
+            val_losses[step] = val_loss.item()
+            del val_loader
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} step_avg:{training_time_ms/(timed_steps-1):.2f}ms train_time:{training_time_ms/1000:.0f}s", console=True)
+            model.train()
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if last_step:
+            if master_process and args.save_checkpoint:
+                log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+                os.makedirs(f"logs/{run_id}", exist_ok=True)
+                torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            # the last step only has the validation loop, so break to avoid training
+            break
+
+        # --------------- TRAINING SECTION -----------------
+        inputs, targets = next(train_loader)
+        step_train_losses = []
+        for input_seq, target_seq in zip(inputs.split(args.seq_len), targets.split(args.seq_len)):
+            loss = model(input_seq, target_seq, sw_num_blks(window_size))
+            loss.backward()
+            dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+            step_train_losses.append(loss.detach().item())
+            del loss
+        train_losses.append(sum(step_train_losses) / len(step_train_losses))
+        train_loss = sum(train_losses[-10:]) / len(train_losses[-10:])
+        for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        del param
+        # momentum warmup for Muon
+        frac = min(step / 300, 1)
+        for group in optimizer2.param_groups:
+            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        # step the optimizers and schedulers
+        for opt, sched in zip(optimizers, schedulers):
+            opt.step()
+            sched.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
+
+        # logging
+        if step < 20 or (step+1) % 50 == 0:
+            approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+            print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} step_avg:{approx_time/timed_steps:.2f}ms train_time:{approx_time/1000:.0f}s {torch.cuda.max_memory_allocated()=}", console=True)
+
+    print0(f"{train_losses=}")
+    print0(f"{val_losses=}")
+    if master_process and logfile is not None and not custom_logfile:
+        try:
+            new_logfile = input("Name run? ")
+        except KeyboardInterrupt:
+            breakpoint()
+        if new_logfile:
+            old_logfile = logfile
+            logfile = f"logs/{new_logfile}.txt"
+            os.rename(old_logfile, logfile)
+            print0(f"Renamed {old_logfile} -> {logfile}")
+    else:
+        print(logfile)
+#endregion
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
+
+21:51:50.582: ====================================================================================================
+21:51:50.583: Running Python 3.12.7 (main, Oct 16 2024, 04:37:19) [Clang 18.1.8 ]
+21:51:50.583: Running PyTorch 2.7.0.dev20250110+cu126 compiled for CUDA 12.6
+21:51:50.664: Tue Feb  4 21:51:50 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 560.35.02              Driver Version: 560.94         CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3090 Ti     On  |   00000000:2D:00.0  On |                  Off |
+|  0%   40C    P2             95W /  450W |    1214MiB /  24564MiB |      5%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A        26      G   /Xwayland                                   N/A      |
+|    0   N/A  N/A    373047      C   /python3.12                                 N/A      |
++-----------------------------------------------------------------------------------------+
+
+21:51:50.664: ====================================================================================================
+21:51:50.665: Init data
+21:51:50.665: Init model
+21:51:51.602: torch.bfloat16: 111.728Mi params
+21:51:51.602: total: 111.728Mi params
+21:51:51.602: Init optimizers
+21:51:51.618: Starting train loop
+21:53:06.893: step:0/4000 val_loss:10.8258 step_avg:nanms train_time:0s
+21:58:02.272: step:1/4000 train_loss:10.8258 step_avg:nanms train_time:295s torch.cuda.max_memory_allocated()=5137541120
+21:58:02.820: step:2/4000 train_loss:10.7820 step_avg:nanms train_time:296s torch.cuda.max_memory_allocated()=5564933120
+21:58:03.080: step:3/4000 train_loss:10.7222 step_avg:nanms train_time:296s torch.cuda.max_memory_allocated()=5564933120
+21:58:03.282: step:4/4000 train_loss:10.6554 step_avg:nanms train_time:296s torch.cuda.max_memory_allocated()=5564933120
+21:58:03.486: step:5/4000 train_loss:10.5554 step_avg:nanms train_time:297s torch.cuda.max_memory_allocated()=5564933120
+21:58:03.718: step:6/4000 train_loss:10.4322 step_avg:nanms train_time:297s torch.cuda.max_memory_allocated()=5564933120
+21:58:03.918: step:7/4000 train_loss:10.3078 step_avg:nanms train_time:297s torch.cuda.max_memory_allocated()=5564933120
+21:58:04.120: step:8/4000 train_loss:10.1468 step_avg:nanms train_time:297s torch.cuda.max_memory_allocated()=5564933120
+21:58:04.336: step:9/4000 train_loss:9.9810 step_avg:nanms train_time:297s torch.cuda.max_memory_allocated()=5564933120
+21:58:04.573: step:10/4000 train_loss:9.8412 step_avg:nanms train_time:298s torch.cuda.max_memory_allocated()=5564933120
+21:58:04.791: step:11/4000 train_loss:9.5614 step_avg:nanms train_time:0s torch.cuda.max_memory_allocated()=5564933120
+21:58:05.196: step:12/4000 train_loss:9.2263 step_avg:nanms train_time:1s torch.cuda.max_memory_allocated()=5564933120
+21:58:05.744: step:13/4000 train_loss:8.8619 step_avg:389.98ms train_time:1s torch.cuda.max_memory_allocated()=5564933120
+21:58:05.952: step:14/4000 train_loss:8.5689 step_avg:344.51ms train_time:1s torch.cuda.max_memory_allocated()=5564933120
+21:58:06.187: step:15/4000 train_loss:8.3347 step_avg:322.63ms train_time:2s torch.cuda.max_memory_allocated()=5564933120
+21:58:06.399: step:16/4000 train_loss:8.1311 step_avg:304.18ms train_time:2s torch.cuda.max_memory_allocated()=5564933120
+21:58:06.626: step:17/4000 train_loss:7.9618 step_avg:293.15ms train_time:2s torch.cuda.max_memory_allocated()=5564933120
+21:58:06.961: step:18/4000 train_loss:7.8685 step_avg:298.37ms train_time:2s torch.cuda.max_memory_allocated()=5564933120
+21:58:07.206: step:19/4000 train_loss:7.7461 step_avg:292.51ms train_time:3s torch.cuda.max_memory_allocated()=5564933120
+21:58:07.411: step:20/4000 train_loss:7.6254 step_avg:283.79ms train_time:3s torch.cuda.max_memory_allocated()=5564933120
+21:58:14.638: step:50/4000 train_loss:6.6109 step_avg:251.61ms train_time:10s torch.cuda.max_memory_allocated()=5564933120
+21:58:25.970: step:100/4000 train_loss:6.3107 step_avg:237.73ms train_time:21s torch.cuda.max_memory_allocated()=5564933120
+21:58:33.759: step:125/4000 val_loss:6.1632 step_avg:233.12ms train_time:27s
+21:58:39.587: step:150/4000 train_loss:5.9894 step_avg:233.12ms train_time:33s torch.cuda.max_memory_allocated()=5564933120
+21:58:50.849: step:200/4000 train_loss:5.9162 step_avg:231.04ms train_time:44s torch.cuda.max_memory_allocated()=5564933120
+21:59:03.328: step:250/4000 train_loss:5.6168 step_avg:234.91ms train_time:56s torch.cuda.max_memory_allocated()=5564933120
+21:59:05.604: step:250/4000 val_loss:5.7402 step_avg:235.04ms train_time:56s
+21:59:18.184: step:300/4000 train_loss:5.5183 step_avg:237.89ms train_time:69s torch.cuda.max_memory_allocated()=5564933120
+21:59:29.852: step:350/4000 train_loss:5.5038 step_avg:237.22ms train_time:81s torch.cuda.max_memory_allocated()=5564933120
+21:59:37.837: step:375/4000 val_loss:5.4466 step_avg:236.69ms train_time:86s
+21:59:44.024: step:400/4000 train_loss:5.4409 step_avg:237.38ms train_time:93s torch.cuda.max_memory_allocated()=5564933120
+21:59:55.279: step:450/4000 train_loss:5.2592 step_avg:235.98ms train_time:104s torch.cuda.max_memory_allocated()=5564933120
+22:00:06.585: step:500/4000 train_loss:5.0487 step_avg:234.98ms train_time:115s torch.cuda.max_memory_allocated()=5564933120
+22:00:08.868: step:500/4000 val_loss:5.1801 step_avg:235.04ms train_time:115s
+22:00:20.351: step:550/4000 train_loss:5.0868 step_avg:234.54ms train_time:127s torch.cuda.max_memory_allocated()=5564933120
+22:00:33.809: step:600/4000 train_loss:5.1045 step_avg:237.48ms train_time:140s torch.cuda.max_memory_allocated()=5564933120
+22:00:41.569: step:625/4000 val_loss:5.0135 step_avg:236.77ms train_time:146s
+22:00:47.169: step:650/4000 train_loss:5.0035 step_avg:236.27ms train_time:151s torch.cuda.max_memory_allocated()=5564933120
+22:01:00.152: step:700/4000 train_loss:5.0573 step_avg:237.96ms train_time:164s torch.cuda.max_memory_allocated()=5564933120
+22:01:11.939: step:750/4000 train_loss:4.8578 step_avg:237.81ms train_time:176s torch.cuda.max_memory_allocated()=5564933120
+22:01:14.230: step:750/4000 val_loss:4.8936 step_avg:237.86ms train_time:176s
+22:01:25.512: step:800/4000 train_loss:4.9553 step_avg:237.08ms train_time:187s torch.cuda.max_memory_allocated()=5564933120
+22:01:37.421: step:850/4000 train_loss:4.8614 step_avg:237.15ms train_time:199s torch.cuda.max_memory_allocated()=5564933120
+22:01:45.110: step:875/4000 val_loss:4.8050 step_avg:236.57ms train_time:205s
+22:01:50.836: step:900/4000 train_loss:4.7883 step_avg:236.36ms train_time:210s torch.cuda.max_memory_allocated()=5564933120
+22:02:02.628: step:950/4000 train_loss:4.7509 step_avg:236.33ms train_time:222s torch.cuda.max_memory_allocated()=5564933120
+22:02:14.662: step:1000/4000 train_loss:4.5714 step_avg:236.55ms train_time:234s torch.cuda.max_memory_allocated()=5564933120
+22:02:16.950: step:1000/4000 val_loss:4.7345 step_avg:236.59ms train_time:234s
+22:02:28.775: step:1050/4000 train_loss:4.7407 step_avg:236.58ms train_time:246s torch.cuda.max_memory_allocated()=5564933120
+22:02:40.818: step:1100/4000 train_loss:4.7276 step_avg:236.78ms train_time:258s torch.cuda.max_memory_allocated()=5564933120
+22:02:48.635: step:1125/4000 val_loss:4.6753 step_avg:236.45ms train_time:264s
+22:02:54.474: step:1150/4000 train_loss:4.6722 step_avg:236.39ms train_time:269s torch.cuda.max_memory_allocated()=5564933120
+22:03:06.385: step:1200/4000 train_loss:4.6212 step_avg:236.47ms train_time:281s torch.cuda.max_memory_allocated()=5564933120
+22:03:17.769: step:1250/4000 train_loss:4.6779 step_avg:236.11ms train_time:293s torch.cuda.max_memory_allocated()=5564933120
+22:03:20.058: step:1250/4000 val_loss:4.6230 step_avg:236.14ms train_time:293s
+22:03:31.342: step:1300/4000 train_loss:4.6316 step_avg:235.73ms train_time:304s torch.cuda.max_memory_allocated()=5564933120
+22:03:42.525: step:1350/4000 train_loss:4.6275 step_avg:235.28ms train_time:315s torch.cuda.max_memory_allocated()=5564933120
+22:03:50.265: step:1375/4000 val_loss:4.5748 step_avg:234.99ms train_time:321s
+22:03:56.611: step:1400/4000 train_loss:4.4463 step_avg:235.33ms train_time:327s torch.cuda.max_memory_allocated()=5564933120
+22:04:08.592: step:1450/4000 train_loss:4.5044 step_avg:235.48ms train_time:339s torch.cuda.max_memory_allocated()=5564933120
+22:04:20.050: step:1500/4000 train_loss:4.5165 step_avg:235.27ms train_time:351s torch.cuda.max_memory_allocated()=5564933120
+22:04:22.342: step:1500/4000 val_loss:4.5400 step_avg:235.29ms train_time:351s
+22:04:34.139: step:1550/4000 train_loss:4.5442 step_avg:235.31ms train_time:362s torch.cuda.max_memory_allocated()=5564933120
+22:04:46.143: step:1600/4000 train_loss:4.5486 step_avg:235.46ms train_time:374s torch.cuda.max_memory_allocated()=5564933120
+22:04:55.500: step:1625/4000 val_loss:4.5313 step_avg:236.21ms train_time:381s
+22:05:01.585: step:1650/4000 train_loss:4.4433 step_avg:236.32ms train_time:388s torch.cuda.max_memory_allocated()=5564933120
+22:05:12.956: step:1700/4000 train_loss:4.4397 step_avg:236.06ms train_time:399s torch.cuda.max_memory_allocated()=5564933120
+22:05:24.018: step:1750/4000 train_loss:4.3840 step_avg:235.63ms train_time:410s torch.cuda.max_memory_allocated()=5564933120
+22:05:26.305: step:1750/4000 val_loss:4.4844 step_avg:235.65ms train_time:410s
+22:05:37.730: step:1800/4000 train_loss:4.3588 step_avg:235.45ms train_time:421s torch.cuda.max_memory_allocated()=5564933120
+22:05:49.145: step:1850/4000 train_loss:4.4544 step_avg:235.25ms train_time:433s torch.cuda.max_memory_allocated()=5564933120
+22:05:57.091: step:1875/4000 val_loss:4.4520 step_avg:235.15ms train_time:439s
+22:06:03.625: step:1900/4000 train_loss:4.5020 step_avg:235.50ms train_time:445s torch.cuda.max_memory_allocated()=5564933120
+22:06:15.089: step:1950/4000 train_loss:4.4748 step_avg:235.34ms train_time:457s torch.cuda.max_memory_allocated()=5564933120
+22:06:26.675: step:2000/4000 train_loss:4.3492 step_avg:235.25ms train_time:468s torch.cuda.max_memory_allocated()=5564933120
+22:06:28.965: step:2000/4000 val_loss:4.4308 step_avg:235.26ms train_time:468s
+22:06:42.280: step:2050/4000 train_loss:4.5171 step_avg:236.02ms train_time:481s torch.cuda.max_memory_allocated()=5564933120
+22:06:54.436: step:2100/4000 train_loss:4.3899 step_avg:236.19ms train_time:494s torch.cuda.max_memory_allocated()=5564933120
+22:07:02.217: step:2125/4000 val_loss:4.4095 step_avg:236.01ms train_time:499s
+22:07:08.062: step:2150/4000 train_loss:4.5532 step_avg:235.99ms train_time:505s torch.cuda.max_memory_allocated()=5564933120
+22:07:20.276: step:2200/4000 train_loss:4.3077 step_avg:236.18ms train_time:517s torch.cuda.max_memory_allocated()=5564933120
+22:07:32.033: step:2250/4000 train_loss:4.3686 step_avg:236.15ms train_time:529s torch.cuda.max_memory_allocated()=5564933120
+22:07:34.330: step:2250/4000 val_loss:4.3901 step_avg:236.17ms train_time:529s
+22:07:46.840: step:2300/4000 train_loss:4.4418 step_avg:236.47ms train_time:542s torch.cuda.max_memory_allocated()=5564933120
+22:07:59.616: step:2350/4000 train_loss:4.3199 step_avg:236.88ms train_time:554s torch.cuda.max_memory_allocated()=5564933120
+22:08:07.825: step:2375/4000 val_loss:4.3703 step_avg:236.89ms train_time:560s
+22:08:13.313: step:2400/4000 train_loss:4.4131 step_avg:236.71ms train_time:566s torch.cuda.max_memory_allocated()=5564933120
+22:08:26.617: step:2450/4000 train_loss:4.2925 step_avg:237.31ms train_time:579s torch.cuda.max_memory_allocated()=5564933120
+22:08:38.092: step:2500/4000 train_loss:4.4144 step_avg:237.15ms train_time:591s torch.cuda.max_memory_allocated()=5564933120
+22:08:40.389: step:2500/4000 val_loss:4.3539 step_avg:237.17ms train_time:591s
+22:08:54.626: step:2550/4000 train_loss:4.3154 step_avg:238.10ms train_time:605s torch.cuda.max_memory_allocated()=5564933120
+22:09:06.213: step:2600/4000 train_loss:4.3031 step_avg:237.98ms train_time:616s torch.cuda.max_memory_allocated()=5564933120
+22:09:14.939: step:2625/4000 val_loss:4.3334 step_avg:238.18ms train_time:623s
+22:09:20.835: step:2650/4000 train_loss:4.2645 step_avg:238.16ms train_time:629s torch.cuda.max_memory_allocated()=5564933120
+22:09:32.433: step:2700/4000 train_loss:4.2733 step_avg:238.04ms train_time:640s torch.cuda.max_memory_allocated()=5564933120
+22:09:44.038: step:2750/4000 train_loss:4.3867 step_avg:237.93ms train_time:652s torch.cuda.max_memory_allocated()=5564933120
+22:09:46.330: step:2750/4000 val_loss:4.2939 step_avg:237.95ms train_time:652s
+22:09:57.784: step:2800/4000 train_loss:4.2900 step_avg:237.79ms train_time:663s torch.cuda.max_memory_allocated()=5564933120
+22:10:09.872: step:2850/4000 train_loss:4.2040 step_avg:237.86ms train_time:676s torch.cuda.max_memory_allocated()=5564933120
+22:10:18.457: step:2875/4000 val_loss:4.2707 step_avg:237.99ms train_time:682s
+22:10:24.017: step:2900/4000 train_loss:4.3462 step_avg:237.86ms train_time:687s torch.cuda.max_memory_allocated()=5564933120
+22:10:35.507: step:2950/4000 train_loss:4.1844 step_avg:237.72ms train_time:699s torch.cuda.max_memory_allocated()=5564933120
+22:10:47.491: step:3000/4000 train_loss:4.3203 step_avg:237.75ms train_time:711s torch.cuda.max_memory_allocated()=5564933120
+22:10:49.783: step:3000/4000 val_loss:4.2425 step_avg:237.76ms train_time:711s
+22:11:01.615: step:3050/4000 train_loss:4.1574 step_avg:237.74ms train_time:723s torch.cuda.max_memory_allocated()=5564933120
+22:11:12.823: step:3100/4000 train_loss:4.3163 step_avg:237.53ms train_time:734s torch.cuda.max_memory_allocated()=5564933120
+22:11:20.894: step:3125/4000 val_loss:4.2148 step_avg:237.49ms train_time:740s
+22:11:26.835: step:3150/4000 train_loss:4.1434 step_avg:237.49ms train_time:746s torch.cuda.max_memory_allocated()=5564933120
+22:11:39.626: step:3200/4000 train_loss:4.0782 step_avg:237.77ms train_time:759s torch.cuda.max_memory_allocated()=5564933120
+22:11:52.275: step:3250/4000 train_loss:4.2067 step_avg:238.01ms train_time:771s torch.cuda.max_memory_allocated()=5564933120
+22:11:54.562: step:3250/4000 val_loss:4.1937 step_avg:238.02ms train_time:771s
+22:12:06.836: step:3300/4000 train_loss:4.2249 step_avg:238.13ms train_time:783s torch.cuda.max_memory_allocated()=5564933120
+22:12:19.221: step:3350/4000 train_loss:4.2416 step_avg:238.28ms train_time:796s torch.cuda.max_memory_allocated()=5564933120
+22:12:27.344: step:3375/4000 val_loss:4.1732 step_avg:238.25ms train_time:802s
+22:12:33.262: step:3400/4000 train_loss:4.1296 step_avg:238.24ms train_time:808s torch.cuda.max_memory_allocated()=5564933120
+22:12:45.359: step:3450/4000 train_loss:4.0490 step_avg:238.29ms train_time:820s torch.cuda.max_memory_allocated()=5564933120
+22:12:56.982: step:3500/4000 train_loss:4.1687 step_avg:238.21ms train_time:831s torch.cuda.max_memory_allocated()=5564933120
+22:12:59.274: step:3500/4000 val_loss:4.1516 step_avg:238.22ms train_time:831s
+22:13:10.711: step:3550/4000 train_loss:4.1739 step_avg:238.08ms train_time:843s torch.cuda.max_memory_allocated()=5564933120
+22:13:22.806: step:3600/4000 train_loss:4.2533 step_avg:238.14ms train_time:855s torch.cuda.max_memory_allocated()=5564933120
+22:13:31.349: step:3625/4000 val_loss:4.1340 step_avg:238.23ms train_time:861s
+22:13:37.070: step:3650/4000 train_loss:4.1886 step_avg:238.16ms train_time:867s torch.cuda.max_memory_allocated()=5564933120
+22:13:49.104: step:3700/4000 train_loss:4.1791 step_avg:238.20ms train_time:879s torch.cuda.max_memory_allocated()=5564933120
+22:14:00.574: step:3750/4000 train_loss:4.1775 step_avg:238.08ms train_time:890s torch.cuda.max_memory_allocated()=5564933120
+22:14:02.863: step:3750/4000 val_loss:4.1192 step_avg:238.09ms train_time:890s
+22:14:14.066: step:3800/4000 train_loss:4.0805 step_avg:237.90ms train_time:902s torch.cuda.max_memory_allocated()=5564933120
+22:14:25.577: step:3850/4000 train_loss:4.0111 step_avg:237.80ms train_time:913s torch.cuda.max_memory_allocated()=5564933120
+22:14:33.463: step:3875/4000 val_loss:4.1087 step_avg:237.72ms train_time:919s
+22:14:39.129: step:3900/4000 train_loss:4.0095 step_avg:237.65ms train_time:924s torch.cuda.max_memory_allocated()=5564933120
+22:14:50.910: step:3950/4000 train_loss:4.1575 step_avg:237.62ms train_time:936s torch.cuda.max_memory_allocated()=5564933120
+22:15:02.225: step:4000/4000 train_loss:4.1398 step_avg:237.48ms train_time:948s torch.cuda.max_memory_allocated()=5564933120
+22:15:04.510: step:4000/4000 val_loss:4.1032 step_avg:237.49ms train_time:948s
+22:15:04.512: train_losses=[10.82583999633789, 10.738162994384766, 10.602630615234375, 10.454816818237305, 10.155421257019043, 9.816320419311523, 9.561542510986328, 9.019947052001953, 8.654716491699219, 8.582496643066406, 8.027860641479492, 7.38694953918457, 6.95864725112915, 7.524914741516113, 7.813836097717285, 7.779870986938477, 7.869233131408691, 8.086666107177734, 7.430266380310059, 7.376086711883545, 7.31979513168335, 7.168294906616211, 6.987827777862549, 6.929904937744141, 6.9718403816223145, 6.87272834777832, 6.980911731719971, 7.2019572257995605, 7.20499324798584, 6.870064735412598, 6.96159553527832, 6.6937713623046875, 6.84881591796875, 6.541199684143066, 7.004253387451172, 6.65136194229126, 6.70363187789917, 6.556378364562988, 6.763758659362793, 6.505113124847412, 6.531468391418457, 6.4494524002075195, 6.593878746032715, 6.325018882751465, 7.188031196594238, 6.456725120544434, 6.520868301391602, 6.8541998863220215, 6.577886581420898, 6.611935138702393, 6.460565090179443, 6.747857093811035, 6.089007377624512, 6.484805107116699, 6.979261875152588, 6.347585678100586, 6.614171981811523, 6.522119522094727, 6.294061183929443, 6.656788349151611, 6.836935997009277, 6.73307466506958, 6.623012542724609, 6.578414440155029, 6.694463729858398, 6.345056533813477, 6.7732834815979, 6.379990577697754, 6.270170211791992, 6.363890171051025, 6.666882514953613, 6.518884658813477, 6.4174604415893555, 6.5542449951171875, 6.174535751342773, 6.411487579345703, 6.335134506225586, 6.175540924072266, 6.450743675231934, 6.202943801879883, 6.1839189529418945, 6.275988578796387, 6.5353875160217285, 6.776277542114258, 6.226120471954346, 6.501994609832764, 6.452754974365234, 6.3344621658325195, 6.272951126098633, 6.412388324737549, 6.266539573669434, 6.562801361083984, 7.021927356719971, 6.214301109313965, 6.357377052307129, 6.047724723815918, 6.123371601104736, 6.38773250579834, 5.844264507293701, 6.281153678894043, 6.218140602111816, 5.989935398101807, 6.116520404815674, 6.089067459106445, 6.157608985900879, 6.44180965423584, 6.197641849517822, 6.261706829071045, 6.254786968231201, 5.802412986755371, 6.109546661376953, 6.264365196228027, 5.991081714630127, 6.013038635253906, 5.921087265014648, 6.133629322052002, 6.216766357421875, 6.021227836608887, 5.891745567321777, 5.767276287078857, 6.530078411102295, 6.39082145690918, 6.150301933288574, 6.117042064666748, 6.140852451324463, 6.512339115142822, 6.350401878356934, 6.074652671813965, 5.868768692016602, 6.327365875244141, 6.056350231170654, 6.12800407409668, 6.13137674331665, 6.026879787445068, 6.537998676300049, 6.1497483253479, 6.024332523345947, 5.989546775817871, 6.253849983215332, 5.7652740478515625, 6.074636936187744, 5.995029926300049, 6.054813385009766, 6.448747634887695, 5.996326446533203, 6.157634735107422, 5.98844051361084, 5.707828044891357, 5.728332042694092, 5.742627143859863, 5.869717121124268, 6.0739874839782715, 5.944886684417725, 5.971124172210693, 5.786808490753174, 6.075028419494629, 6.007655143737793, 5.993051052093506, 5.839707851409912, 5.848365783691406, 5.732017993927002, 5.910109043121338, 5.816041946411133, 5.679733753204346, 5.794977188110352, 5.710625171661377, 5.965248107910156, 6.037795066833496, 5.686316967010498, 5.7137041091918945, 5.8296732902526855, 5.79384708404541, 5.641972541809082, 5.965036869049072, 5.891415119171143, 5.878902912139893, 5.729949951171875, 5.902990341186523, 5.75861930847168, 5.665133476257324, 5.827314853668213, 5.594573974609375, 5.756960868835449, 5.843539714813232, 5.673668384552002, 5.823664665222168, 5.874149322509766, 6.039234161376953, 5.880368709564209, 5.915584564208984, 5.9011054039001465, 6.049165725708008, 5.864950180053711, 5.807347774505615, 6.372280120849609, 6.1230363845825195, 5.704523086547852, 5.770927429199219, 5.770745754241943, 5.79780387878418, 5.668057441711426, 5.927569389343262, 6.005091667175293, 5.503607749938965, 6.189844131469727, 6.195221424102783, 5.965758323669434, 5.935365676879883, 5.714468479156494, 5.9830522537231445, 5.995003700256348, 6.055497169494629, 5.849575042724609, 5.665000915527344, 5.813947677612305, 5.941213607788086, 5.652762413024902, 5.745390892028809, 5.792451858520508, 5.763256072998047, 5.971230506896973, 5.838542938232422, 5.8029961585998535, 5.644985198974609, 5.596251964569092, 6.366136074066162, 5.676843166351318, 5.659334182739258, 5.673557758331299, 5.710416316986084, 5.885436058044434, 5.569518566131592, 5.887751579284668, 5.519137859344482, 5.802463054656982, 5.547824859619141, 5.449536323547363, 5.627926349639893, 5.735875606536865, 5.528309345245361, 4.708555221557617, 5.676424026489258, 5.850098609924316, 5.553301811218262, 5.5786614418029785, 5.64678955078125, 5.838378429412842, 5.570341110229492, 6.077040672302246, 5.668277740478516, 5.464687824249268, 5.775286674499512, 5.458770751953125, 5.434579849243164, 5.505702018737793, 5.67413330078125, 5.864193916320801, 5.6248273849487305, 5.6924238204956055, 5.739663124084473, 5.891610145568848, 5.5616326332092285, 5.676086902618408, 5.619508743286133, 5.785807132720947, 5.5524139404296875, 5.757267951965332, 5.6928815841674805, 5.735777378082275, 5.7910590171813965, 5.717099189758301, 5.953378677368164, 5.772647857666016, 5.694706916809082, 5.723968505859375, 5.968253135681152, 5.556224346160889, 5.508699893951416, 5.643284320831299, 5.687196731567383, 5.476848125457764, 5.536447525024414, 5.414419651031494, 5.631239891052246, 5.877222061157227, 6.714728355407715, 6.160516262054443, 5.874621391296387, 5.89786434173584, 5.619433403015137, 5.202541828155518, 5.881251335144043, 5.347184181213379, 5.3101701736450195, 5.563687801361084, 5.575908660888672, 5.527634620666504, 5.353965759277344, 5.781523704528809, 5.638729095458984, 5.468547344207764, 5.183910369873047, 5.408055305480957, 5.633875846862793, 5.461838722229004, 5.732136249542236, 5.523395538330078, 5.646574974060059, 5.4048542976379395, 5.547857761383057, 5.435216903686523, 5.518396854400635, 5.348820209503174, 5.51548957824707, 5.730985641479492, 5.601341247558594, 5.487522602081299, 5.473110675811768, 5.604116916656494, 5.433594703674316, 5.383869647979736, 5.562731742858887, 5.708307266235352, 5.613739013671875, 5.491562366485596, 5.527717590332031, 5.547327041625977, 5.519679069519043, 5.563802719116211, 5.40122127532959, 5.40821647644043, 5.8023881912231445, 5.3743085861206055, 5.289811134338379, 5.627851486206055, 5.345178127288818, 5.564113616943359, 5.50021505355835, 5.595388889312744, 5.46306037902832, 5.286686420440674, 5.551731586456299, 5.3981547355651855, 5.607171058654785, 5.506956100463867, 5.275416851043701, 5.449474334716797, 5.37286376953125, 6.193173408508301, 5.396475791931152, 5.555690765380859, 5.358827590942383, 5.451769828796387, 5.587591648101807, 5.405915260314941, 5.454571723937988, 5.48491096496582, 5.169349193572998, 5.641393184661865, 5.487046241760254, 5.534162998199463, 5.511786937713623, 5.4318037033081055, 5.183335781097412, 5.338314056396484, 5.416996955871582, 5.185059547424316, 5.7026166915893555, 5.377293109893799, 5.288209915161133, 5.525483131408691, 5.248019218444824, 5.531926155090332, 5.51283073425293, 5.7181196212768555, 5.727184772491455, 5.410038948059082, 5.601569175720215, 5.4804229736328125, 5.285491943359375, 5.227017402648926, 5.546324253082275, 5.467879295349121, 5.370079040527344, 5.307918548583984, 5.279374122619629, 5.426012992858887, 5.372356414794922, 5.320282936096191, 5.4987640380859375, 5.380950450897217, 5.408039569854736, 5.521239280700684, 5.608826637268066, 5.516751289367676, 5.379412651062012, 5.400883197784424, 5.271198749542236, 5.621109485626221, 5.300611972808838, 5.297914028167725, 5.423003196716309, 5.473996639251709, 5.290938377380371, 5.2184319496154785, 5.177436828613281, 5.447607040405273, 5.1807122230529785, 5.594025611877441, 5.392465591430664, 5.334290981292725, 5.565569877624512, 5.42513370513916, 5.139743328094482, 5.257699012756348, 5.290872097015381, 5.222322463989258, 5.279365539550781, 5.391509056091309, 5.31309700012207, 5.395195007324219, 5.41059684753418, 5.292839050292969, 5.31281852722168, 4.986371040344238, 5.119761943817139, 5.190930366516113, 5.209418773651123, 5.519698143005371, 5.826188087463379, 5.313570976257324, 5.218207359313965, 5.363677978515625, 5.449034690856934, 5.143908500671387, 5.098072528839111, 5.0965423583984375, 5.155099868774414, 4.91892147064209, 4.991283893585205, 5.225058555603027, 5.205500602722168, 5.326045036315918, 5.139729022979736, 5.3277435302734375, 5.266035079956055, 5.32693338394165, 5.3182454109191895, 5.137202262878418, 5.319157600402832, 5.188488483428955, 5.284435272216797, 5.105015754699707, 5.186638832092285, 5.254307270050049, 5.37662935256958, 5.221858978271484, 5.188376426696777, 5.176933288574219, 5.300423622131348, 5.107273101806641, 5.090893745422363, 5.339300632476807, 5.393462181091309, 5.295844078063965, 5.371556758880615, 5.222296237945557, 5.1393537521362305, 5.301449775695801, 5.071221351623535, 5.15415620803833, 5.34567928314209, 5.184216499328613, 5.43704891204834, 5.514369010925293, 5.347070693969727, 5.059018611907959, 5.211943626403809, 5.561007976531982, 5.020018577575684, 5.381301403045654, 5.004332542419434, 5.099185466766357, 5.236591339111328, 5.297353744506836, 5.112065315246582, 5.181852340698242, 5.099371910095215, 5.06208610534668, 5.309074401855469, 4.973758697509766, 5.0497846603393555, 4.881597518920898, 5.5522379875183105, 4.827136039733887, 4.979036331176758, 4.971705436706543, 5.0580034255981445, 5.264773368835449, 4.928992748260498, 4.779224395751953, 5.171779632568359, 5.152118682861328, 5.124732971191406, 5.360346794128418, 5.313007354736328, 5.331658363342285, 5.093107223510742, 5.041064262390137, 4.840155601501465, 5.282443046569824, 5.196620941162109, 5.147388458251953, 5.382326126098633, 5.24399471282959, 5.246278762817383, 5.060254096984863, 5.0523529052734375, 5.283875465393066, 5.117027759552002, 4.638186454772949, 4.961318492889404, 5.0909037590026855, 4.991336822509766, 4.8756327629089355, 5.072031021118164, 5.285785675048828, 5.014713764190674, 4.949914932250977, 5.100841045379639, 4.880005836486816, 5.110243797302246, 5.07643985748291, 5.160212516784668, 5.184074401855469, 5.301446914672852, 4.840744495391846, 4.922530174255371, 5.609869956970215, 5.1675825119018555, 4.9040751457214355, 5.053526878356934, 5.605544090270996, 4.962036609649658, 5.111817836761475, 5.207191467285156, 5.017423152923584, 4.9044952392578125, 5.280930995941162, 4.820937156677246, 5.298238754272461, 5.084786891937256, 5.278260707855225, 4.972413063049316, 5.161067008972168, 5.11700963973999, 5.214097023010254, 5.180741310119629, 5.401137828826904, 5.021721839904785, 5.163178443908691, 5.275716781616211, 5.538087844848633, 5.441033363342285, 5.053620338439941, 5.18312931060791, 4.947963714599609, 4.837442398071289, 5.262025833129883, 4.996420860290527, 5.075789928436279, 5.09673547744751, 5.1359076499938965, 5.0182061195373535, 5.073328018188477, 5.239068984985352, 4.957975387573242, 5.409414291381836, 5.158792972564697, 4.77290153503418, 5.123456954956055, 5.203369617462158, 4.946023941040039, 5.139944076538086, 5.192375183105469, 5.185330867767334, 5.04736328125, 5.126160621643066, 5.382271766662598, 6.26576042175293, 5.24818754196167, 5.069729328155518, 4.7505645751953125, 4.975092887878418, 5.166065216064453, 4.894440174102783, 5.032212257385254, 5.138370990753174, 4.977436065673828, 5.792582035064697, 4.686003684997559, 5.020601749420166, 5.04804801940918, 5.166928291320801, 4.976335525512695, 5.064327716827393, 5.162566661834717, 5.337419033050537, 4.995486259460449, 4.933859825134277, 4.58127498626709, 4.67241096496582, 4.83560037612915, 4.891524314880371, 4.853518962860107, 4.988435745239258, 4.950479030609131, 5.162394046783447, 5.08609676361084, 5.0432844161987305, 5.05478572845459, 4.915910720825195, 4.955150604248047, 5.082015037536621, 5.00435733795166, 5.140353202819824, 5.117857456207275, 5.3331146240234375, 4.925670623779297, 5.039044380187988, 5.119864463806152, 4.842825889587402, 5.062055587768555, 4.800400733947754, 5.012531280517578, 5.151312351226807, 5.172732830047607, 5.114795684814453, 4.974006652832031, 4.874988555908203, 4.834209442138672, 5.008243560791016, 4.9813456535339355, 5.0951433181762695, 5.1389617919921875, 4.957670211791992, 5.014047622680664, 5.013335704803467, 5.079080581665039, 4.913412094116211, 4.892818450927734, 4.660933017730713, 4.753278732299805, 4.78305721282959, 4.853201866149902, 5.12198543548584, 5.042220115661621, 4.971449851989746, 5.374917030334473, 5.3571367263793945, 5.017396926879883, 4.8365864753723145, 4.933347702026367, 4.991334438323975, 5.165276527404785, 5.3034162521362305, 4.891307353973389, 5.129286766052246, 5.080438613891602, 4.947854518890381, 5.033940315246582, 4.95703125, 5.179890155792236, 5.28741979598999, 4.937819004058838, 4.917447566986084, 5.048243522644043, 5.159326076507568, 5.01366662979126, 4.7067108154296875, 4.688626289367676, 4.812400817871094, 4.912299156188965, 5.022671699523926, 5.361764907836914, 4.998841762542725, 4.880847454071045, 5.571852207183838, 4.692224502563477, 4.8742828369140625, 4.955196857452393, 4.724895477294922, 4.849326133728027, 5.293025016784668, 4.859315395355225, 5.02255916595459, 5.183785915374756, 4.799285411834717, 5.10168981552124, 5.784269332885742, 4.6587090492248535, 4.718557357788086, 5.027314186096191, 5.099205017089844, 5.119103908538818, 4.914715766906738, 5.166876792907715, 4.881167411804199, 4.878533363342285, 4.969593048095703, 5.04182243347168, 5.056867599487305, 5.400115966796875, 4.947099208831787, 4.6573028564453125, 4.862915992736816, 4.783603668212891, 4.8865461349487305, 4.884427070617676, 4.7490925788879395, 5.024925708770752, 5.067011833190918, 4.724215030670166, 4.836078643798828, 4.948034286499023, 4.985537052154541, 4.9619550704956055, 4.97415828704834, 4.775771141052246, 4.969046592712402, 4.760208606719971, 4.719447135925293, 4.487561225891113, 4.667142868041992, 4.9265031814575195, 4.883942604064941, 5.57047176361084, 5.11608362197876, 4.968898773193359, 4.845105171203613, 4.839809894561768, 4.905064582824707, 4.792967796325684, 4.751638412475586, 4.882817268371582, 4.9452667236328125, 4.931712627410889, 4.67456579208374, 4.908454895019531, 4.945207595825195, 4.898880481719971, 4.9710893630981445, 4.7241926193237305, 5.21994161605835, 4.9373459815979, 4.927721977233887, 4.772980213165283, 5.08748722076416, 4.665422439575195, 4.94710111618042, 4.731517791748047, 4.651627063751221, 4.667115211486816, 4.836024761199951, 4.713004112243652, 5.017001152038574, 4.925114154815674, 5.205775260925293, 4.716048717498779, 4.9880571365356445, 4.89630126953125, 4.782269477844238, 5.03071403503418, 4.940240859985352, 4.752954959869385, 4.849071502685547, 4.777453899383545, 4.785336017608643, 4.326081275939941, 4.802631378173828, 4.886222839355469, 4.7482008934021, 5.243504047393799, 4.822686195373535, 4.986820220947266, 4.676296234130859, 4.670559883117676, 4.847776412963867, 4.720158576965332, 4.565959930419922, 5.072093963623047, 4.865549087524414, 4.914895534515381, 4.938833236694336, 4.980227470397949, 4.791229724884033, 5.244791030883789, 4.778480529785156, 5.019810199737549, 4.9470648765563965, 5.096683502197266, 4.577714920043945, 4.691028118133545, 4.854130744934082, 5.311322212219238, 5.041243553161621, 4.972277641296387, 4.873600482940674, 4.6931233406066895, 4.498058319091797, 5.04742431640625, 5.013615131378174, 4.784682750701904, 5.0335283279418945, 4.916316032409668, 4.753188133239746, 4.826181411743164, 4.788028717041016, 4.92128849029541, 4.942049980163574, 4.779703617095947, 4.7603325843811035, 4.760030746459961, 4.725419998168945, 4.790087699890137, 4.867608547210693, 4.644162178039551, 4.681058883666992, 4.698497295379639, 4.7775163650512695, 5.075512886047363, 5.685809135437012, 5.020990371704102, 4.72955322265625, 4.7534942626953125, 4.949559211730957, 4.925077438354492, 4.654294967651367, 4.829352855682373, 4.654780864715576, 4.8188066482543945, 4.909109115600586, 4.569914817810059, 4.802140235900879, 4.977633476257324, 5.016171455383301, 4.834043025970459, 4.805763244628906, 4.870448112487793, 5.010378360748291, 4.798332214355469, 4.813333034515381, 4.631400108337402, 5.145054817199707, 4.8460798263549805, 4.846651077270508, 4.934844017028809, 4.759804725646973, 4.790715217590332, 5.165509223937988, 4.95432186126709, 4.579584121704102, 4.749497890472412, 4.738149642944336, 4.721449375152588, 4.390115737915039, 4.861110210418701, 4.618686676025391, 4.803348064422607, 4.835474014282227, 4.851107120513916, 4.721305847167969, 4.706668853759766, 4.687074661254883, 4.463874816894531, 4.783598899841309, 4.736868858337402, 4.214608192443848, 4.674094200134277, 4.496675491333008, 4.734562873840332, 4.95322847366333, 4.743370056152344, 4.69655704498291, 4.6689043045043945, 4.696327209472656, 5.013065814971924, 4.875309944152832, 4.710714340209961, 4.802960395812988, 4.652425765991211, 4.805028915405273, 4.946465015411377, 4.867053985595703, 4.732292175292969, 4.576305866241455, 4.902028560638428, 4.722192764282227, 4.8097734451293945, 4.869250297546387, 4.947253704071045, 4.4882001876831055, 4.596772193908691, 4.920692443847656, 4.769922256469727, 4.722185134887695, 4.842494010925293, 4.907388687133789, 4.615099906921387, 4.973240375518799, 5.192447662353516, 4.978314399719238, 4.932007789611816, 4.842099666595459, 4.632559776306152, 5.440526008605957, 5.150812149047852, 5.037900924682617, 5.0313825607299805, 4.478323459625244, 4.833899974822998, 4.796197891235352, 4.919253349304199, 4.801061630249023, 4.473986625671387, 4.959685325622559, 4.828987121582031, 4.5358686447143555, 4.517538070678711, 5.0122175216674805, 4.783836364746094, 4.4771928787231445, 4.563375473022461, 4.608640193939209, 4.728676795959473, 4.754950046539307, 4.741193771362305, 4.588953495025635, 4.928144931793213, 4.677689552307129, 4.859580993652344, 4.717801094055176, 4.570490837097168, 4.4975128173828125, 4.882981300354004, 4.852641582489014, 4.951790809631348, 4.864686012268066, 4.767102241516113, 4.54442024230957, 4.645890235900879, 4.741506576538086, 4.953279495239258, 4.741003036499023, 4.5465898513793945, 4.475858211517334, 4.669208526611328, 4.684772491455078, 4.746510982513428, 4.855370044708252, 4.627622604370117, 4.52601432800293, 4.82746696472168, 4.79673957824707, 4.687931060791016, 4.809755325317383, 4.798188209533691, 4.749699592590332, 4.665005683898926, 4.671086311340332, 4.817116737365723, 4.69221305847168, 4.6444196701049805, 4.7335405349731445, 4.785804748535156, 4.848667621612549, 4.762231826782227, 4.97048282623291, 5.304512023925781, 5.352400779724121, 5.0017409324646, 5.021231651306152, 4.923947334289551, 4.848886489868164, 4.677524566650391, 4.725358963012695, 4.572057723999023, 4.947478294372559, 4.640789985656738, 4.766217231750488, 4.587760925292969, 4.649946212768555, 4.714931488037109, 4.610927581787109, 4.727791786193848, 4.171730041503906, 4.48976469039917, 4.540529251098633, 4.614501953125, 4.605761528015137, 4.569278240203857, 4.637202262878418, 4.733458995819092, 4.767460823059082, 4.8612871170043945, 4.550004959106445, 4.6019110679626465, 4.603268623352051, 4.536317348480225, 4.836444854736328, 4.874032974243164, 4.7293853759765625, 4.803804397583008, 4.761334419250488, 4.615487575531006, 4.709609508514404, 4.894432544708252, 5.074379920959473, 4.667296886444092, 4.440615177154541, 4.729274272918701, 4.651385307312012, 4.725125312805176, 4.778581619262695, 4.595772743225098, 4.679350852966309, 4.672455310821533, 4.621842384338379, 4.372463703155518, 4.389845848083496, 4.767289161682129, 4.614211082458496, 4.695876121520996, 4.661979675292969, 4.639657974243164, 4.803893089294434, 4.707087993621826, 4.516443252563477, 4.702381134033203, 4.411686420440674, 4.595114707946777, 4.612722396850586, 4.784337043762207, 4.664623737335205, 4.944648265838623, 4.674526214599609, 4.479750633239746, 4.865363597869873, 5.0341901779174805, 4.751768112182617, 4.558251857757568, 4.578822135925293, 4.68718957901001, 4.772446632385254, 4.5710554122924805, 4.493444442749023, 4.887375831604004, 4.800331115722656, 4.519488334655762, 4.590611934661865, 4.523764133453369, 4.789491176605225, 4.424920082092285, 4.699518203735352, 4.775892734527588, 4.646266937255859, 4.949000358581543, 4.564925193786621, 4.446105003356934, 4.375615119934082, 4.687512397766113, 4.853550434112549, 4.560935974121094, 4.7022294998168945, 4.678098678588867, 4.693352222442627, 4.630368232727051, 4.611154556274414, 4.922853469848633, 4.754072189331055, 4.687180519104004, 4.590277194976807, 4.762066841125488, 4.439764976501465, 4.657772541046143, 4.654300212860107, 4.654105186462402, 4.817469120025635, 5.064892768859863, 4.647878170013428, 4.542025566101074, 4.858051776885986, 4.782125473022461, 4.6853790283203125, 4.853387832641602, 4.619040489196777, 4.715458869934082, 4.732344627380371, 4.815497398376465, 4.672601699829102, 4.794507026672363, 4.697693347930908, 4.7456793785095215, 4.752009391784668, 4.850186824798584, 4.851409912109375, 5.023436546325684, 4.7037153244018555, 4.764995574951172, 4.869474411010742, 4.728384017944336, 4.692898273468018, 4.662280082702637, 4.76632022857666, 4.6734209060668945, 4.564414978027344, 4.720489978790283, 4.384067535400391, 4.454513072967529, 4.652136325836182, 4.840264320373535, 4.405184268951416, 4.887003421783447, 4.643902778625488, 4.653560638427734, 4.472108364105225, 4.602781772613525, 4.691906929016113, 4.6302900314331055, 4.530905246734619, 4.325339317321777, 4.436056137084961, 4.713852882385254, 4.429452896118164, 4.792366981506348, 4.584081172943115, 4.793302536010742, 4.8125410079956055, 4.713132858276367, 4.502451419830322, 4.469983100891113, 4.691906929016113, 4.72900390625, 4.826323509216309, 4.688645839691162, 4.815101623535156, 4.572159290313721, 4.599818229675293, 4.569506645202637, 4.75991153717041, 4.724539279937744, 4.306702136993408, 4.744970321655273, 5.031929016113281, 4.764239311218262, 4.486025810241699, 4.742273807525635, 5.38299560546875, 4.694036483764648, 4.650506496429443, 4.661856651306152, 4.785022735595703, 4.675177574157715, 4.642915725708008, 4.526360511779785, 4.565195560455322, 4.859052658081055, 4.893251419067383, 4.730154991149902, 4.6060590744018555, 5.012245178222656, 4.853348255157471, 4.651546001434326, 4.219463348388672, 4.5931396484375, 4.648123264312744, 4.517737865447998, 4.631084442138672, 4.245208263397217, 4.415853500366211, 4.441375732421875, 4.768374443054199, 4.479779243469238, 4.58802604675293, 4.472195625305176, 4.60640287399292, 4.540454864501953, 4.806412696838379, 4.655519962310791, 4.551292896270752, 4.597316741943359, 4.675631999969482, 4.589250564575195, 4.678782939910889, 4.581394672393799, 4.413737773895264, 5.073664665222168, 4.653772830963135, 4.549174785614014, 4.398867130279541, 4.877852439880371, 4.656033515930176, 4.480711936950684, 4.6666765213012695, 4.678958415985107, 4.629351615905762, 4.756292819976807, 4.697846412658691, 4.5640668869018555, 4.441673278808594, 4.669628620147705, 4.769805431365967, 4.6976823806762695, 4.8976335525512695, 4.46090030670166, 4.5338592529296875, 4.780231475830078, 4.393637657165527, 4.7135820388793945, 4.561468124389648, 4.58469295501709, 4.691590309143066, 4.749850749969482, 4.545553207397461, 4.508883476257324, 4.716085910797119, 4.737514972686768, 4.597959518432617, 4.364143371582031, 4.498061180114746, 4.66922664642334, 4.594990253448486, 4.958349227905273, 4.768154621124268, 4.64516019821167, 4.643174648284912, 4.611546516418457, 4.835737228393555, 4.802507400512695, 4.69635009765625, 4.661774635314941, 4.817975997924805, 4.70833158493042, 4.559322357177734, 4.879546642303467, 5.079306125640869, 4.618502616882324, 4.5225934982299805, 4.4849748611450195, 4.446496963500977, 4.687015056610107, 4.541064262390137, 4.649504661560059, 4.703225135803223, 4.585815906524658, 4.393916130065918, 4.436680793762207, 4.533334732055664, 4.32490348815918, 4.5356364250183105, 4.633284568786621, 4.706690788269043, 4.4177565574646, 4.293464660644531, 4.421821594238281, 4.562106132507324, 4.499660015106201, 4.589241027832031, 4.5953369140625, 4.6871795654296875, 4.620429515838623, 4.432387828826904, 4.695887088775635, 4.734776020050049, 4.563211441040039, 4.458590507507324, 4.587372779846191, 4.827516555786133, 4.727353096008301, 4.6888628005981445, 4.580729961395264, 4.472095489501953, 4.63078498840332, 4.57222843170166, 4.6512603759765625, 4.569838523864746, 4.602209091186523, 4.625938415527344, 4.413335800170898, 4.426382064819336, 5.037960052490234, 4.451122283935547, 4.378436088562012, 4.733723163604736, 4.450325012207031, 4.541522026062012, 4.767706394195557, 4.788349151611328, 4.605564117431641, 4.5613813400268555, 4.782958030700684, 4.56788969039917, 4.659116744995117, 4.740503311157227, 4.622291564941406, 4.552495002746582, 4.540591239929199, 4.5065016746521, 4.775107383728027, 4.725281238555908, 4.601203918457031, 4.68779182434082, 4.551447868347168, 4.130152702331543, 4.65499210357666, 4.737146854400635, 4.801187038421631, 4.504316329956055, 4.283345699310303, 4.577008247375488, 4.342458724975586, 4.617130279541016, 4.324970245361328, 4.296950817108154, 4.415019989013672, 4.689614772796631, 4.716304302215576, 4.735935688018799, 4.618174076080322, 4.411745071411133, 4.706837177276611, 4.552402496337891, 4.533117771148682, 4.657087326049805, 4.508552551269531, 4.633029937744141, 4.59783411026001, 4.638291835784912, 4.841011047363281, 4.645512580871582, 4.447397232055664, 4.676806449890137, 4.601871490478516, 4.514137268066406, 4.662256240844727, 4.7238359451293945, 4.528737545013428, 4.632846355438232, 4.806576728820801, 4.6804280281066895, 4.656126022338867, 4.654366493225098, 4.61154842376709, 4.6124162673950195, 4.843784332275391, 5.104337692260742, 5.0104570388793945, 4.558253288269043, 4.676950454711914, 4.648942947387695, 4.66549015045166, 4.468581199645996, 4.657721519470215, 4.567081451416016, 4.404688835144043, 4.566666603088379, 4.171168327331543, 4.51058292388916, 4.599966049194336, 4.627676486968994, 4.663256645202637, 4.422567844390869, 4.407724380493164, 4.474794387817383, 4.491606712341309, 4.704557418823242, 4.525223731994629, 4.486232280731201, 4.651294231414795, 4.4417314529418945, 4.669975280761719, 4.506145477294922, 4.657258033752441, 4.639756202697754, 4.505446434020996, 4.507656097412109, 4.63820743560791, 4.647164344787598, 4.604910850524902, 4.432445526123047, 4.583730220794678, 4.2104339599609375, 4.558112621307373, 4.461411476135254, 4.604362487792969, 4.56810188293457, 4.384356498718262, 4.383485794067383, 4.371070384979248, 4.337993621826172, 4.550650596618652, 4.585308074951172, 4.424437522888184, 4.518324375152588, 4.476731300354004, 4.604723930358887, 4.531542778015137, 4.578757286071777, 4.334704399108887, 4.412015914916992, 5.046041965484619, 4.657312393188477, 4.341884136199951, 4.613709449768066, 4.735490798950195, 4.451877593994141, 4.471974849700928, 4.3297905921936035, 4.554557800292969, 5.100895881652832, 4.962050914764404, 4.248134613037109, 4.425760746002197, 4.347862720489502, 4.454440593719482, 4.338083744049072, 4.550949573516846, 4.4647932052612305, 4.4226274490356445, 4.553293228149414, 4.3145270347595215, 4.543912887573242, 4.471100807189941, 4.68644380569458, 4.420580863952637, 4.363612651824951, 4.292936325073242, 4.548379898071289, 4.469766616821289, 4.4931960105896, 4.658084392547607, 4.203084945678711, 4.325322151184082, 4.623778343200684, 4.517341613769531, 4.707459449768066, 4.58165168762207, 4.566401481628418, 4.3242316246032715, 4.536175727844238, 4.531167507171631, 4.651278495788574, 4.535469055175781, 4.499222755432129, 4.66033935546875, 4.484467506408691, 4.4047675132751465, 4.523285388946533, 4.619916915893555, 4.5399651527404785, 4.521050453186035, 4.502420425415039, 4.657256603240967, 4.736047267913818, 4.729013919830322, 4.65443229675293, 4.526238441467285, 4.684179306030273, 4.650578022003174, 4.473825454711914, 4.47635555267334, 4.596158504486084, 4.46949577331543, 4.445757865905762, 4.321017742156982, 4.4784626960754395, 4.693358421325684, 4.798617362976074, 4.422249794006348, 4.43486213684082, 4.619709491729736, 4.530575752258301, 4.365731239318848, 4.74642276763916, 4.600707054138184, 4.627199172973633, 4.402751922607422, 4.313934803009033, 4.532864093780518, 4.371422290802002, 4.450592994689941, 4.463018894195557, 4.400513172149658, 4.605155944824219, 4.454122543334961, 4.821715831756592, 4.527517795562744, 4.581672668457031, 4.461885929107666, 4.398468017578125, 4.391256332397461, 4.59308385848999, 4.908935546875, 4.438467502593994, 4.442604064941406, 4.5244340896606445, 4.6390886306762695, 4.435459136962891, 4.385993957519531, 4.742807388305664, 4.504091739654541, 4.844559192657471, 4.789872169494629, 4.234847068786621, 4.520496368408203, 4.682555198669434, 4.720278739929199, 4.6197919845581055, 4.439457893371582, 4.49851131439209, 4.652482986450195, 4.4838762283325195, 4.566983699798584, 4.663519859313965, 4.584629058837891, 4.558921813964844, 4.268076419830322, 4.744091033935547, 4.429573059082031, 4.60642671585083, 4.677203178405762, 4.341052532196045, 4.358941555023193, 4.447440147399902, 4.128747940063477, 4.053487777709961, 4.2767815589904785, 4.410953521728516, 4.441859245300293, 4.935133457183838, 4.164870738983154, 4.6851301193237305, 4.700650215148926, 4.70533561706543, 4.456301689147949, 4.505366325378418, 4.602116584777832, 4.588393211364746, 4.526500701904297, 4.507659912109375, 4.5126214027404785, 4.237009048461914, 4.361964702606201, 4.349429607391357, 4.526759147644043, 4.421778678894043, 4.441928863525391, 4.495453834533691, 4.333221912384033, 4.446807861328125, 4.508054733276367, 4.382119655609131, 4.551753044128418, 4.369347095489502, 4.423544883728027, 4.457674026489258, 4.575438499450684, 4.411971092224121, 4.536625862121582, 4.6122941970825195, 5.057791709899902, 4.306197643280029, 4.340693473815918, 4.640004634857178, 4.67982816696167, 4.571210861206055, 4.776799201965332, 4.48798942565918, 4.6305036544799805, 4.278469085693359, 4.354157447814941, 4.44852352142334, 4.4011430740356445, 4.52476692199707, 4.352169036865234, 4.476369857788086, 4.507847785949707, 4.546678066253662, 4.452620506286621, 4.9034295082092285, 4.555379390716553, 4.4947004318237305, 4.543395519256592, 4.687708377838135, 4.495862007141113, 4.536400318145752, 4.407761573791504, 4.62438440322876, 4.435835838317871, 4.704170227050781, 4.597777843475342, 4.291070938110352, 4.628880977630615, 4.519218444824219, 4.764204978942871, 4.724206924438477, 4.832769393920898, 4.564725399017334, 4.184700012207031, 3.8281328678131104, 4.473332405090332, 4.876896381378174, 4.365939140319824, 4.451696395874023, 4.404054641723633, 4.6056108474731445, 4.342406272888184, 4.610100746154785, 3.915485382080078, 4.014108657836914, 3.78114652633667, 3.787104845046997, 4.42445182800293, 4.467529773712158, 4.484506607055664, 4.461165428161621, 4.481087684631348, 4.7234697341918945, 4.529321670532227, 4.192464828491211, 4.341287612915039, 4.608139991760254, 4.571957588195801, 4.250998020172119, 4.334529876708984, 4.47411584854126, 4.521056175231934, 4.667625427246094, 4.646205902099609, 4.428703308105469, 4.557242393493652, 4.6342878341674805, 4.369218826293945, 4.513993263244629, 4.182828903198242, 3.9730172157287598, 4.7320098876953125, 4.297086715698242, 4.698347568511963, 4.474573135375977, 4.6322455406188965, 4.49122953414917, 4.536050796508789, 4.448500633239746, 5.12478494644165, 5.136495590209961, 4.4608612060546875, 4.350931167602539, 4.677565574645996, 4.57652473449707, 4.581809997558594, 4.492255210876465, 4.432024955749512, 4.343825340270996, 4.713176727294922, 4.429387092590332, 4.611285209655762, 4.735927581787109, 4.271670818328857, 4.604517459869385, 4.4967498779296875, 4.536052703857422, 4.680522918701172, 4.368788242340088, 4.529917240142822, 4.566291809082031, 4.847625732421875, 4.462808609008789, 4.471168518066406, 4.259349822998047, 4.442972183227539, 4.425321578979492, 4.530904769897461, 4.260147571563721, 4.428548336029053, 4.685352325439453, 4.465545654296875, 4.221321105957031, 4.546136379241943, 4.5316691398620605, 4.701948642730713, 4.691554069519043, 4.429563045501709, 4.307563781738281, 4.254767417907715, 4.404074668884277, 4.27495002746582, 4.571369647979736, 4.349462509155273, 4.412232398986816, 4.5832624435424805, 4.356168746948242, 4.492386817932129, 4.619787216186523, 4.525203704833984, 4.477357864379883, 4.400631904602051, 4.4188313484191895, 4.699666976928711, 4.498016357421875, 4.543388366699219, 4.560940265655518, 4.448139190673828, 4.433267593383789, 4.395476818084717, 4.544889450073242, 4.47148323059082, 4.194533824920654, 4.496583938598633, 4.643772125244141, 4.3168864250183105, 4.479907989501953, 4.386932849884033, 4.543959617614746, 4.570722579956055, 4.453112602233887, 4.659737586975098, 4.4796142578125, 4.4926371574401855, 4.859918594360352, 4.710152626037598, 4.987299919128418, 4.353031158447266, 4.235695838928223, 4.549330711364746, 4.541932106018066, 4.670830249786377, 4.267779350280762, 4.540987968444824, 4.315257549285889, 4.390468120574951, 4.391136646270752, 4.277525424957275, 4.277273178100586, 4.477444648742676, 4.4322309494018555, 4.563695907592773, 4.296698093414307, 4.368899822235107, 4.364976406097412, 4.373531818389893, 4.553481101989746, 4.369155406951904, 4.641529083251953, 4.375323295593262, 4.33988094329834, 4.330002307891846, 4.091087341308594, 3.9902145862579346, 4.620102882385254, 4.343945503234863, 4.352564811706543, 4.4879150390625, 4.366578102111816, 4.641226291656494, 4.473331451416016, 4.422337532043457, 4.537681579589844, 4.544643402099609, 4.396176815032959, 4.572039604187012, 4.427801132202148, 4.2935590744018555, 4.544749736785889, 4.457608699798584, 4.662229061126709, 4.444518089294434, 4.529664039611816, 4.6005353927612305, 4.336450576782227, 4.5362229347229, 4.443617820739746, 4.461879730224609, 4.436828136444092, 4.612626075744629, 4.564736843109131, 4.385065078735352, 4.5694427490234375, 4.638096332550049, 4.293614387512207, 4.571163654327393, 4.5221357345581055, 4.412600517272949, 4.152696132659912, 4.44956111907959, 4.200179100036621, 4.38601541519165, 3.931753158569336, 4.341455459594727, 4.620698928833008, 4.464180946350098, 4.549579620361328, 4.840743064880371, 4.293708801269531, 4.296717166900635, 4.013308048248291, 4.423216342926025, 4.4319634437561035, 4.386126518249512, 4.519527435302734, 4.535858154296875, 4.473720550537109, 4.552084445953369, 4.3845953941345215, 4.388702392578125, 4.385825157165527, 4.585086822509766, 4.46764612197876, 4.4301652908325195, 4.471376419067383, 4.253965854644775, 4.362959861755371, 4.594930171966553, 4.66310977935791, 4.328444957733154, 4.347935676574707, 4.405125617980957, 4.413518905639648, 4.543332576751709, 4.484918117523193, 4.392021179199219, 4.320679664611816, 4.447345733642578, 4.413116455078125, 4.655184745788574, 4.534232139587402, 4.642423629760742, 4.439665794372559, 4.324026107788086, 4.494227886199951, 4.4460320472717285, 4.522863388061523, 4.814146041870117, 4.220017433166504, 4.696192741394043, 4.606902599334717, 4.473072052001953, 4.525600433349609, 3.9152979850769043, 4.323480606079102, 4.436060905456543, 4.517523765563965, 4.235532760620117, 4.345232963562012, 4.285571098327637, 4.544624328613281, 4.383391857147217, 4.374929428100586, 4.321559906005859, 4.404491424560547, 4.409971237182617, 4.547292709350586, 4.554821968078613, 4.443100929260254, 4.464147567749023, 4.366777420043945, 4.481450080871582, 4.396942138671875, 4.513337135314941, 4.410079002380371, 4.069765567779541, 4.391164779663086, 4.290957450866699, 4.610715389251709, 4.414668560028076, 4.354889869689941, 4.380237102508545, 4.572473526000977, 4.338718414306641, 4.243069648742676, 4.491942405700684, 4.519417762756348, 4.424979209899902, 4.413256645202637, 4.2992424964904785, 4.360459327697754, 4.571293830871582, 4.287235736846924, 4.344872951507568, 4.489048004150391, 4.6456732749938965, 4.575927734375, 4.535938262939453, 4.4722065925598145, 4.496787071228027, 4.420198917388916, 4.397575378417969, 4.672998428344727, 4.416418075561523, 4.386590003967285, 4.549304008483887, 4.485321044921875, 4.371659755706787, 4.327976703643799, 4.501203536987305, 4.416394233703613, 4.269631385803223, 4.4237518310546875, 4.590850353240967, 4.489972114562988, 4.543305397033691, 4.439171314239502, 4.4379987716674805, 4.468245983123779, 4.442687511444092, 4.482908248901367, 4.283957481384277, 4.3013410568237305, 4.256167411804199, 4.183090686798096, 4.194638729095459, 4.2929768562316895, 4.436617851257324, 4.342965126037598, 4.523385047912598, 4.232676982879639, 4.5275983810424805, 4.34382438659668, 4.365680694580078, 4.44761848449707, 4.466954708099365, 4.227423667907715, 4.278303146362305, 4.8355913162231445, 4.403079032897949, 4.3257317543029785, 4.341762542724609, 4.492356777191162, 4.341748237609863, 4.613511085510254, 4.927619934082031, 4.672223091125488, 4.417733192443848, 4.477417469024658, 4.316943168640137, 3.903651714324951, 4.583343505859375, 4.529053688049316, 4.453753471374512, 4.466678619384766, 4.300370216369629, 4.364682674407959, 4.483081340789795, 4.477916717529297, 4.4560933113098145, 4.4391069412231445, 4.4838056564331055, 4.350266456604004, 4.511435508728027, 4.50004768371582, 4.3427300453186035, 4.344630241394043, 4.390149116516113, 4.479517459869385, 4.27444314956665, 4.343688488006592, 4.39778470993042, 4.453185081481934, 4.348017692565918, 4.6120758056640625, 4.651402473449707, 4.196382999420166, 4.446573257446289, 4.396878719329834, 4.011755466461182, 4.178605079650879, 4.4546661376953125, 5.055605888366699, 4.685258865356445, 4.371274948120117, 4.350953102111816, 4.568982124328613, 4.270912170410156, 4.36210823059082, 4.544931888580322, 4.339923858642578, 4.37060546875, 4.536969184875488, 4.562768936157227, 4.370572090148926, 4.1082072257995605, 4.184898376464844, 4.363285064697266, 4.291731834411621, 4.1351823806762695, 4.436675548553467, 4.538222789764404, 4.334491729736328, 4.3324995040893555, 4.766754150390625, 4.3477325439453125, 4.386990070343018, 4.640415668487549, 4.444028854370117, 4.408994674682617, 4.668063163757324, 4.548614501953125, 4.52533483505249, 4.537935733795166, 4.228316307067871, 4.394466400146484, 4.469212532043457, 4.502692222595215, 4.326396465301514, 4.427257061004639, 3.9981157779693604, 3.741288661956787, 3.8121755123138428, 3.9647722244262695, 4.4440107345581055, 4.362215518951416, 4.309214115142822, 3.937751054763794, 4.865579128265381, 4.629929542541504, 4.503815650939941, 4.503890037536621, 4.210888385772705, 4.508106231689453, 4.3724684715271, 4.008635520935059, 4.280330657958984, 4.310179710388184, 4.301699161529541, 4.508031845092773, 4.56038761138916, 4.608985424041748, 4.602916717529297, 4.848942756652832, 4.1763529777526855, 4.758881568908691, 4.5505523681640625, 4.334794998168945, 4.646022796630859, 4.78421688079834, 4.386727809906006, 4.4555840492248535, 4.365007400512695, 4.495217323303223, 4.394439220428467, 4.08048677444458, 4.225377082824707, 4.137133598327637, 4.488379001617432, 4.496090888977051, 4.350266933441162, 4.400059700012207, 4.306490421295166, 4.646843433380127, 4.378198146820068, 4.748790264129639, 4.333184242248535, 4.442841529846191, 4.4405927658081055, 4.219721794128418, 4.352386951446533, 4.289946556091309, 4.249386787414551, 4.379143714904785, 4.150118827819824, 4.160693168640137, 4.452065467834473, 4.517445087432861, 4.517153739929199, 4.283204555511475, 4.266768455505371, 4.367193222045898, 4.4492669105529785, 4.424536228179932, 4.270379066467285, 4.550589561462402, 4.2528228759765625, 4.456950664520264, 4.332695484161377, 4.579884052276611, 4.334850311279297, 4.499820709228516, 4.335554599761963, 4.336658000946045, 4.6090569496154785, 4.4126081466674805, 4.310317039489746, 4.433159828186035, 4.427865505218506, 4.422830104827881, 4.308969974517822, 4.317117691040039, 4.362709999084473, 4.556092262268066, 4.34726619720459, 4.294472694396973, 4.39894962310791, 4.323369026184082, 4.356348514556885, 4.383946418762207, 4.707036018371582, 4.321236610412598, 4.907451152801514, 4.596200466156006, 4.451757431030273, 4.494174003601074, 4.636344909667969, 4.3539347648620605, 4.317343235015869, 4.330134391784668, 4.357499122619629, 4.427659034729004, 4.398437023162842, 4.396369934082031, 4.339851379394531, 4.124589920043945, 4.415732383728027, 4.442732810974121, 4.525549411773682, 4.442510604858398, 4.242682456970215, 4.08579683303833, 4.548316478729248, 4.284509181976318, 4.331576347351074, 4.499248504638672, 4.355916976928711, 4.227910041809082, 4.114736557006836, 4.725432872772217, 4.004199981689453, 4.123228073120117, 4.448518753051758, 4.453955173492432, 4.40888786315918, 4.642264366149902, 4.399358749389648, 4.378352165222168, 5.008063316345215, 4.857770919799805, 4.427361965179443, 4.452000141143799, 4.415004253387451, 4.7778520584106445, 4.174107551574707, 4.419405937194824, 4.517127990722656, 4.5536956787109375, 4.561572551727295, 4.4464311599731445, 4.100738525390625, 4.292850017547607, 4.652459144592285, 4.54149055480957, 4.2011823654174805, 4.455224990844727, 4.390392780303955, 4.378979682922363, 4.554047584533691, 4.424501419067383, 4.122858047485352, 4.614634037017822, 4.607922554016113, 4.544078350067139, 4.284510612487793, 4.433107376098633, 4.874303817749023, 4.673576354980469, 4.50691556930542, 4.380762100219727, 4.568047523498535, 4.211292743682861, 4.0987396240234375, 4.399202346801758, 4.247804641723633, 4.295977592468262, 4.391725540161133, 4.3639607429504395, 4.277609825134277, 4.723995208740234, 3.869016170501709, 4.275254249572754, 4.574218273162842, 4.470071792602539, 4.26059627532959, 4.3583083152771, 4.151922225952148, 4.311495780944824, 4.5202531814575195, 4.098591327667236, 4.394903182983398, 4.1818366050720215, 4.36279821395874, 4.389057159423828, 4.307769775390625, 4.128065586090088, 4.412714958190918, 4.604991436004639, 4.401020050048828, 4.454412460327148, 4.3393635749816895, 4.254946708679199, 4.531730651855469, 4.547900199890137, 4.152414321899414, 3.9787516593933105, 4.333930969238281, 4.427472114562988, 4.317181587219238, 4.199674606323242, 4.338442325592041, 4.75672721862793, 4.342756271362305, 4.218649864196777, 4.382933139801025, 4.5095672607421875, 4.234859943389893, 4.497689723968506, 4.530675411224365, 4.187809944152832, 4.3510637283325195, 4.2516045570373535, 4.499378204345703, 4.132319927215576, 4.485784530639648, 4.241896152496338, 4.566318035125732, 4.375112056732178, 4.243155002593994, 4.601869583129883, 4.394122123718262, 4.1671366691589355, 4.002013683319092, 4.487706661224365, 4.356005668640137, 4.406904220581055, 4.268150806427002, 4.602385520935059, 4.273041248321533, 4.206184387207031, 4.461093902587891, 4.294288635253906, 4.293093204498291, 4.452121257781982, 4.428864479064941, 4.17178201675415, 4.349428176879883, 4.255159378051758, 4.274275779724121, 4.25538444519043, 4.296029567718506, 4.391630172729492, 4.35379695892334, 4.27251672744751, 4.160160064697266, 4.274255752563477, 4.442961692810059, 4.4677557945251465, 4.30009651184082, 4.620943069458008, 4.12227725982666, 4.637232780456543, 4.453829765319824, 4.398795127868652, 4.2709784507751465, 4.410577774047852, 4.39966344833374, 4.266339302062988, 4.327437400817871, 4.348908424377441, 4.352002143859863, 4.274316787719727, 4.022397994995117, 4.761837005615234, 4.524404525756836, 4.484940528869629, 4.633584499359131, 3.9852137565612793, 4.355513572692871, 4.608493804931641, 4.476762771606445, 4.251246452331543, 3.9491660594940186, 4.081515789031982, 4.33310604095459, 4.6761298179626465, 4.507789611816406, 4.309282302856445, 4.345273017883301, 4.520445823669434, 4.467081069946289, 4.406126976013184, 4.229333877563477, 4.402157783508301, 4.554452896118164, 4.622097015380859, 4.517200946807861, 4.433895111083984, 4.232622146606445, 4.042148113250732, 4.366304397583008, 4.315397262573242, 4.262667655944824, 4.071342945098877, 4.31228494644165, 4.3668060302734375, 4.040453910827637, 4.17793083190918, 4.621759414672852, 4.565606117248535, 4.699784755706787, 4.423376560211182, 4.62328577041626, 4.159923076629639, 4.330956935882568, 4.122971534729004, 4.679072380065918, 4.1830644607543945, 4.147528171539307, 4.29321813583374, 4.365998268127441, 4.075070858001709, 4.252414703369141, 3.961789608001709, 4.5828704833984375, 4.575411796569824, 4.579545974731445, 4.4172210693359375, 4.377976894378662, 4.29780387878418, 4.495377540588379, 4.583542823791504, 4.631536960601807, 4.27515172958374, 4.016507148742676, 4.274871349334717, 4.417858123779297, 4.546090126037598, 4.378473281860352, 4.390023231506348, 4.370515823364258, 3.9712131023406982, 4.393441677093506, 4.288129806518555, 4.168692111968994, 4.388262748718262, 4.481071472167969, 3.996640205383301, 4.381438255310059, 4.336730003356934, 4.296202659606934, 4.478861331939697, 4.402159690856934, 4.558318138122559, 4.974815368652344, 4.37548303604126, 4.746115207672119, 4.474180698394775, 4.25733757019043, 4.260030746459961, 4.554221153259277, 4.304722785949707, 4.568903923034668, 4.436439514160156, 4.135922908782959, 4.226145267486572, 3.9531126022338867, 4.4166412353515625, 4.234650611877441, 4.680463790893555, 4.376018524169922, 4.475089073181152, 4.131723880767822, 4.184180736541748, 4.2079057693481445, 4.491971969604492, 4.408543586730957, 4.369899749755859, 4.290414333343506, 4.284140586853027, 4.209099292755127, 4.25431489944458, 4.323846817016602, 3.926116943359375, 4.191229343414307, 4.364453315734863, 4.467885494232178, 4.300962448120117, 4.304418563842773, 4.376620292663574, 4.36935567855835, 4.41546106338501, 4.517946720123291, 4.440452575683594, 4.573349952697754, 4.142969131469727, 4.308073997497559, 4.520488739013672, 4.285207748413086, 4.116913318634033, 4.597226142883301, 4.105788230895996, 4.518691539764404, 4.473170757293701, 3.91365385055542, 4.132053375244141, 4.464672088623047, 3.915867567062378, 4.0490875244140625, 4.142258644104004, 4.150747776031494, 4.3064374923706055, 4.192758560180664, 4.291868686676025, 4.140021324157715, 4.2573981285095215, 4.089042663574219, 4.345587730407715, 4.47419548034668, 4.316701412200928, 4.382877349853516, 4.515176773071289, 4.534372329711914, 4.638009071350098, 4.412548542022705, 4.262701034545898, 4.7034993171691895, 4.407901763916016, 4.487682819366455, 4.347260475158691, 4.513045310974121, 3.9200196266174316, 4.139966011047363, 4.407478332519531, 3.9112119674682617, 4.213004112243652, 4.346297264099121, 3.979773998260498, 4.428991317749023, 4.240824222564697, 4.249044418334961, 4.3057146072387695, 4.229915142059326, 4.531915664672852, 4.399754047393799, 4.32643985748291, 4.347705841064453, 4.508055686950684, 4.369494438171387, 4.158169746398926, 4.436098098754883, 4.442521095275879, 4.177461624145508, 4.3941192626953125, 4.395487308502197, 4.43137264251709, 4.446197509765625, 4.438947677612305, 4.255422115325928, 4.2841291427612305, 4.160303592681885, 5.944555759429932, 4.588626861572266, 4.5596442222595215, 4.220882892608643, 4.342855453491211, 4.476204872131348, 4.435342788696289, 4.3774309158325195, 4.4766035079956055, 4.217719078063965, 4.448786735534668, 4.272737503051758, 4.528242588043213, 4.246973514556885, 4.385053634643555, 4.596875190734863, 4.331869602203369, 4.215798377990723, 3.419036388397217, 4.452298641204834, 4.2846245765686035, 4.219634056091309, 4.427326202392578, 4.289695739746094, 4.595013618469238, 4.700528144836426, 4.634215354919434, 4.451755523681641, 4.220179080963135, 4.442152976989746, 4.190810203552246, 4.560827255249023, 4.268771171569824, 4.079381465911865, 4.372415065765381, 4.166295051574707, 4.182416915893555, 4.040700912475586, 4.153189659118652, 4.094500541687012, 4.2303314208984375, 4.412059307098389, 4.301268100738525, 4.360076904296875, 4.619958877563477, 4.483319282531738, 4.134973526000977, 4.438138484954834, 3.8329315185546875, 3.8280234336853027, 3.7913036346435547, 3.6344757080078125, 3.6257104873657227, 4.466455459594727, 4.536426544189453, 4.352989196777344, 4.306338310241699, 4.25906229019165, 4.361478805541992, 4.1785454750061035, 4.065426826477051, 4.3869524002075195, 4.334648132324219, 4.376523971557617, 4.400493621826172, 4.460546493530273, 4.248128890991211, 4.376584053039551, 4.364226818084717, 4.009917259216309, 4.333098888397217, 4.125853538513184, 4.421119689941406, 4.20721435546875, 4.27103328704834, 4.434262752532959, 4.285961151123047, 4.38177490234375, 4.406122207641602, 4.527102470397949, 4.1939215660095215, 4.338315963745117, 4.097459316253662, 4.217849254608154, 4.411566257476807, 4.369932174682617, 4.108794689178467, 4.574458122253418, 4.2895917892456055, 4.365091800689697, 4.360440731048584, 4.42042350769043, 4.295190811157227, 4.384792327880859, 4.404658317565918, 4.161846160888672, 4.255764007568359, 4.088844299316406, 4.031805515289307, 4.29823112487793, 4.330204010009766, 4.547478199005127, 4.207339763641357, 4.292238235473633, 4.420766353607178, 4.095951557159424, 4.0779948234558105, 4.084953308105469, 4.358560085296631, 4.341707229614258, 4.277872085571289, 4.405425071716309, 4.064453601837158, 4.102565765380859, 4.3060302734375, 4.265910625457764, 4.127996921539307, 4.535224437713623, 4.22697639465332, 4.417301654815674, 4.424169540405273, 4.51107120513916, 4.290566921234131, 4.156129837036133, 4.25010871887207, 4.305558204650879, 4.213500022888184, 4.395871639251709, 4.473593235015869, 4.339138984680176, 4.024052619934082, 4.330065727233887, 4.247209548950195, 4.452352523803711, 4.2683563232421875, 4.11944055557251, 4.182058811187744, 4.264156341552734, 4.675478935241699, 4.452066421508789, 4.396288871765137, 4.358013153076172, 4.199554443359375, 4.295018672943115, 4.198819160461426, 4.467562198638916, 4.37221622467041, 4.450594425201416, 4.295282363891602, 4.550734519958496, 4.203850746154785, 6.271064758300781, 6.227045059204102, 4.358722686767578, 4.318515300750732, 4.297849178314209, 4.547985553741455, 4.210567474365234, 4.26157283782959, 4.1853742599487305, 4.37188720703125, 4.42064905166626, 4.190875053405762, 4.462123870849609, 4.4640679359436035, 4.452145576477051, 4.19622802734375, 4.227702617645264, 4.314966201782227, 4.282014846801758, 4.228017807006836, 4.447652816772461, 4.606029510498047, 4.248057842254639, 4.409661293029785, 4.15493106842041, 4.415935516357422, 4.279240131378174, 4.184654235839844, 4.186861991882324, 4.357029914855957, 4.093131065368652, 4.204500198364258, 4.359328269958496, 4.242659568786621, 4.235601902008057, 4.319576263427734, 4.103250026702881, 4.406529903411865, 4.269387722015381, 4.3409223556518555, 4.082760810852051, 4.240052700042725, 4.368338584899902, 4.380189895629883, 4.081333637237549, 4.263045787811279, 4.110391616821289, 4.153458118438721, 4.242193222045898, 4.268496513366699, 4.222262382507324, 4.45841121673584, 4.063163757324219, 4.309097766876221, 4.070282459259033, 4.123929977416992, 4.259363174438477, 4.269654273986816, 4.320802211761475, 4.023614406585693, 4.341036796569824, 4.453229904174805, 4.325934410095215, 4.625481605529785, 4.151833534240723, 4.2423505783081055, 4.270811557769775, 4.337370872497559, 4.282567024230957, 4.307809829711914, 4.098677635192871, 4.196062088012695, 4.246801376342773, 4.197134971618652, 4.1763200759887695, 4.207210540771484, 4.259888648986816, 4.239136219024658, 4.751211166381836, 4.198497772216797, 4.291476726531982, 4.249621391296387, 4.162409782409668, 4.4401960372924805, 4.424244403839111, 4.175641059875488, 4.265334129333496, 4.063506603240967, 4.335493087768555, 4.084859848022461, 4.117740631103516, 4.355750560760498, 4.163858413696289, 4.116629123687744, 4.291568756103516, 4.443378448486328, 4.32708215713501, 4.241438388824463, 4.3147053718566895, 4.212897300720215, 3.977034568786621, 4.475337982177734, 4.640412330627441, 4.611174583435059, 4.429133415222168, 4.285148620605469, 4.439257621765137, 4.335134506225586, 4.286324501037598, 4.302534103393555, 4.226776599884033, 4.540615558624268, 4.357941150665283, 4.3687663078308105, 4.370759963989258, 4.30113410949707, 4.087620258331299, 4.175756454467773, 4.13890266418457, 4.37426233291626, 4.451018333435059, 4.428545951843262, 4.351268768310547, 4.77366828918457, 4.336379528045654, 4.468376159667969, 4.276070594787598, 4.679646015167236, 4.45733642578125, 4.164974689483643, 4.352800369262695, 4.230368137359619, 4.127799987792969, 4.248285293579102, 4.259462356567383, 4.407557964324951, 4.188188076019287, 4.2251434326171875, 4.437033653259277, 4.171760559082031, 4.302949905395508, 4.33207893371582, 4.228093147277832, 4.1444091796875, 4.244170188903809, 4.204620838165283, 4.23663854598999, 4.109025001525879, 4.2570295333862305, 4.344820976257324, 4.4315643310546875, 4.322415351867676, 4.246568202972412, 4.386229515075684, 4.422844886779785, 4.382418632507324, 4.181207180023193, 4.267822742462158, 4.417649269104004, 4.214499473571777, 4.211828231811523, 4.427647590637207, 4.444246292114258, 4.641022682189941, 4.195882320404053, 4.710150718688965, 4.359635353088379, 4.167028427124023, 3.966871738433838, 4.4800825119018555, 4.282137393951416, 4.47543478012085, 4.2036519050598145, 4.194433689117432, 4.213645935058594, 4.182260513305664, 4.401154518127441, 4.275806427001953, 4.345136642456055, 4.3392333984375, 4.223365783691406, 4.219459533691406, 4.505407333374023, 4.019986629486084, 4.222423076629639, 4.368701934814453, 4.261908531188965, 4.187310695648193, 4.129824161529541, 4.212278366088867, 4.010128498077393, 4.641143321990967, 3.9320435523986816, 4.375458240509033, 4.25233268737793, 4.176724910736084, 4.291342258453369, 4.262200832366943, 5.838709831237793, 4.366407871246338, 4.350784778594971, 4.059467315673828, 4.143363952636719, 4.183854103088379, 4.090530872344971, 4.138571739196777, 4.270321846008301, 4.280576229095459, 4.050135135650635, 4.185358047485352, 4.986708641052246, 4.163567066192627, 4.285399913787842, 4.460160255432129, 4.077131271362305, 4.3268561363220215, 4.19437837600708, 4.285844802856445, 4.306232452392578, 4.96861457824707, 4.885289192199707, 4.3940935134887695, 4.427262783050537, 4.383242607116699, 4.259993076324463, 4.137676239013672, 3.6425399780273438, 4.125176429748535, 4.489706993103027, 4.245267868041992, 4.30295991897583, 4.184880256652832, 4.268757343292236, 4.277680397033691, 4.258216381072998, 4.304605007171631, 4.062392234802246, 4.21595573425293, 4.359626770019531, 4.11599063873291, 4.341217994689941, 4.392623424530029, 4.1380462646484375, 3.8083910942077637, 3.8294453620910645, 4.231169700622559, 4.526943683624268, 4.197815895080566, 4.206820487976074, 4.242249488830566, 3.9058799743652344, 4.117184162139893, 4.319751262664795, 4.013702869415283, 4.081189155578613, 4.293310165405273, 4.166168689727783, 4.182324409484863, 4.226295471191406, 4.489058494567871, 4.211160659790039, 4.2037506103515625, 4.200260162353516, 4.297501087188721, 4.335294723510742, 4.083473205566406, 4.257363796234131, 4.2139434814453125, 4.233647346496582, 4.325885772705078, 4.239902973175049, 4.092810153961182, 3.9274213314056396, 4.16192626953125, 4.740105628967285, 4.283028602600098, 4.3591413497924805, 4.069772720336914, 4.423300266265869, 4.37336540222168, 4.28528356552124, 4.27839469909668, 4.487337112426758, 4.247189521789551, 4.244859218597412, 4.275550842285156, 4.2221574783325195, 4.0627241134643555, 4.260951995849609, 4.166237831115723, 4.044866561889648, 4.038152694702148, 4.425211429595947, 4.855198860168457, 4.551351547241211, 4.19449520111084, 4.40277099609375, 4.23489236831665, 4.246706485748291, 4.321477890014648, 3.92756986618042, 4.467064380645752, 4.222682952880859, 4.212358474731445, 4.962619781494141, 4.102860450744629, 4.2816548347473145, 4.351499557495117, 4.282650470733643, 4.019932270050049, 3.5164132118225098, 4.198305130004883, 4.49186372756958, 4.180364608764648, 4.215755939483643, 4.3448686599731445, 4.129245758056641, 4.2035112380981445, 4.162312984466553, 4.327695846557617, 4.284080505371094, 3.839127540588379, 4.0150628089904785, 4.3439836502075195, 4.096108436584473, 4.181279182434082, 4.14300537109375, 4.180846214294434, 4.112636566162109, 4.249194145202637, 4.1383280754089355, 4.281322956085205, 4.117767333984375, 4.210921287536621, 4.051977157592773, 4.131902694702148, 4.078474044799805, 4.44895076751709, 4.201190948486328, 4.0191650390625, 4.195743560791016, 4.310957908630371, 4.193530082702637, 4.2266950607299805, 4.216564655303955, 4.407155990600586, 4.370973587036133, 3.993978977203369, 4.239544868469238, 4.259450912475586, 4.2459211349487305, 4.165334224700928, 4.230429649353027, 4.0934858322143555, 4.233184814453125, 4.286673545837402, 4.320340156555176, 4.311260223388672, 4.163056373596191, 4.180851936340332, 4.297900199890137, 4.391635894775391, 4.253342151641846, 4.520078659057617, 4.182233810424805, 4.230435371398926, 4.300019264221191, 4.102210998535156, 4.301731109619141, 4.507980823516846, 4.236392021179199, 4.059660911560059, 4.1490092277526855, 4.326017379760742, 4.221443176269531, 4.221739768981934, 4.6176347732543945, 5.11277961730957, 4.045273303985596, 4.226232528686523, 4.181796073913574, 4.134302616119385, 4.115663528442383, 4.057239055633545, 4.199695587158203, 4.233894348144531, 4.084878444671631, 4.322179794311523, 4.398982048034668, 4.150753021240234, 4.313374042510986, 4.285088539123535, 4.262106418609619, 4.399604320526123, 4.112414360046387, 4.313896179199219, 4.157466411590576, 4.093758583068848, 4.231403350830078, 4.266066551208496, 4.224170207977295, 4.293574333190918, 4.337874889373779, 4.312197685241699, 4.3506975173950195, 4.254472732543945, 4.3358612060546875, 4.064680099487305, 4.354307651519775, 4.237735748291016, 4.357088088989258, 4.14845085144043, 4.094527721405029, 4.217329978942871, 3.9314756393432617, 4.219965934753418, 4.26154899597168, 4.405339241027832, 4.178777694702148, 4.013783931732178, 4.27418327331543, 4.361069679260254, 4.292669773101807, 4.274868965148926, 4.281776428222656, 4.114704132080078, 4.256260395050049, 4.103131294250488, 4.135802745819092, 3.8962478637695312, 4.054253101348877, 4.439830303192139, 4.016697883605957, 4.195769309997559, 4.343570232391357, 3.9376158714294434, 4.316971778869629, 4.285904884338379, 4.10219669342041, 4.201796531677246, 4.1892194747924805, 4.146103858947754, 3.9485912322998047, 4.151423454284668, 4.286223411560059, 4.352665424346924, 4.257565975189209, 4.088720321655273, 4.1783647537231445, 4.061774253845215, 4.2545013427734375, 4.2897844314575195, 3.993875026702881, 4.267080307006836, 3.9624853134155273, 4.08323860168457, 4.181159496307373, 4.130045413970947, 4.235390663146973, 4.353363037109375, 3.9568519592285156, 4.389550685882568, 4.111332893371582, 4.081854820251465, 4.211109161376953, 4.3120317459106445, 4.241232872009277, 4.071389198303223, 3.9932847023010254, 4.132630348205566, 4.222101211547852, 4.286444664001465, 4.388708114624023, 4.273723602294922, 4.1941728591918945, 4.377382755279541, 4.27571439743042, 4.535554885864258, 4.387587547302246, 4.187480926513672, 4.277263641357422, 4.187795162200928, 4.466029167175293, 4.18294095993042, 4.145617961883545, 4.944256782531738, 4.496950626373291, 4.204298496246338, 4.119197845458984, 4.3831987380981445, 4.075118064880371, 4.410699844360352, 4.322941780090332, 4.262507438659668, 4.172433853149414, 3.985879421234131, 4.3953776359558105, 4.177298545837402, 4.304408073425293, 4.567416191101074, 4.113056182861328, 4.0667266845703125, 4.364598751068115, 4.126247882843018, 4.272877216339111, 3.9348316192626953, 4.249447822570801, 4.0436296463012695, 4.250194549560547, 4.302529335021973, 4.2349042892456055, 4.050365447998047, 4.105302810668945, 4.278134346008301, 4.2580060958862305, 4.373950958251953, 4.297821998596191, 4.104670524597168, 4.040158271789551, 4.1623735427856445, 4.1950201988220215, 4.325746536254883, 4.323770523071289, 4.278029918670654, 4.160097599029541, 4.166085243225098, 4.397792816162109, 4.428893089294434, 3.9644877910614014, 3.9035696983337402, 4.091037273406982, 4.124573707580566, 3.9191527366638184, 4.165384769439697, 4.234973907470703, 4.099995136260986, 4.280028820037842, 4.148972034454346, 4.076858043670654, 4.115941047668457, 4.450223445892334, 4.488321304321289, 4.297933578491211, 4.288537502288818, 4.4755096435546875, 4.136075973510742, 4.071236610412598, 4.281416416168213, 4.028197288513184, 4.2877984046936035, 4.048336982727051, 4.295154094696045, 4.241094589233398, 4.4265241622924805, 4.308538436889648, 4.126157760620117, 4.231180667877197, 4.158215045928955, 3.96221661567688, 3.868143081665039, 4.140131950378418, 4.042743682861328, 4.275500297546387, 4.109449863433838, 4.134204387664795, 4.691594123840332, 4.311809539794922, 4.358116149902344, 4.131664276123047, 4.15052604675293, 4.054043769836426, 3.7686619758605957, 3.982231616973877, 4.167679786682129, 4.315960884094238, 3.894105911254883, 4.026004314422607, 4.359675407409668, 4.116944313049316, 4.164610862731934, 3.8756563663482666, 3.9359405040740967, 3.92507004737854, 4.014708042144775, 4.334940433502197, 4.238495826721191, 3.979846239089966, 4.153012275695801, 3.7798550128936768, 4.167167663574219, 4.14061975479126, 4.121240139007568, 4.293854713439941, 4.269200325012207, 3.4726555347442627, 4.1413373947143555, 3.5471296310424805, 2.756226062774658, 4.203390121459961, 4.014345169067383, 4.282315731048584, 4.208809852600098, 3.72624135017395, 3.883558750152588, 4.118342876434326, 4.133075714111328, 4.118875980377197, 4.325016975402832, 4.22998571395874, 3.4504098892211914, 4.16847038269043, 3.988898754119873, 4.493659973144531, 4.174571990966797, 4.630771636962891, 4.281399250030518, 4.249677658081055, 4.2336106300354, 4.549671173095703, 4.04408073425293, 4.1565093994140625, 4.030978679656982, 4.126006126403809, 4.287109375, 4.181469917297363, 4.039124488830566, 4.194437026977539, 3.9909870624542236, 4.180449962615967, 4.088478088378906, 4.659763336181641, 4.236098289489746, 4.208798408508301, 4.317669868469238, 4.172853946685791, 3.948671340942383, 3.829883575439453, 4.09135627746582, 4.162932395935059, 4.276127815246582, 4.244421482086182, 4.364548206329346, 4.2681498527526855, 4.282164096832275, 4.028791904449463, 4.128127574920654, 4.420255184173584, 4.274155139923096, 4.0355305671691895, 4.294239044189453, 3.92844295501709, 4.295342922210693, 4.175649166107178, 4.102450370788574, 4.298903942108154, 4.153154373168945, 4.031442642211914, 4.2733540534973145, 4.383846759796143, 4.212925910949707, 4.012530326843262, 4.145806312561035, 3.7472660541534424, 3.9702365398406982, 3.936947822570801, 4.284649848937988, 4.256521224975586, 4.335932731628418, 4.221901893615723, 3.9431538581848145, 4.207545757293701, 4.352723598480225, 4.15814208984375, 4.364546775817871, 4.176004409790039, 4.429988861083984, 4.296291351318359, 3.993825912475586, 4.251561164855957, 4.110325336456299, 4.14799690246582, 4.086018085479736, 4.39232063293457, 4.351445198059082, 4.152167320251465, 4.209602355957031, 4.210575580596924, 4.1270270347595215, 5.485086441040039, 5.945805549621582, 4.8789448738098145, 4.050599098205566, 4.1918792724609375, 4.0568718910217285, 4.11468505859375, 3.901945114135742, 4.138473987579346, 4.532285690307617, 4.3665337562561035, 3.955838203430176, 3.9703450202941895, 4.07780647277832, 3.8408095836639404, 4.17299222946167, 4.196587562561035, 4.212964057922363, 4.062148094177246, 4.273719787597656, 4.048421382904053, 4.168225288391113, 4.190276145935059, 4.161001682281494, 4.154969215393066, 4.153336524963379, 4.1433939933776855, 4.261441230773926, 4.015391826629639, 4.133968830108643, 4.458542823791504, 4.199811935424805, 4.30061674118042, 4.231273651123047, 4.283871650695801, 4.169659614562988, 4.286855697631836, 4.066490173339844, 4.087850570678711, 4.253747940063477, 4.080256462097168, 4.168208122253418, 4.208613395690918, 4.7383952140808105, 4.355557441711426, 4.1612372398376465, 4.128218650817871, 4.336413860321045, 4.467682838439941, 4.073528289794922, 4.1449055671691895, 4.216506481170654, 4.20906925201416, 4.022058486938477, 3.9657578468322754, 3.999091386795044, 4.064831733703613, 4.213286399841309, 3.681532859802246, 4.217747688293457, 4.098006725311279, 3.9634885787963867, 4.195923805236816, 4.282148361206055, 4.331663131713867, 4.295760154724121, 4.48205041885376, 3.962670087814331, 4.090608596801758, 4.233601093292236, 4.018219947814941, 4.668906211853027, 3.864694118499756, 4.265557289123535, 4.172113418579102, 4.170655727386475, 4.177330493927002, 4.2154693603515625, 4.105981826782227, 4.409732818603516, 4.19294548034668, 4.112683296203613, 4.147183895111084, 4.181368827819824, 4.235335826873779, 4.203394889831543, 4.054993629455566, 4.193406105041504, 4.164891719818115, 4.082619667053223, 4.191827297210693, 4.094283580780029, 3.975356101989746, 4.087320327758789, 4.247622489929199, 4.226038932800293, 4.378265380859375, 4.111093521118164, 4.2068915367126465, 4.186242580413818, 4.442132949829102, 4.146661281585693, 4.081847667694092, 4.0956315994262695, 4.118494510650635, 4.236449241638184, 4.191218852996826, 4.14753532409668, 4.256051063537598, 4.308516502380371, 4.573897838592529, 4.52691650390625, 3.9828696250915527, 4.362272262573242, 4.135831832885742, 3.778903007507324, 3.7284719944000244, 4.15872859954834, 4.176535606384277, 4.0320539474487305, 4.134776592254639, 3.8737168312072754, 4.023599624633789, 4.461556434631348, 4.203329086303711, 4.117402076721191, 4.193005561828613, 4.036165237426758, 4.117905616760254, 4.14380407333374, 3.83855938911438, 4.00834321975708, 4.162242889404297, 4.156549453735352, 4.122219085693359, 4.024843215942383, 4.06915807723999, 3.945195198059082, 4.181414604187012, 4.1090593338012695, 3.645662307739258, 4.08977746963501, 4.0881547927856445, 4.1473469734191895, 4.1896772384643555, 4.328010559082031, 4.177835941314697, 4.254972457885742, 4.042157173156738, 4.433697700500488, 4.129250526428223, 4.039806842803955, 4.323667526245117, 3.958538055419922, 4.21470832824707, 4.2259674072265625, 4.165935039520264, 3.975083827972412, 4.073018550872803, 4.256790637969971, 3.977909564971924, 4.138136863708496, 4.181705474853516, 4.398221492767334, 4.268020153045654, 4.327235221862793, 4.04843282699585, 4.687609672546387, 4.402204513549805, 4.309200286865234, 4.278319358825684, 4.232555866241455, 3.9201436042785645, 4.2329559326171875, 4.203429222106934, 4.047345161437988, 4.095306396484375, 4.205770015716553, 4.001582145690918, 4.244316577911377, 4.122546195983887, 4.389925003051758, 4.206646919250488, 4.147788047790527, 4.0335259437561035, 4.131325721740723, 3.9073572158813477, 4.250366687774658, 4.374269485473633, 4.215432643890381, 4.348766326904297, 4.1903486251831055, 4.0665435791015625, 3.962965965270996, 4.239500999450684, 4.095334053039551, 4.094165802001953, 4.192213535308838, 4.091174125671387, 4.292082786560059, 4.119451999664307, 4.119606018066406, 4.167629241943359, 4.082250595092773, 4.227156162261963, 4.267302989959717, 4.256650924682617, 4.346566677093506, 4.470975875854492, 4.212507247924805, 4.130882263183594, 3.930337905883789, 3.952258825302124, 5.323455333709717, 4.0680036544799805, 4.180942535400391, 4.040268421173096, 3.9968276023864746, 3.9733824729919434, 4.188676357269287, 4.153125762939453, 4.1602020263671875, 4.187422275543213, 4.2123823165893555, 4.152731418609619, 4.248707294464111, 4.231567859649658, 4.258962154388428, 4.2441487312316895, 4.1744184494018555, 3.8551783561706543, 3.968466281890869, 4.0291595458984375, 4.18897008895874, 4.201340675354004, 4.206653594970703, 4.172746658325195, 4.16522216796875, 4.1633076667785645, 4.22209358215332, 3.980678081512451, 4.267090320587158, 4.1287713050842285, 4.19757604598999, 4.234505653381348, 3.8384058475494385, 3.9286580085754395, 4.252618789672852, 4.070799350738525, 4.320173263549805, 4.032815933227539, 3.9678292274475098, 3.9135918617248535, 4.14968204498291, 4.314751625061035, 4.294125556945801, 3.8316116333007812, 4.366088390350342, 4.190873146057129, 4.059250354766846, 4.1372785568237305, 4.0698323249816895, 4.348509311676025, 4.393819808959961, 4.2512617111206055, 4.203632831573486, 4.287508964538574, 4.132565498352051, 4.593428611755371, 4.362709045410156, 3.9722723960876465, 4.080571174621582, 3.9840333461761475, 3.8303070068359375, 4.091546535491943, 4.069828033447266, 4.132260799407959, 4.118812084197998, 4.571453094482422, 4.161183834075928, 4.112420082092285, 4.1026387214660645, 4.077644348144531, 4.274394989013672, 4.246309280395508, 4.1612067222595215, 4.058719635009766, 4.282556533813477, 4.4582014083862305, 4.054651260375977, 4.3817033767700195, 4.521416664123535, 4.0720109939575195, 4.54472541809082, 3.9982237815856934, 3.700819253921509, 3.9358527660369873, 4.422046661376953, 3.994645118713379, 4.0674333572387695, 3.356579065322876, 4.239351272583008, 4.508436679840088, 4.231451034545898, 4.748430252075195, 4.647617340087891, 4.088310718536377, 4.1728129386901855, 4.0113067626953125, 4.521519660949707, 4.511984348297119, 3.965268135070801, 4.173161506652832, 3.871868371963501, 3.9625325202941895, 4.161534309387207, 4.280134201049805, 4.077450752258301, 4.123288154602051, 4.04979133605957, 4.290249347686768, 4.016257286071777, 4.024691581726074, 4.14553165435791, 4.72856330871582, 4.122197151184082, 4.16234016418457, 4.252353191375732, 4.222760200500488, 4.152792930603027, 4.192826271057129, 4.132286071777344, 3.965315818786621, 4.123544692993164, 4.200613498687744, 4.193365097045898, 4.158108711242676, 4.05985164642334, 4.357475280761719, 4.271913528442383, 4.074780464172363, 4.249312400817871, 4.181905746459961, 4.121544361114502, 4.217741012573242, 4.165465354919434, 4.134964942932129, 4.039527893066406, 4.194591045379639, 4.07050895690918, 3.9765777587890625, 3.962222099304199, 4.196144104003906, 4.263216972351074, 4.325608730316162, 4.222038269042969, 4.157502174377441, 4.273443222045898, 4.193684101104736, 4.105522155761719, 4.008518218994141, 4.118495941162109, 4.3005499839782715, 4.296751022338867, 3.8525891304016113, 4.026284694671631, 4.146585464477539, 4.251025199890137, 3.958803653717041, 4.056631565093994, 3.6569485664367676, 4.306647777557373, 3.8703317642211914, 4.1531982421875, 6.443966865539551, 4.278071880340576, 4.250846862792969, 3.9991636276245117, 4.029880523681641, 4.0435991287231445, 4.212264060974121, 4.123239517211914, 4.33540678024292, 4.0343217849731445, 4.079122543334961, 4.244582176208496, 4.117464065551758, 4.216316223144531, 4.202424049377441, 4.234809875488281, 4.200255870819092, 3.8110275268554688, 4.236865043640137, 4.222923278808594, 4.304635047912598, 4.2116241455078125, 3.997800827026367, 4.140721321105957, 4.192744255065918, 4.251949310302734, 4.173130035400391, 4.074679374694824, 3.880568742752075, 4.33234977722168, 4.366873741149902, 3.9617204666137695, 4.284088134765625, 3.8772895336151123, 4.0654497146606445, 4.083844184875488, 4.072725296020508, 4.121888160705566, 4.22421932220459, 4.12727165222168, 4.247647762298584, 4.110664367675781, 4.0562968254089355, 4.413062572479248, 4.052563190460205, 4.041775703430176, 4.1705427169799805, 4.162955284118652, 4.104740142822266, 4.008851051330566, 4.152710437774658, 3.7183079719543457, 3.946319580078125, 4.0469207763671875, 4.185873985290527, 4.049745082855225, 4.219881057739258, 3.987189292907715, 4.068037986755371, 4.254233360290527, 4.107691764831543, 3.972059726715088, 4.038478374481201, 4.264404296875, 4.097817420959473, 4.318399429321289, 4.3983683586120605, 4.117332458496094, 4.273731231689453, 4.074346542358398, 4.219959259033203, 4.101263046264648, 4.34505033493042, 4.066927909851074, 4.454907417297363, 4.214720726013184, 4.202031135559082, 4.021788597106934, 4.137267112731934, 4.026512145996094, 3.9998624324798584, 4.122695446014404, 4.307619094848633, 4.165226936340332, 4.305838584899902, 4.080449104309082, 3.9905295372009277, 4.437692642211914, 4.010357856750488, 4.083042144775391, 4.171095848083496, 4.142158508300781, 4.024046421051025, 3.8722686767578125, 4.307305812835693, 3.9153456687927246, 3.980376720428467, 4.130979537963867, 4.200815200805664, 4.386656284332275, 3.643491506576538, 4.046926498413086, 4.176341533660889, 3.8637194633483887, 3.870450735092163, 4.100340843200684, 4.277782917022705, 4.246711730957031, 4.016734600067139, 4.118544101715088, 4.278434753417969, 4.044979572296143, 3.9660327434539795, 3.8192150592803955, 4.123806476593018, 4.056788444519043, 4.154642105102539, 4.232128143310547, 4.19545316696167, 4.019596576690674, 4.192539215087891, 4.052726745605469, 4.143331527709961, 4.175405025482178, 4.191734313964844, 3.9930567741394043, 4.172726631164551, 4.077247619628906, 4.217717170715332, 4.213253021240234, 3.9684958457946777, 3.6257996559143066, 3.9076504707336426, 4.0376691818237305, 4.125872611999512, 4.2209672927856445, 3.9675755500793457, 4.088873386383057, 4.096818923950195, 4.160441875457764, 4.158102035522461, 4.152889251708984, 4.096251964569092, 4.278035640716553, 3.913858413696289, 4.069052219390869, 4.318549633026123, 4.069217681884766, 4.05183219909668, 4.231056213378906, 4.253722190856934, 4.141205310821533, 3.9445009231567383, 3.867018699645996, 4.412681579589844, 3.9094369411468506, 4.3752288818359375, 3.7913403511047363, 4.25661563873291, 4.166767120361328, 4.087949275970459, 3.977940559387207, 3.794344902038574, 3.8555428981781006, 4.322710990905762, 3.8759543895721436, 3.949781894683838, 4.050934791564941, 4.112959861755371, 4.186385631561279, 3.98437237739563, 4.110271453857422, 4.012667655944824, 4.227173805236816, 3.998908758163452, 4.25160026550293, 4.057765960693359, 4.120146751403809, 4.213200569152832, 4.030586242675781, 4.070687770843506, 4.279223918914795, 4.203413963317871, 4.0647783279418945, 3.9426207542419434, 4.175542831420898, 4.346132278442383, 4.267564296722412, 4.009281158447266, 4.15690803527832, 4.230964660644531, 4.08057165145874, 4.142722129821777, 4.167194843292236, 4.322077751159668, 4.248531341552734, 3.924417734146118, 4.236125469207764, 4.025909423828125, 4.032668113708496, 4.322654724121094, 4.1435394287109375, 4.013883113861084, 4.0732340812683105, 4.0595808029174805, 4.100093841552734, 4.099418640136719, 4.254584312438965, 3.771042823791504, 4.007282733917236, 3.9459455013275146, 4.043580055236816, 4.073174953460693, 3.7668662071228027, 4.050930976867676, 4.278558731079102, 4.014260768890381, 3.9662184715270996, 4.040029525756836, 4.016942977905273, 3.8447422981262207, 3.5899624824523926, 3.8909873962402344, 4.256773948669434, 4.0873332023620605, 4.287974834442139, 3.845393180847168, 3.9184579849243164, 3.738870143890381, 4.013980388641357, 4.438083648681641, 4.177350997924805, 4.082887649536133, 4.15153694152832, 4.167808532714844, 4.058444023132324, 4.358309268951416, 4.282236099243164, 4.060520172119141, 3.9603826999664307, 4.185303688049316, 3.9820494651794434, 4.159906387329102, 4.179656982421875, 4.237732887268066, 4.570000648498535, 4.214818477630615, 4.122244358062744, 3.694856882095337, 3.530029773712158, 3.9822940826416016, 4.202032089233398, 4.2750654220581055, 4.139943599700928, 3.944521188735962, 4.0196027755737305, 4.190411567687988, 4.220381259918213, 4.53651237487793, 4.054511070251465, 4.191539764404297, 4.358905792236328, 4.088437080383301, 4.291585445404053, 4.096951961517334, 4.249785423278809, 3.8894057273864746, 4.054699897766113, 4.150724411010742, 3.983006000518799, 4.411593437194824, 3.877979278564453, 3.9523398876190186, 4.065084934234619, 4.008505344390869, 4.023576736450195, 3.836841583251953, 4.111789226531982, 4.056621074676514, 4.006167411804199, 3.9092392921447754, 4.16662073135376, 4.086616516113281, 4.218842506408691, 3.955021619796753, 4.14276123046875, 4.11458683013916, 4.183340549468994, 4.013271808624268, 4.004857063293457, 4.313018798828125, 4.151974201202393, 4.1061553955078125, 4.2602033615112305, 3.9970390796661377, 4.2552409172058105, 4.1789231300354, 4.134116172790527, 4.179043769836426, 4.01945686340332, 4.410824298858643, 4.0991411209106445, 4.112720966339111, 4.139158725738525, 4.187979698181152, 3.9644064903259277, 4.1158857345581055, 3.864170551300049, 4.092930793762207, 4.192914962768555, 4.114784240722656, 4.091975212097168, 4.042542457580566, 4.215063571929932, 4.2556304931640625, 4.101824760437012, 4.012117385864258, 4.333005905151367, 4.0716729164123535, 4.341628074645996, 3.9320449829101562]
+22:15:04.513: val_losses={0: 10.825837135314941, 125: 6.163179397583008, 250: 5.740232944488525, 375: 5.446574687957764, 500: 5.180050849914551, 625: 5.013510704040527, 750: 4.893640518188477, 875: 4.805034637451172, 1000: 4.734495639801025, 1125: 4.675285816192627, 1250: 4.623010158538818, 1375: 4.574784755706787, 1500: 4.540041923522949, 1625: 4.531297206878662, 1750: 4.484366416931152, 1875: 4.452047824859619, 2000: 4.430757999420166, 2125: 4.40949821472168, 2250: 4.390087604522705, 2375: 4.370331764221191, 2500: 4.353917598724365, 2625: 4.333449363708496, 2750: 4.293867111206055, 2875: 4.270697116851807, 3000: 4.242500305175781, 3125: 4.214794635772705, 3250: 4.193683624267578, 3375: 4.173152923583984, 3500: 4.151612281799316, 3625: 4.133955478668213, 3750: 4.1192145347595215, 3875: 4.108733177185059, 4000: 4.103209972381592}
+22:15:19.478: Renamed logs/79d06739-58e3-4438-b694-00538f96448e.txt -> logs/20250204_SSMax4000.txt
+22:15:19.481: peak memory allocated: 5307 MiB reserved: 7178 MiB

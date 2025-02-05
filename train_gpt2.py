@@ -292,7 +292,7 @@ class CausalSelfAttention(nn.Module):
         # Scalable-Softmax params
         # Using 1/log(512) to approximately negate the log(n), assuming 512 is the average window_size (unchecked).
         # This hasn't been tuned. Assuming that self.attn_scale was tuned, so trying to avoid deviating too much.
-        self.softmax_temps = nn.Parameter(1/torch.tensor([512] * num_heads).log())
+        # self.softmax_temps = nn.Parameter(1/torch.tensor([512] * num_heads).log())
 
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, logn: Tensor):
@@ -302,7 +302,7 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         # Apply Scalable-Softmax
-        q = q * self.softmax_temps[None, None, :, None] * logn.type_as(q)[None, :, None, None]
+        # q = q * self.softmax_temps[None, None, :, None] * logn.type_as(q)[None, :, None, None]
 
         if ve is not None:
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977

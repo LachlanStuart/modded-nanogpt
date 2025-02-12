@@ -294,6 +294,8 @@ class CausalSelfAttention(nn.Module):
         # This hasn't been tuned. Assuming that self.attn_scale was tuned, so trying to avoid deviating too much.
         self.softmax_temps = nn.Parameter(1/torch.tensor([512] * num_heads).log())
 
+        self.softmax_voids = nn.Parameter(torch.tensor([0.0] * num_heads))
+
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, logn: Tensor):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -308,7 +310,14 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = self.lambdas[0] * v
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale)
+        y, lse = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale, return_lse=True)
+
+        void_lse = (self.softmax_voids[None, :, None] + logn[None, None, :])
+        max_lse = torch.maximum(lse, void_lse)
+        lse = (lse - max_lse).exp2()
+        void_lse = (void_lse - max_lse).exp2()
+        frac_lse = void_lse / (lse + void_lse)
+        y = y * frac_lse.type_as(y).unsqueeze(-1)
         y = y.transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)

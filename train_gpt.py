@@ -289,12 +289,6 @@ class CausalSelfAttention(nn.Module):
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
-        # Scalable-Softmax params
-        # Using 1/log(512) to approximately negate the log(n), assuming 512 is the average window_size (unchecked).
-        # This hasn't been tuned. Assuming that self.attn_scale was tuned, so trying to avoid deviating too much.
-        self.softmax_temps = nn.Parameter(1/torch.tensor([512] * num_heads).log())
-
-        self.softmax_voids = nn.Parameter(torch.tensor([0.0] * num_heads))
 
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, logn: Tensor):
@@ -303,8 +297,6 @@ class CausalSelfAttention(nn.Module):
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
-        # Apply Scalable-Softmax
-        q = q * self.softmax_temps[None, None, :, None] * logn.type_as(q)[None, :, None, None]
 
         if ve is not None:
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
@@ -312,12 +304,6 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v
         y, lse = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale, return_lse=True)
 
-        void_lse = (self.softmax_voids[None, :, None] + logn[None, None, :])
-        max_lse = torch.maximum(lse, void_lse)
-        lse = (lse - max_lse).exp2()
-        void_lse = (void_lse - max_lse).exp2()
-        frac_lse = void_lse / (lse + void_lse)
-        y = y * frac_lse.type_as(y).unsqueeze(-1)
         y = y.transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -1464,7 +1450,6 @@ if custom_logfile := len(sys.argv) > 1:
 else:
     run_id = uuid.uuid4()
 def main(args = TEST_HPARAMS):
-# def main(args = DEV_HPARAMS):
     global master_process, logfile
     # torchrun sets these env variables
     rank = int(os.environ["RANK"])

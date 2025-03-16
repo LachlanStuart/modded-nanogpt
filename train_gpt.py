@@ -282,7 +282,7 @@ class CausalSelfAttention(nn.Module):
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
-        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.ve_residual = MPResidual(0.5)
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
@@ -299,9 +299,7 @@ class CausalSelfAttention(nn.Module):
         q, k = self.rotary(q), self.rotary(k)
 
         if ve is not None:
-            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
-        else: # skip mid-layers token value embeddings by @YouJiacheng
-            v = self.lambdas[0] * v
+            v = self.ve_residual(v, ve.view_as(v)) # @KoszarskyB & @Grad62304977
         y, lse = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale, return_lse=True)
 
         y = y.transpose(1, 2)
@@ -310,10 +308,10 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MPResidual(nn.Module):
-    def __init__(self):
+    def __init__(self, initial_value=0.3):
         super().__init__()
         # "Magnitude preserving sum" from EDM2, but learnable
-        self.weight = nn.Parameter(torch.tensor(0.3))
+        self.weight = nn.Parameter(torch.tensor(initial_value))
 
     def forward(self, x: Tensor, y: Tensor):
         div = (self.weight ** 2 + (1 - self.weight) ** 2) ** 0.5
@@ -336,7 +334,7 @@ class MLP(nn.Module):
 class DynamicTanh(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.input_scale = nn.Parameter(torch.tensor(0.5))
+        self.input_scale = nn.Parameter(torch.tensor(0.05))
         self.weight = nn.Parameter(torch.ones(dim))
         self.bias = nn.Parameter(torch.zeros(dim))
 
@@ -348,16 +346,18 @@ class Block(nn.Module):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.attn_residual = MPResidual() if layer_idx != 7 else None
+        self.attn_residual = MPResidual(0.4) if layer_idx != 7 else None
+        self.attn_tanh = DynamicTanh(dim) if layer_idx != 7 else None
         self.mlp = MLP(dim)
-        self.mlp_residual = MPResidual()
-        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+        self.mlp_residual = MPResidual(0.1)
+        self.mlp_tanh = DynamicTanh(dim)
+        self.start_residual = MPResidual(0.0)
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask, logn: Tensor):
-        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x = self.start_residual(x, x0)
         if self.attn is not None:
-            x = self.attn_residual(x, self.attn(norm(x), ve, block_mask, logn))
-        x = self.mlp_residual(x, self.mlp(norm(x)))
+            x = self.attn_residual(x, self.attn(self.attn_tanh(x), ve, block_mask, logn))
+        x = self.mlp_residual(x, self.mlp(self.mlp_tanh(x)))
         return x
 
 class ValueEmbedding(nn.Module):
@@ -448,7 +448,7 @@ class GPT(nn.Module):
         self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
         self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
-        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+        self.skip_residuals = nn.ModuleList([MPResidual() for _ in range(self.num_decoder_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         # self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
@@ -481,7 +481,7 @@ class GPT(nn.Module):
         logns.reverse()
         assert len(block_masks) == self.num_decoder_layers
         for i, block in enumerate(self.blocks[self.num_encoder_layers:]):
-            x = x + self.skip_weights[i] * skip_connections.pop()
+            x = self.skip_residuals[i](x, skip_connections.pop())
             x = block(x, ve_dec[i], x0, block_masks[i], logns[i])
 
         x = norm(x)

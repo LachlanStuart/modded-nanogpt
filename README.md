@@ -4,11 +4,27 @@ This is not a competition attempt! I'm just doing small-scale experiments, and M
 
 Licenses: This repository combines several independently-licensed sources, each of which requires its own notice to be distributed - see the `LICENSE` files.
 
+## 2025-03-16 Magnitude-preserving residual path
+
+Quick test of whether [EDM2](https://arxiv.org/abs/2312.02696)'s "Magnitude-preserving sum" on the residual path can be used in isolation. @FutureXiang [noted](https://github.com/FutureXiang/edm2?tab=readme-ov-file#results) that using the full suite of magnitude-preserving operations drastically slows convergence. Adding this to the residual path should give the benefit of post-norm without needing the post-norm. This should also address the [curse of depth](https://arxiv.org/abs/2502.05795), allowing deeper layers to remain effective.
+
+Unlike EDM2, the mixing coefficient is a learnable value.
+
+![](experiment_logs/20250316_MPResidual.png)
+
+"MP-Tanh-Mess" replaces every residual-like connection with a learned MPSum, and also uses Dynamic Tanh instead of prenorms.
+
+![](experiment_logs/20250316_MPMess.png)
+
+No obvious lessons from the learned values...
 
 ## 2025-03-16 Transformers without Normalization
 
-Tested out [Transformers without Normalization](https://arxiv.org/abs/2503.10622)
-The base NanoGPT model also uses QK norm, which may be a confounder.
+Tested out Dynamic Tanh from [Transformers without Normalization](https://arxiv.org/abs/2503.10622)
+
+* The base NanoGPT model also uses QK norm, which may be a confounder.
+* The overall model runs 5% slower (200ms -> 210ms per step). I guess the paper's results are only relevant to larger uncompiled models. Perhaps this needs a tanh approximation like in [this code](https://github.com/pytorch-labs/attention-gym/blob/main/attn_gym/mods/softcapping.py#L13-L28)
+
 
 ![](experiment_logs/20250316_DynamicTanh.png)
 
@@ -25,56 +41,65 @@ Learnings:
 4. One should probably ablate this without the QK norm, with uncursed depth, and applying this separately to Attn/MLP. Won't be me though. Slower steps rule it out for all my applications.
 
 ## 2025-02-04 Scalable-Softmax
-Testing out [Scalable-Softmax](https://arxiv.org/abs/2501.19399)
+Testing out [Scalable-Softmax](https://arxiv.org/abs/2501.19399) Results:
 
-Results:
-    * n_layers=12, d_model=384, n_heads=3
-    * `20250204_SSMax320M  `: step:20000/20000 val_loss:3.7410 step_avg:236.09ms train_time:4720s
-    * `20250204_NoSSMax320M`: step:20000/20000 val_loss:3.7385 step_avg:236.40ms train_time:4726s
-    * ![SSMax training curve showing near-identical loss with base run being slightly better](./experiment_logs/20250204_SSMax320M.png)
-    * Learned the following softmax scaling values:
-    ```
-    [[ 0.16308594,  0.12158203,  0.09863281],
-    [ 0.41992188,  0.26367188,  0.21582031],
-    [ 0.234375  ,  0.25585938,  0.26953125],
-    [ 0.20800781,  1.015625  ,  0.19238281],
-    [ 0.15625   ,  0.25390625,  0.22753906],
-    [ 0.21484375,  0.25390625,  0.2734375 ],
-    [ 0.22460938,  0.13769531,  0.20605469],
-    [ 0.2421875 , -0.13476562,  0.23339844],
-    [ 0.22558594,  0.19628906,  0.24511719],
-    [ 0.21972656,  0.21484375,  0.23242188],
-    [ 0.26757812,  0.2578125 ,  0.22949219]]
-    ```
-    * ![](./experiment_logs/20250311_SSMaxVoid320M.png)
-    * `SSMaxVoid` attempted to fix [Attention is off by one](https://www.evanmiller.org/attention-is-off-by-one.html), except using `alpha * log(n)` instead of `1` and learning `alpha`.
-    * Negative result: No significant difference. It just had a slight learning delay.
+* n_layers=12, d_model=384, n_heads=3
+* `20250204_SSMax320M  `: step:20000/20000 val_loss:3.7410 step_avg:236.09ms train_time:4720s
+* `20250204_NoSSMax320M`: step:20000/20000 val_loss:3.7385 step_avg:236.40ms train_time:4726s
 
-## 2025-02-02 Dabbling with attention & MoEUTs
+![SSMax training curve showing near-identical loss with base run being slightly better](./experiment_logs/20250204_SSMax320M.png)
 
-* Attempting to hack in attention KV sinks (skipping the qkv projection) using flex_attention's return_lse to combine 2 query results. 1k steps * 16k seqlen:
-    * baseline: `val_loss:4.6727 step_avg:154.44ms`
-    * 1 sink:   `val_loss:4.6840 step_avg:231.85ms`
-    * 8 sinks:  `val_loss:4.6780 step_avg:223.48ms`
-    * The 2 contexts need to be combined by lerping with `exp2(lse1) / (exp2(lse1) + esp2(lse2))`
-    * Just setting `return_lse=True` on `flex_attention()` causes some slowdown by itself.
-    * Total slowdown is much worse than one would expect based on FLOPS.
-    * This failure is likely due to Muon being a orthogonalizing optimizer and keeping qkv from exploding.
-    * 8 sinks optimized by Adam as scalars:  `val_loss:4.6776 step_avg:203.95ms`
-* MoEUT is slower but competitive with a smaller model
-    * 55M MoEUT: `val_loss:4.7876 step_avg:257.43ms`
-    * +LN->RMSNorm: `val_loss:5.0154 step_avg:255.81ms`
-    * +ReLU^2: nan @ step 9
-    * +RMSNorm MLP: `val_loss:5.4239 step_avg:251.43ms`
-    * +Adam Scalar on sel_: improved until step 500, then worsened back to init-levels by 900
-    * +Back to Muon, fix lr scaling (wasn't correcting for world_size 8 in original), tweaks to init: `val_loss:5.0411 step_avg:247.13ms`
-    * `20250202_MoEUT2_FixedSels`: Fixed initialization for sels, added lambdas in attention: `val_loss:4.9316 step_avg:266.86ms`
-    * `20250202_MoEUT2_Skips`: Added per-layer weights/gates & unet-skip connections (both good, latter better): `val_loss:4.8662 step_avg:247.70ms`
-    * `20250202_MoEUT2_ValueEmbeds`: Added value embeds - `val_loss:4.8793 step_avg:249.93ms`
-    * `20250202_MoEUT2_ValueEmbeds2`: Tweaked to only 2 value embeds - `val_loss:4.8520 step_avg:249.41ms`
-    * reverted: attk=4: `val_loss:4.8260 step_avg:260.60ms`
-    * reverted: att_experts=4: `val_loss:4.8825 step_avg:249.86ms`
-    * `20250202_MoEUT2_x0skips`: Add skips back to x0 - `val_loss:4.8208 step_avg:253.83ms`
+Learned the following softmax scaling values:
+
+```
+[[ 0.16308594,  0.12158203,  0.09863281],
+[ 0.41992188,  0.26367188,  0.21582031],
+[ 0.234375  ,  0.25585938,  0.26953125],
+[ 0.20800781,  1.015625  ,  0.19238281],
+[ 0.15625   ,  0.25390625,  0.22753906],
+[ 0.21484375,  0.25390625,  0.2734375 ],
+[ 0.22460938,  0.13769531,  0.20605469],
+[ 0.2421875 , -0.13476562,  0.23339844],
+[ 0.22558594,  0.19628906,  0.24511719],
+[ 0.21972656,  0.21484375,  0.23242188],
+[ 0.26757812,  0.2578125 ,  0.22949219]]
+```
+
+![](./experiment_logs/20250311_SSMaxVoid320M.png)
+
+`SSMaxVoid` attempts to fix [Attention is off by one](https://www.evanmiller.org/attention-is-off-by-one.html), except using `alpha * log(n)` instead of `1` and learning `alpha`.
+* Negative result: No significant difference. It just had a slight learning delay.
+
+## 2025-02-02 Dabbling with attention
+
+Attempting to hack in attention KV sinks that skip the qkv projection, as proposed in [Massive Activations ...](https://arxiv.org/abs/2402.17762) using flex_attention's return_lse to combine 2 query results. 1k steps * 16k seqlen:
+
+* baseline: `val_loss:4.6727 step_avg:154.44ms`
+* 1 sink:   `val_loss:4.6840 step_avg:231.85ms`
+* 8 sinks:  `val_loss:4.6780 step_avg:223.48ms`
+* The 2 contexts need to be combined by lerping with `exp2(lse1) / (exp2(lse1) + esp2(lse2))`
+* Just setting `return_lse=True` on `flex_attention()` causes some slowdown by itself.
+* Total slowdown is much worse than one would expect based on FLOPS.
+* This failure is likely due to Muon being a orthogonalizing optimizer and keeping qkv from exploding.
+* 8 sinks optimized by Adam as scalars:  `val_loss:4.6776 step_avg:203.95ms`
+
+## 2025-02-02 Dabbling with MoEUTs
+
+MoEUT is slower but competitive with a smaller model
+
+* 55M MoEUT: `val_loss:4.7876 step_avg:257.43ms`
+* +LN->RMSNorm: `val_loss:5.0154 step_avg:255.81ms`
+* +ReLU^2: nan @ step 9
+* +RMSNorm MLP: `val_loss:5.4239 step_avg:251.43ms`
+* +Adam Scalar on sel_: improved until step 500, then worsened back to init-levels by 900
+* +Back to Muon, fix lr scaling (wasn't correcting for world_size 8 in original), tweaks to init: `val_loss:5.0411 step_avg:247.13ms`
+* `20250202_MoEUT2_FixedSels`: Fixed initialization for sels, added lambdas in attention: `val_loss:4.9316 step_avg:266.86ms`
+* `20250202_MoEUT2_Skips`: Added per-layer weights/gates & unet-skip connections (both good, latter better): `val_loss:4.8662 step_avg:247.70ms`
+* `20250202_MoEUT2_ValueEmbeds`: Added value embeds - `val_loss:4.8793 step_avg:249.93ms`
+* `20250202_MoEUT2_ValueEmbeds2`: Tweaked to only 2 value embeds - `val_loss:4.8520 step_avg:249.41ms`
+* reverted: attk=4: `val_loss:4.8260 step_avg:260.60ms`
+* reverted: att_experts=4: `val_loss:4.8825 step_avg:249.86ms`
+* `20250202_MoEUT2_x0skips`: Add skips back to x0 - `val_loss:4.8208 step_avg:253.83ms`
 
 
 

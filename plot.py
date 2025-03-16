@@ -18,7 +18,9 @@ def get_data_from_file(f: Path):
 ROOT = Path(__file__).parent
 RUNS = [
     {"name": "Softmax", "color": "blue", **get_data_from_file(ROOT / "experiment_logs/20250316_Softmax.txt")},
-    {"name": "Dynamic Tanh", "color": "red", **get_data_from_file(ROOT / "experiment_logs/20250316_DynamicTanh.txt")},
+    {"name": "MP-Residual", "color": "green", **get_data_from_file(ROOT / "experiment_logs/20250316_MPResidual.txt")},
+    {"name": "MP-Tanh-Mess", "color": "red", **get_data_from_file(ROOT / "experiment_logs/20250316_MPMess.txt")},
+    {"name": "MP-Tanh-Mess", "color": "cyan", **get_data_from_file(ROOT / "experiment_logs/20250316_DynamicTanh.txt")},
 ]
 
 plt.figure(figsize=(16, 10))
@@ -39,7 +41,7 @@ plt.ylabel('Loss')
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.show()
-plt.savefig("dynamic_tanh.png")
+plt.savefig("plot.png")
 
 
 if False:

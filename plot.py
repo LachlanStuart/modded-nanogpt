@@ -17,9 +17,8 @@ def get_data_from_file(f: Path):
 
 ROOT = Path(__file__).parent
 RUNS = [
-    {"name": "Base", "color": "blue", **get_data_from_file(ROOT / "experiment_logs/20250204_NoSSMax320M.txt")},
-    {"name": "SSMax", "color": "red", **get_data_from_file(ROOT / "experiment_logs/20250204_SSMax320M.txt")},
-    {"name": "SSVoid", "color": "green", **get_data_from_file(ROOT / "experiment_logs/20250211_SSMaxVoid320M.txt")},
+    {"name": "Softmax", "color": "blue", **get_data_from_file(ROOT / "experiment_logs/20250316_Softmax.txt")},
+    {"name": "Dynamic Tanh", "color": "red", **get_data_from_file(ROOT / "experiment_logs/20250316_DynamicTanh.txt")},
 ]
 
 plt.figure(figsize=(16, 10))
@@ -40,24 +39,25 @@ plt.ylabel('Loss')
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.show()
-plt.savefig("ssmax.png")
+plt.savefig("dynamic_tanh.png")
 
 
-## Analyse fineweb seq_len distribution
-# Load validation data
-val_data = np.fromfile('./data/fineweb1B/fineweb_val_000000.bin', dtype=np.uint16)
+if False:
+    ## Analyse fineweb seq_len distribution
+    # Load validation data
+    val_data = np.fromfile('./data/fineweb1B/fineweb_val_000000.bin', dtype=np.uint16)
 
-# Find document boundaries (50256) and calculate sequence lengths
-doc_ends = np.flatnonzero(val_data == 50256)
-seq_lengths = np.diff(doc_ends)
+    # Find document boundaries (50256) and calculate sequence lengths
+    doc_ends = np.flatnonzero(val_data == 50256)
+    seq_lengths = np.diff(doc_ends)
 
-# Create histogram
-plt.figure(figsize=(16, 10))
-plt.hist(seq_lengths, bins=np.geomspace(128, 128*1024, 21), alpha=0.7, log=True)
-plt.xlabel('Sequence Length')
-plt.ylabel('Count')
-plt.title('Distribution of Document Lengths')
-plt.grid(True, alpha=0.3)
-plt.gca().set_xscale("log", base=2)
-plt.gca().set_yscale("linear")
-plt.savefig("seq_lengths_hist.png")
+    # Create histogram
+    plt.figure(figsize=(16, 10))
+    plt.hist(seq_lengths, bins=np.geomspace(128, 128*1024, 21), alpha=0.7, log=True)
+    plt.xlabel('Sequence Length')
+    plt.ylabel('Count')
+    plt.title('Distribution of Document Lengths')
+    plt.grid(True, alpha=0.3)
+    plt.gca().set_xscale("log", base=2)
+    plt.gca().set_yscale("linear")
+    plt.savefig("seq_lengths_hist.png")

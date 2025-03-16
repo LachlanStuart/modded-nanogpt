@@ -309,6 +309,16 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
+class MPResidual(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # "Magnitude preserving sum" from EDM2, but learnable
+        self.weight = nn.Parameter(torch.tensor(0.3))
+
+    def forward(self, x: Tensor, y: Tensor):
+        div = (self.weight ** 2 + (1 - self.weight) ** 2) ** 0.5
+        return torch.lerp(x, y, self.weight) / div
+
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -338,16 +348,16 @@ class Block(nn.Module):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.attn_tanh = DynamicTanh(dim) if layer_idx != 7 else None
+        self.attn_residual = MPResidual() if layer_idx != 7 else None
         self.mlp = MLP(dim)
-        self.mlp_tanh = DynamicTanh(dim)
+        self.mlp_residual = MPResidual()
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask, logn: Tensor):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.attn(self.attn_tanh(x), ve, block_mask, logn)
-        x = x + self.mlp(self.mlp_tanh(x))
+            x = self.attn_residual(x, self.attn(norm(x), ve, block_mask, logn))
+        x = self.mlp_residual(x, self.mlp(norm(x)))
         return x
 
 class ValueEmbedding(nn.Module):
@@ -1656,7 +1666,7 @@ def main(args = TEST_HPARAMS):
         # logging
         if step < 20 or (step+1) % 50 == 0:
             approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-            print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} step_avg:{approx_time/timed_steps:.2f}ms train_time:{approx_time/1000:.0f}s {torch.cuda.max_memory_allocated()=}", console=True)
+            print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} step_avg:{approx_time/timed_steps:.2f}ms train_time:{approx_time/1000:.0f}s vram={torch.cuda.max_memory_allocated()/2**30:.2f}GiB", console=True)
 
     print0(f"{train_losses=}")
     print0(f"{val_losses=}")

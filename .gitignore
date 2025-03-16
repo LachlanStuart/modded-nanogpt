@@ -4,3 +4,4 @@ pylog124M/
 __pycache__/
 logs/
 .venv
+*.code-workspace

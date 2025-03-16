@@ -10,7 +10,7 @@ Licenses: This repository combines several independently-licensed sources, each 
 Tested out [Transformers without Normalization](https://arxiv.org/abs/2503.10622)
 The base NanoGPT model also uses QK norm, which may be a confounder.
 
-![](20250316_DynamicTanh.png)
+![](experiment_logs/20250316_DynamicTanh.png)
 
 Digging into the learned parameters in the final checkpoint:
 * Though `alpha` was initialized to 0.5, it learned drastically lower values that decreased in later layers. MLP had `[0.07, 0.05, 0.04, ..., 0.02]`, Attn had `[0.29, 0.11, 0.06, ..., 0.03]`.

@@ -323,19 +323,31 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+class DynamicTanh(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.input_scale = nn.Parameter(torch.tensor(0.5))
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: Tensor):
+        return torch.tanh(self.input_scale * x) * self.weight + self.bias
+
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, layer_idx: int, max_seq_len: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
+        self.attn_tanh = DynamicTanh(dim) if layer_idx != 7 else None
         self.mlp = MLP(dim)
+        self.mlp_tanh = DynamicTanh(dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask, logn: Tensor):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.attn(norm(x), ve, block_mask, logn)
-        x = x + self.mlp(norm(x))
+            x = x + self.attn(self.attn_tanh(x), ve, block_mask, logn)
+        x = x + self.mlp(self.mlp_tanh(x))
         return x
 
 class ValueEmbedding(nn.Module):

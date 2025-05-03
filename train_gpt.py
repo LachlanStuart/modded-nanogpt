@@ -22,6 +22,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
+from x_attention import x_attention
 
 # torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 import triton
@@ -340,7 +341,10 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v)  # @KoszarskyB & @Grad62304977
         else:  # skip mid-layers token value embeddings by @YouJiacheng
             v = self.lambdas[0] * v
-        y = flex_attention(
+        # y = flex_attention(
+        #     q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale
+        # ).transpose(1, 2)
+        y = x_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale
         ).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)  # re-assemble all head outputs side by side
@@ -613,7 +617,7 @@ else:
     run_id = uuid.uuid4()
 
 
-def main(args=TEST_HPARAMS):
+def main(args):
     global master_process, logfile
     # torchrun sets these env variables
     rank = int(os.environ["RANK"])
@@ -849,4 +853,5 @@ def main(args=TEST_HPARAMS):
 # endregion
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    main(DEV_HPARAMS)
+    # main(TEST_HPARAMS)

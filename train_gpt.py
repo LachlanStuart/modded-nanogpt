@@ -853,5 +853,5 @@ def main(args):
 # endregion
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    main(DEV_HPARAMS)
-    # main(TEST_HPARAMS)
+    # main(DEV_HPARAMS)
+    main(TEST_HPARAMS)

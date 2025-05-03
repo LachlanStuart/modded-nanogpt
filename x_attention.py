@@ -269,7 +269,6 @@ def x_attention(
         return_lse,
         kernel_options,
     )
-    score_mod = _identity
 
     if torch.compiler.is_dynamo_compiling():
         # mark head_dim and number of heads to be static
@@ -281,10 +280,10 @@ def x_attention(
             query,
             key,
             value,
-            score_mod,
             block_mask.as_tuple(),
             scale,
             kernel_options,  # type: ignore[union-attr]
+            (),
         )
         if return_lse:
             return out, lse * math.log(2)
@@ -315,10 +314,10 @@ def x_attention(
                         query,
                         key,
                         value,
-                        score_mod,
                         block_mask.as_tuple(),  # type: ignore[union-attr]
                         scale,
                         kernel_options,
+                        (),
                     )
                     if return_lse:
                         return out, lse * math.log(2)

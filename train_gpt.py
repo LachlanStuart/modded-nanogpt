@@ -6,7 +6,7 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 import atexit
 
@@ -19,6 +19,8 @@ import torch.distributed as dist
 from torch.profiler import profile, record_function, ProfilerActivity
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
+from torch._inductor.lowering import make_pointwise, register_lowering
+from torch._inductor.virtualized import ops
 # torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 import triton
 import triton.language as tl
@@ -112,6 +114,50 @@ def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
     ctx.set_materialize_grads(False)
 
 mm_op.register_autograd(backward, setup_context=setup_context)
+
+@torch.library.custom_op("approx::tanh", mutates_args=())
+def _tanh_approx(inp: Tensor) -> Tensor:
+    return torch.tanh(inp)
+
+
+@_tanh_approx.register_fake
+def _(inp: torch.Tensor) -> torch.Tensor:
+    return torch.tanh(inp)
+
+
+def _tanh_approx_lowering(inp):
+    fn = partial(ops.inline_asm_elementwise, asm="tanh.approx.f32 $0, $1;")
+    return make_pointwise(fn)(inp)
+
+
+register_lowering(torch.ops.approx.tanh)(_tanh_approx_lowering)
+
+
+class _TanhApprox(torch.autograd.Function):
+    """From https://github.com/pytorch-labs/attention-gym/blob/main/attn_gym/mods/softcapping.py#L13-L52"""
+    @staticmethod
+    def forward(x):
+        return torch.ops.approx.tanh(x.half()).to(x.dtype)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        (x,) = inputs
+        result = output
+        ctx.save_for_backward(result)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (result,) = ctx.saved_tensors
+        return grad_output * (1 - result * result)
+
+    @staticmethod
+    def vmap(info, in_dims, x):
+        return torch.tanh(x), 0
+
+
+_tanh_approx = _TanhApprox.apply
+
+
 #endregion
 # -----------------------------------------------------------------------------
 #region Muon optimizer
@@ -282,7 +328,7 @@ class CausalSelfAttention(nn.Module):
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
-        self.ve_residual = MPResidual(0.5)
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
@@ -299,23 +345,15 @@ class CausalSelfAttention(nn.Module):
         q, k = self.rotary(q), self.rotary(k)
 
         if ve is not None:
-            v = self.ve_residual(v, ve.view_as(v)) # @KoszarskyB & @Grad62304977
+            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
+        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = self.lambdas[0] * v
         y, lse = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale, return_lse=True)
 
         y = y.transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
-
-class MPResidual(nn.Module):
-    def __init__(self, initial_value=0.3):
-        super().__init__()
-        # "Magnitude preserving sum" from EDM2, but learnable
-        self.weight = nn.Parameter(torch.tensor(initial_value))
-
-    def forward(self, x: Tensor, y: Tensor):
-        div = (self.weight ** 2 + (1 - self.weight) ** 2) ** 0.5
-        return torch.lerp(x, y, self.weight) / div
 
 class MLP(nn.Module):
     def __init__(self, dim: int):
@@ -334,30 +372,28 @@ class MLP(nn.Module):
 class DynamicTanh(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.input_scale = nn.Parameter(torch.tensor(0.05))
+        self.input_scale = nn.Parameter(torch.tensor(0.5))
         self.weight = nn.Parameter(torch.ones(dim))
         self.bias = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: Tensor):
-        return torch.tanh(self.input_scale * x) * self.weight + self.bias
+        return torch.tanh(self.input_scale * x) # * self.weight + self.bias
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, layer_idx: int, max_seq_len: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.attn_residual = MPResidual(0.4) if layer_idx != 7 else None
         self.attn_tanh = DynamicTanh(dim) if layer_idx != 7 else None
         self.mlp = MLP(dim)
-        self.mlp_residual = MPResidual(0.1)
         self.mlp_tanh = DynamicTanh(dim)
-        self.start_residual = MPResidual(0.0)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask, logn: Tensor):
-        x = self.start_residual(x, x0)
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
-            x = self.attn_residual(x, self.attn(self.attn_tanh(x), ve, block_mask, logn))
-        x = self.mlp_residual(x, self.mlp(self.mlp_tanh(x)))
+            x = x + self.attn(self.attn_tanh(x), ve, block_mask, logn)
+        x = x + self.mlp(self.mlp_tanh(x))
         return x
 
 class ValueEmbedding(nn.Module):
@@ -448,7 +484,7 @@ class GPT(nn.Module):
         self.num_encoder_layers = num_layers // 2 # Half of the layers for encoder
         self.num_decoder_layers = num_layers - self.num_encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
-        self.skip_residuals = nn.ModuleList([MPResidual() for _ in range(self.num_decoder_layers)])
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         # self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=True, x_s=2.0, w_s=2.0**9, grad_s=2.0**19)
@@ -481,7 +517,7 @@ class GPT(nn.Module):
         logns.reverse()
         assert len(block_masks) == self.num_decoder_layers
         for i, block in enumerate(self.blocks[self.num_encoder_layers:]):
-            x = self.skip_residuals[i](x, skip_connections.pop())
+            x = x + self.skip_weights[i] * skip_connections.pop()
             x = block(x, ve_dec[i], x0, block_masks[i], logns[i])
 
         x = norm(x)
@@ -1441,12 +1477,12 @@ TEST_HPARAMS = Hyperparameters(
     train_files = "data/fineweb1B/fineweb_train_*.bin",
     val_files = "data/fineweb1B/fineweb_val_*.bin",
     val_tokens = 1048576,
-    num_iterations = 20000,
+    num_iterations = 2000,
     cooldown_frac = 0.4,
     val_loss_every = 1000,
-    seq_len = 16*1024,
-    val_seq_len = 4*16*1024,
-    save_checkpoint = True,
+    seq_len = 4*1024,
+    val_seq_len = 4*4*1024,
+    save_checkpoint = False,
     dev=False,
 )
 DEV_HPARAMS = Hyperparameters(
@@ -1514,7 +1550,7 @@ def main(args = TEST_HPARAMS):
     torch.cuda.synchronize()
     print0("Init model")
     # REF: model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
-    model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=3, model_dim=384, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
+    model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=16, model_dim=2048, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
     # model: nn.Module = MoEUTWrapper(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
     model.bfloat16()
     for m in model.modules():

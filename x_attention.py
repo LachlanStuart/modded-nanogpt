@@ -1,325 +1,338 @@
 """This module implements the user facing API for x_attention in PyTorch."""
 
+from functools import partial
 import math
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
-from torch._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
-from x_attention_hop import XAttentionOp
-from torch._higher_order_ops.utils import _set_compilation_env
-from torch.fx.experimental.proxy_tensor import (
-    _temp_remove_metadata_torch_function_mode,
-    _temp_remove_pre_dispatch_torch_function_mode,
-)
-from torch.nn.attention._utils import _supported_head_dim, _validate_sdpa_input
-from torch.nn.attention.flex_attention import _identity, _create_empty_block_mask, BlockMask
+from torch.nn.attention.flex_attention import BlockMask, _ordered_to_dense
+from lovely_tensors import monkey_patch
+
+monkey_patch()
+
+LSE_DTYPE = torch.float32
 
 
-__all__ = [
-    "BlockMask",
-    "x_attention",
-]
+def aggregate_with_lse(
+    outs: Tensor,  # shape (N, d)
+    lses: Tensor,  # shape (N,)
+) -> tuple[Tensor, Tensor]:  # shapes (d,), (,)
+    max_log = lses.max()
+    scaled_lses = (lses - max_log).exp()
+    sum_lse = scaled_lses.sum()
+    scales = (scaled_lses / sum_lse).type_as(outs)
+    out = (outs * scales[:, None]).sum(dim=0)
+    lse = sum_lse.log() + max_log
 
-_mask_mod_signature = Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]
+    # print(f"{outs=}")
+    # print(f"{lses=}")
+    # print(f"{max_log=}")
+    # print(f"{scaled_lses=}")
+    # print(f"{sum_lse=}")
+    # print(f"{scales=}")
+    # print(f"{out=}")
+    # print(f"{lse=}")
 
-
-def _vmap_for_bhqkv(
-    fn: Callable,
-    prefix: Tuple[Optional[int], ...],
-    suffix: Tuple[Optional[int], ...] = (),
-    out_dims: Union[int, List[Optional[int]]] = 0,
-    group_dim: bool = False,
-):
-    """Used to vmap mask_mods over 4-dimensional/5-dimension inputs.
-    Mapping over the [b, hq, q_idx, kv_idx] or [b, hkv, g, q_idx, kv_idx] dimensions.
-
-    Args:
-        fn (callable): The function to vmap.
-        prefix (tuple): The prefix of the vmap. Should be set to () for mask_mods.
-        suffix (tuple): We need to add (0,) if gradOut is being mapped over,
-                        and (None,) * len(other_buffers).
-        out_dims (tuple): For forward cases, keep this as the default 0 since
-                          we are only returning 1 output. For backwards, the joint
-                          graph returns grads for B, H, Q_idx, KV_idx and other_buffers,
-                          so we set this to (0, None, None, None, None) + (None,) * len(other_buffers).
-
-    Returns:
-        callable: The vmapped function.
-    """
-    # We vamp a function 4 times, broadcasting the [b, h, q_idx, kv_idx] dimensions
-    dimensions: List[Tuple[None | int, None | int, None | int, None | int]] = []
-    dimensions = [
-        (None, None, None, 0),
-        (None, None, 0, None),
-        (None, 0, None, None),
-    ]
-
-    if group_dim:
-        dimensions += [
-            (None, 0, None, None),
-        ]
-
-    dimensions += [
-        (0, None, None, None),
-    ]
-
-    for dims in dimensions:
-        fn = torch.vmap(fn, in_dims=prefix + dims + suffix, out_dims=out_dims)  # type: ignore[arg-type]
-    return fn
+    return out, lse
 
 
-_LARGE_SPARSE_BLOCK_SIZE = 1 << 30
+if __name__ == "__main__":
+    outs = torch.randn(1000, 128)
+    lses = torch.randn(1000)
+    out, lse = aggregate_with_lse(outs, lses)
 
 
-def create_mask(
-    mask_mod: _mask_mod_signature,
-    B: Optional[int],
-    H: Optional[int],
-    Q_LEN: int,
-    KV_LEN: int,
-    device: str = "cuda",
-) -> Tensor:
-    r"""This function creates a mask tensor from a mask_mod function.
-
-    Args:
-        mask_mod (_mask_mod_signature): Function to generate the mask.
-        B (int): Batch size.
-        H (int): Number of query heads.
-        Q_LEN (int): Sequence length of query.
-        KV_LEN (int): Sequence length of key/value.
-        device (str): Device to run the mask creation on.
-
-    Returns:
-        mask (Tensor): A mask tensor with shape (B, H, M, N).
-    """
-    if B is None:
-        B = 1
-    if H is None:
-        H = 1
-    b = torch.arange(0, B, device=device)
-    h = torch.arange(0, H, device=device)
-    m = torch.arange(0, Q_LEN, device=device)
-    n = torch.arange(0, KV_LEN, device=device)
-
-    with TransformGetItemToIndex():
-        mask_mod_vmap = _vmap_for_bhqkv(mask_mod, prefix=())
-        mask = mask_mod_vmap(b, h, m, n)
-        return mask
+def mask_mod(b, h, q_idx, k_idx):
+    return q_idx >= k_idx
+    # return (q_idx[None] >= k_idx[None]).squeeze(0)
 
 
-def _apply_kernel_options(query: Tensor, key: Tensor, value: Tensor, return_lse: bool, kernel_options):
-    kernel_options = {} if kernel_options is None else dict(kernel_options)
-
-    kernel_options.setdefault("PRESCALE_QK", False)
-    kernel_options.setdefault("ROWS_GUARANTEED_SAFE", False)
-    kernel_options.setdefault("BLOCKS_ARE_CONTIGUOUS", False)
-    # This forces all biases grad scatters to be done in the DQ iteration loop of the backwards
-    kernel_options.setdefault("WRITE_DQ", True)
-
-    # If forward kernel needs to return logsumexp is decided by this rule internally.
-    assert "OUTPUT_LOGSUMEXP" not in kernel_options
-    kernel_options["OUTPUT_LOGSUMEXP"] = True
-    if not return_lse:
-        # We used to check if q,k,v required grads but since captured buffers can require grad
-        # we always write unless in no_grad
-        output_logsumexp = torch.is_grad_enabled()
-        kernel_options["OUTPUT_LOGSUMEXP"] = output_logsumexp
-        any_inputs_on_cpu_device = query.device.type == "cpu" or key.device.type == "cpu" or value.device.type == "cpu"
-        if any_inputs_on_cpu_device:
-            # CPU with torch.compile now supports infernece, and will not return lse
-            # TODO: support CPU for training and return lse
-            kernel_options["OUTPUT_LOGSUMEXP"] = False
-
-    return kernel_options
+def process_full(
+    query: Tensor,  # shape (Dk,)
+    query_i: Tensor,  # shape ()
+    key: Tensor,  # shape (Dk,)
+    value: Tensor,  # shape (Dv,)
+    key_i: Tensor,  # shape ()
+) -> Tuple[Tensor, Tensor]:  # shapes (Dv,), (,)
+    return value, (query * key).sum().float()
 
 
-def _validate_embed_dim(query: Tensor, key: Tensor, value: Tensor):
-    if query.size(-1) != key.size(-1):
-        raise ValueError(
-            f"Expect query and key/value to have the same embedding dimension "
-            f"but got E={query.size(-1)} and E={key.size(-1)}."
-        )
-    # TODO this config segfaults with Triton without:
-    # https://github.com/triton-lang/triton/pull/4540
-    if not (_supported_head_dim(query.size(-1)) and _supported_head_dim(value.size(-1))):
-        raise ValueError(
-            f"NYI: Currently non power of 2 embedding dimension are not supported. "
-            f"Got E={query.size(-1)} and Ev={value.size(-1)}."
-        )
+def process_partial(
+    query: Tensor,  # shape (Dk,)
+    query_i: Tensor,  # shape ()
+    key: Tensor,  # shape (Dk,)
+    value: Tensor,  # shape (Dv,)
+    key_i: Tensor,  # shape ()
+    mask_mod: Callable,
+) -> Tuple[Tensor, Tensor]:  # shapes (Dv,), (,)
+    def unmasked(query, key, value):
+        score = torch.dot(query, key).float().exp()
+        out = score * value
+        lse = score.log()
+        return out, lse
 
+    def masked(query, key, value):
+        return masked_val(query, key, value), masked_lse(query, key, value)
 
-def _validate_device(query: Tensor, key: Tensor, value: Tensor):
-    """TODO: Remove once non cuda/cpu devices support is added
-    We only need to check query since we have already that q,k,v are on the same device
-    """
-    if query.device.type != "cuda" and query.device.type != "cpu":
-        raise ValueError(
-            f"XAttention is only supported on CUDA or CPU devices. Found input tensors on {query.device.type} device."
-        )
+    def unmasked_val(query, key, value):
+        return value.clone()
 
+    def unmasked_lse(query, key, value):
+        # WORKAROUND: torch.dot doesn't support being so nested...
+        # score = torch.dot(query, key).float()
+        return (query * key).sum().float()
 
-def _validate_nestedness(query: Tensor, key: Tensor, value: Tensor):
-    # Currently, inputs can only be all nested or no nested.
-    if query.is_nested != key.is_nested or key.is_nested != value.is_nested:
-        raise ValueError(
-            "XAttention does not support mixed nested tensor / non-nested tensor inputs. "
-            "Please file an issue requesting this if it is important to you."
-        )
+    def masked_val(query, key, value):
+        return value.new_zeros(V)
 
-    if (
-        (query.is_nested and query._lengths is not None)  # type: ignore[attr-defined]
-        or (key.is_nested and key._lengths is not None)  # type: ignore[attr-defined]
-        or (value.is_nested and value._lengths is not None)  # type: ignore[attr-defined]
-    ):
-        raise ValueError(
-            "XAttention does not support nested tensors that are non-contiguous with holes. "
-            "Please file an issue requesting this if it is important to you."
-        )
+    def masked_lse(query, key, value):
+        return value.new_full((), -torch.inf, dtype=torch.float32)
 
-
-def x_attention(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    block_mask: Optional[BlockMask] = None,
-    scale: Optional[float] = None,
-    enable_gqa: bool = False,
-    return_lse: bool = False,
-    kernel_options: Optional[Dict[str, Any]] = None,
-) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-    # Some basic input validation
-    _validate_sdpa_input(query, key, value)
-    _validate_embed_dim(query, key, value)
-    _validate_device(query, key, value)
-    _validate_nestedness(query, key, value)
-    if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
-        raise NotImplementedError("NYI: query, key, and value must be 4D tensors")
-    if (not enable_gqa) and query.size(-3) != key.size(-3):
-        raise ValueError(
-            f"Expect query and key/value to have the same number of heads "
-            f"but got Hq={query.size(-3)} and Hkv={key.size(-3)}. "
-            f"Try setting enable_gqa=True for GQA."
-        )
-    if enable_gqa:
-        Hq = query.size(1)
-        Hkv = key.size(1)
-        if Hq % Hkv != 0:
-            raise ValueError(
-                f"Expect number of query heads to be a multiple of kv heads for GQA but got Hq={Hq} and Hkv={Hkv}."
-            )
-    if query.size(0) != key.size(0):
-        if block_mask is None:
-            raise ValueError(
-                f"Expect query and key/value to have the same batch size, "
-                f"or non-none block_mask, "
-                f"but got block_mask=None, Bq={query.size(0)}, and Bkv={key.size(0)}."
-            )
-
-        if block_mask.kv_num_blocks.size(0) != query.size(0):
-            raise ValueError(
-                f"Expect query and key/value to have the same batch size, "
-                f"or block_mask and query to have the same batch size, "
-                f"but got Bq={query.size(0)}, Bkv={key.size(0)}, B_block_mask={block_mask.kv_num_blocks.size(0)}."
-            )
-
-    if block_mask is None:
-        block_mask = _create_empty_block_mask(query, key)
-
-    if block_mask.BLOCK_SIZE[0] == _LARGE_SPARSE_BLOCK_SIZE and block_mask.BLOCK_SIZE[1] == _LARGE_SPARSE_BLOCK_SIZE:
-        # This corresponds to the case where we essentially have a "no-op" block mask.
-        pass
-    elif query.is_nested:
-        if block_mask.shape[-2] != query._values.size(query._ragged_idx - 1):  # type: ignore[attr-defined]
-            raise RuntimeError(
-                f"block_mask of shape {block_mask.shape} is not compatible with nested tensor input "
-                f"with total sequence length of {query._values.size(query._ragged_idx - 1)}"  # type: ignore[attr-defined]
-            )
-    else:
-        block_mask_q_len = block_mask.shape[-2]
-        block_mask_kv_len = block_mask.shape[-1]
-        if query.size(-2) > block_mask_q_len or key.size(-2) > block_mask_kv_len:
-            raise ValueError(
-                f"block_mask was created for block_mask.shape={block_mask.shape} but got q_len={query.size(-2)} and kv_len={key.size(-2)}. "
-                "As the block mask was created for a smaller length than you're using it for, you likely need to create a new block mask."
-            )
-        elif (query.size(-2) < block_mask_q_len and key.size(-2) <= block_mask_kv_len) or (
-            query.size(-2) <= block_mask_q_len and key.size(-2) < block_mask_kv_len
-        ):
-            raise ValueError(
-                f"block_mask was created for block_mask.shape={block_mask.shape} but got q_len={query.size(-2)} and kv_len={key.size(-2)}. "
-                "As the block mask was created for a larger length than you're using it for, you can either 1. create a new block mask with the correct length, or 2. 'adjust' the existing block mask to the correct length by calling block_mask._adjust(q_len, kv_len). This essentially 'crops' the block mask to the upper left corner, which does not work for all mask_mods!"
-            )
-        assert query.size(-2) == block_mask_q_len
-        assert key.size(-2) == block_mask_kv_len
-
-    if scale is None:
-        scale = 1.0 / math.sqrt(query.size(-1))
-
-    if query.device != block_mask.kv_num_blocks.device:  # type: ignore[union-attr]
-        raise RuntimeError(
-            f"Expect q/k/v and block_mask to be on the same device "
-            f"but got {query.device} and {block_mask.kv_num_blocks.device}."  # type: ignore[union-attr]
-        )
-
-    kernel_options = _apply_kernel_options(
-        query,
-        key,
-        value,
-        return_lse,
-        kernel_options,
+    V = value.shape[-1]
+    mask = mask_mod(0, 0, query_i, key_i)
+    # WORKAROUND: torch.cond doesn't seem to like the returned tuples here. No idea why. Other places work.
+    # return torch.cond(mask, unmasked, masked, (query, key, value))
+    return (
+        # torch.cond(mask, unmasked_val, masked_val, (query, key, value)),
+        torch.where(mask, unmasked_val(query, key, value), masked_val(query, key, value)),
+        # torch.cond(mask, unmasked_lse, masked_lse, (query, key, value)),
+        torch.where(mask, unmasked_lse(query, key, value), masked_lse(query, key, value)),
     )
 
-    if torch.compiler.is_dynamo_compiling():
-        # mark head_dim and number of heads to be static
-        for x in [query, key, value]:
-            torch._dynamo.mark_static(x, -3)
-            torch._dynamo.mark_static(x, -1)
 
-        out, lse = XAttentionOp.apply(
-            query,
-            key,
-            value,
-            block_mask.as_tuple(),
-            scale,
-            kernel_options,  # type: ignore[union-attr]
-            (),
+if __name__ == "__main__":
+    query = torch.randn(128)
+    key = torch.randn(128)
+    value = torch.randn(128)
+    query_i = torch.tensor(0)
+    key_i = torch.tensor(0)
+    out, lse = torch.compile(process_full, fullgraph=True)(query, key, value)
+    out, lse = torch.compile(process_partial, fullgraph=True)(query, query_i, key, value, key_i, mask_mod)
+    print(out, lse)
+
+
+def process_query_tile_full(
+    query: Tensor,  # shape (Dk,)
+    key: Tensor,  # shape (KV_LEN, Dk)
+    value: Tensor,  # shape (KV_LEN, Dv)
+) -> Tuple[Tensor, Tensor]:  # shapes (Dv,), (,)
+    outs = value
+    lses = (query * key).sum(dim=-1).float()
+
+    out, lse = aggregate_with_lse(outs, lses)
+    return out, lse
+
+
+def process_query_tile_partial(
+    query: Tensor,  # shape (Dk,)
+    query_i: Tensor,  # shape ()
+    key: Tensor,  # shape (KV_LEN, Dk)
+    value: Tensor,  # shape (KV_LEN, Dv)
+    key_i: Tensor,  # shape (KV_LEN,)
+    mask_mod: Callable,
+) -> Tuple[Tensor, Tensor]:  # shapes (Dv,), (,)
+    process_partial_ = torch.vmap(process_partial, in_dims=(None, None, 0, 0, 0, None))
+    outs, lses = process_partial_(query, query_i, key, value, key_i, mask_mod)
+    out, lse = aggregate_with_lse(outs, lses)
+    return out, lse
+
+
+def process_tile(
+    query_tile: Tensor,  # shape (Q_LEN, Dk)
+    query_i: Tensor,  # shape (Q_LEN,)
+    key_tile: Tensor,  # shape (KV_LEN, Dk)
+    value_tile: Tensor,  # shape (KV_LEN, Dv)
+    key_i: Tensor,  # shape (KV_LEN,)
+    mask_val: Tensor,  # shape ()
+    full_mask_val: Tensor,  # shape ()
+    mask_mod: Callable,
+) -> Tuple[Tensor, Tensor]:  # shapes (Q_LEN, Dv), (Q_LEN)
+    def empty(query, query_i, key, value, key_i):
+        out = value.new_zeros(query.shape[:1] + value.shape[1:])
+        lse = value.new_full(query.shape[:1], -torch.inf, dtype=LSE_DTYPE)
+        return out, lse
+
+    def partial_tile(query, query_i, key, value, key_i):
+        # query, query_i, key, value, key_i, mask_mod
+        process_query_tile_ = torch.vmap(process_query_tile_partial, in_dims=(0, 0, None, None, None, None))
+        return process_query_tile_(query, query_i, key, value, key_i, mask_mod)
+
+    def full(query, query_i, key, value, key_i):
+        # query, key, value
+        process_query_tile_ = torch.vmap(process_query_tile_full, in_dims=(0, None, None))
+        return process_query_tile_(query, key, value)
+
+    def non_empty(query, query_i, key, value, key_i):
+        # return torch.cond(full_mask_val, full, partial_tile, (query, query_i, key, value, key_i))
+        partial_outs, partial_lse = partial_tile(query, query_i, key, value, key_i)
+        full_outs, full_lse = full(query, query_i, key, value, key_i)
+        return (
+            torch.where(full_mask_val, full_outs, partial_outs),
+            torch.where(full_mask_val, full_lse, partial_lse),
         )
-        if return_lse:
-            return out, lse * math.log(2)
+
+    # return torch.cond(mask_val, non_empty, empty, (query_tile, query_i, key_tile, value_tile, key_i))
+    empty_outs, empty_lse = empty(query_tile, query_i, key_tile, value_tile, key_i)
+    non_empty_outs, non_empty_lse = non_empty(query_tile, query_i, key_tile, value_tile, key_i)
+    return (
+        torch.where(mask_val, non_empty_outs, empty_outs),
+        torch.where(mask_val, non_empty_lse, empty_lse),
+    )
+
+
+if __name__ == "__main__":
+    query = torch.randn(128, 48).cuda()
+    key = torch.randn(128, 48).cuda()
+    value = torch.randn(128, 56).cuda()
+    query_i = torch.arange(128).cuda()
+    key_i = torch.arange(128).cuda()
+    mask_val = torch.tensor(False).cuda()
+    full_mask_val = torch.tensor(False).cuda()
+    out, lse = torch.compile(process_tile, fullgraph=True)(
+        query, query_i, key, value, key_i, mask_val, full_mask_val, mask_mod
+    )
+    print(out)
+    print(lse)
+
+
+def process_query_tiles(
+    query_tile: Tensor,  # shape (q_tile_size, Dk)
+    query_i: Tensor,  # shape (q_tile_size,)
+    key_tiles: Tensor,  # shape (k_tiles, k_tile_size, Dk)
+    value_tiles: Tensor,  # shape (k_tiles, k_tile_size, Dv)
+    key_i: Tensor,  # shape (k_tiles, k_tile_size)
+    coarse_mask: Tensor,  # shape (k_tiles,)
+    coarse_full_mask: Tensor,  # shape (k_tiles,)
+    mask_mod: Callable,
+) -> Tuple[Tensor, Tensor]:  # shapes (q_tile_size, Dv), (q_tile_size)
+    # query, query_i, key, value, key_i, mask_val, full_mask_val, mask_mod
+    process_tile_ = torch.vmap(process_tile, in_dims=(None, None, 0, 0, 0, 0, 0, None))
+    outs, lses = process_tile_(
+        query_tile, query_i, key_tiles, value_tiles, key_i, coarse_mask, coarse_full_mask, mask_mod
+    )
+
+    aggregate_with_lse_ = torch.vmap(aggregate_with_lse, in_dims=(1, 1))
+    out, lse = aggregate_with_lse_(outs, lses)
+    return out, lse
+
+
+if __name__ == "__main__":
+    query = torch.randn(24, 48).cuda()
+    query_i = torch.arange(24).cuda()
+    key = torch.randn(3, 24, 48).cuda()
+    value = torch.randn(3, 24, 56).cuda()
+    key_i = torch.arange(3 * 24).reshape(3, 24).cuda()
+    coarse_mask = torch.randint(0, 2, (3,)).bool().cuda()
+    coarse_full_mask = torch.randint(0, 2, (3,)).bool().cuda()
+    out, lse = torch.compile(process_query_tiles, fullgraph=True)(
+        query, query_i, key, value, key_i, coarse_mask, coarse_full_mask, mask_mod
+    )
+    print(out)
+    print(lse)
+
+
+class VmapAttentionMask(NamedTuple):
+    partial_dense: Tensor
+    full_dense: Tensor
+    mask_mod: Callable
+    q_tile_size: int
+    k_tile_size: int
+
+    @staticmethod
+    def from_block_mask(block_mask: BlockMask) -> "VmapAttentionMask":
+        partial_dense = _ordered_to_dense(block_mask.kv_num_blocks, block_mask.kv_indices).bool()
+        if block_mask.full_kv_num_blocks is not None:
+            full_dense = _ordered_to_dense(block_mask.full_kv_num_blocks, block_mask.full_kv_indices).bool()
+            partial_dense = partial_dense | full_dense
         else:
-            return out
+            full_dense = torch.zeros_like(partial_dense)
+        return VmapAttentionMask(
+            partial_dense=partial_dense,
+            full_dense=full_dense,
+            mask_mod=block_mask.mask_mod,
+            q_tile_size=block_mask.BLOCK_SIZE[1],
+            k_tile_size=block_mask.BLOCK_SIZE[0],
+        )
 
-    if not torch._dynamo.is_dynamo_supported():
-        raise RuntimeError("x_attention requires dynamo support")
+    def to(self, device: torch.device) -> "VmapAttentionMask":
+        return VmapAttentionMask(
+            partial_dense=self.partial_dense.to(device),
+            full_dense=self.full_dense.to(device),
+            mask_mod=self.mask_mod,
+            q_tile_size=self.q_tile_size,
+            k_tile_size=self.k_tile_size,
+        )
 
-    from torch._dynamo.backends.debugging import (
-        make_eager_backend_with_torch_function_mode,
+
+def vmap_attention(
+    query: Tensor,  # shape (B, H, Q_LEN, Dk)
+    key: Tensor,  # shape (B, H, KV_LEN, Dk)
+    value: Tensor,  # shape (B, H, KV_LEN, Dv)
+    mask: VmapAttentionMask,
+    scale: float,
+) -> Tuple[Tensor, Tensor]:  # shapes (B, H, Q_LEN, Dv), (B, H, Q_LEN)
+    query = query * scale
+    assert query.shape[:2] == key.shape[:2] == value.shape[:2], f"{query.shape} != {key.shape} != {value.shape}"
+    assert query.shape[0] == 1, f"{query.shape}"
+    assert query.ndim == 4, f"{query.ndim}"
+    assert query.shape[2] % mask.q_tile_size == 0, f"{query.shape[2]} % {mask.q_tile_size} != 0"
+    assert query.shape[3] == key.shape[3], f"{query.shape[3]} != {key.shape[3]}"
+    assert key.shape[2] % mask.k_tile_size == 0, f"{key.shape[2]} % {mask.k_tile_size} != 0"
+    assert mask.partial_dense.ndim == 4, f"{mask.partial_dense.ndim=}"
+    assert mask.partial_dense.shape[1] == 1, f"{mask.partial_dense.shape=}"
+    assert mask.full_dense.ndim == 4, f"{mask.full_dense.ndim=}"
+
+    partial_mask = mask.partial_dense[:, 0, :, :]
+    full_mask = mask.full_dense[:, 0, :, :]
+
+    q_tile_size = mask.q_tile_size
+    k_tile_size = mask.k_tile_size
+    B, H, Q_LEN, Dk = query.shape
+    B, H, KV_LEN, Dv = value.shape
+    # query, query_i, key, value, key_i, coarse_mask, coarse_full_mask, mask_mod
+    process_query_tiles_ = torch.vmap(process_query_tiles, in_dims=(0, 0, None, None, None, 0, 0, None))
+    process_tiles_by_head = torch.vmap(process_query_tiles_, in_dims=(0, None, 0, 0, None, None, None, None))
+    process_tiles_by_batch = torch.vmap(process_tiles_by_head, in_dims=(0, None, 0, 0, None, 0, 0, None))
+    q_tiles = Q_LEN // q_tile_size
+    k_tiles = KV_LEN // k_tile_size
+    query_i = torch.arange(Q_LEN, device=query.device).view(q_tiles, q_tile_size)
+    key_i = torch.arange(KV_LEN, device=query.device).view(k_tiles, k_tile_size)
+    query_tiles = query.view(B, H, q_tiles, q_tile_size, Dk)
+    key_tiles = key.view(B, H, k_tiles, k_tile_size, Dk)
+    value_tiles = value.view(B, H, k_tiles, k_tile_size, Dv)
+    out, lse = process_tiles_by_batch(
+        query_tiles, query_i, key_tiles, value_tiles, key_i, partial_mask, full_mask, mask.mask_mod
     )
+    out = out.view(B, H, Q_LEN, Dv)
+    lse = lse.view(B, H, Q_LEN)
+    return out, lse
 
-    # Dynamo is expecting a callable with "__code__" attribute.
-    # We cannot directly pass hop to it. So we wrap it in a dummy function.
-    def _x_attention_hop_wrapper(*args, **kwargs):
-        return XAttentionOp.apply(*args, **kwargs)
 
-    with _set_compilation_env():
-        with torch._dynamo.utils.disable_cache_limit():
-            with _temp_remove_pre_dispatch_torch_function_mode():
-                with _temp_remove_metadata_torch_function_mode() as metadata_mode:
-                    if metadata_mode:
-                        backend = make_eager_backend_with_torch_function_mode(metadata_mode)
-                    else:
-                        backend = "eager"
-                    out, lse = torch.compile(_x_attention_hop_wrapper, backend=backend, fullgraph=True)(
-                        query,
-                        key,
-                        value,
-                        block_mask.as_tuple(),  # type: ignore[union-attr]
-                        scale,
-                        kernel_options,
-                        (),
-                    )
-                    if return_lse:
-                        return out, lse * math.log(2)
-                    else:
-                        return out
+if __name__ == "__main__":
+    query = torch.randn(1, 1, 96, 48).half().cuda()
+    key = torch.randn(1, 1, 32, 48).half().cuda()
+    value = torch.randn(1, 1, 32, 56).half().cuda()
+    mask = VmapAttentionMask(
+        partial_dense=torch.randint(0, 2, (1, 3, 2)).bool().cuda(),
+        full_dense=torch.randint(0, 2, (1, 3, 2)).bool().cuda(),
+        mask_mod=mask_mod,
+        q_tile_size=32,
+        k_tile_size=16,
+    )
+    out, lse = vmap_attention(query, key, value, mask)
+    print(out)
+    print(lse)
+
+
+if __name__ == "__main__":
+    query = torch.randn(1, 3, 16384, 128).half().cuda()
+    key = torch.randn(1, 3, 16384, 128).half().cuda()
+    value = torch.randn(1, 3, 16384, 128).half().cuda()
+    coarse_mask = torch.randint(0, 1, (1, 128, 128)).bool().cuda()
+    coarse_full_mask = torch.randint(0, 1, (1, 128, 128)).bool().cuda()
+    out, lse = torch.compile(vmap_attention, fullgraph=True)(
+        query, key, value, coarse_mask, coarse_full_mask, mask_mod, 128, 128
+    )
+    print(out)
+    print(lse)

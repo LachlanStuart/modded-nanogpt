@@ -22,7 +22,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-from x_attention import x_attention
+from x_attention import VmapAttentionMask, vmap_attention
 
 # torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 import triton
@@ -344,9 +344,9 @@ class CausalSelfAttention(nn.Module):
         # y = flex_attention(
         #     q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale
         # ).transpose(1, 2)
-        y = x_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale
-        ).transpose(1, 2)
+        y = vmap_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mask=block_mask, scale=self.attn_scale
+        )[0].transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)  # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -412,7 +412,7 @@ def create_block_masks(input_seq: Tensor, sliding_window_num_blocks: Tensor):
 
     def document_causal(b, h, q_idx, kv_idx):
         causal_mask = q_idx >= kv_idx
-        document_mask = docs[q_idx] == docs[kv_idx]
+        document_mask = (docs[q_idx[None]] == docs[kv_idx[None]]).squeeze(0)
         return causal_mask & document_mask
 
     def dense_to_ordered(dense_mask: Tensor):
@@ -436,7 +436,7 @@ def create_block_masks(input_seq: Tensor, sliding_window_num_blocks: Tensor):
     full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
 
     def build_bm(sw_num_blocks: Tensor) -> BlockMask:
-        return BlockMask.from_kv_blocks(
+        block_mask = BlockMask.from_kv_blocks(
             torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(sw_num_blocks - full_kv_num_blocks, 1)),
             partial_kv_indices,
             torch.clamp_max(full_kv_num_blocks, sw_num_blocks - 1),
@@ -444,6 +444,7 @@ def create_block_masks(input_seq: Tensor, sliding_window_num_blocks: Tensor):
             BLOCK_SIZE=BLOCK_SIZE,
             mask_mod=document_causal,
         )
+        return VmapAttentionMask.from_block_mask(block_mask)
 
     # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
     return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
@@ -588,7 +589,7 @@ TEST_HPARAMS = Hyperparameters(
     num_iterations=5000,
     cooldown_frac=0.4,
     val_loss_every=1000,
-    seq_len=32 * 1024,
+    seq_len=4 * 1024,
     val_seq_len=2 * 64 * 1024,
     save_checkpoint=False,
     dev=False,

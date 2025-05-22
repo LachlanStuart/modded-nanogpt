@@ -80,8 +80,8 @@ def process_partial(
 
     def unmasked_lse(query, key, value):
         # WORKAROUND: torch.dot doesn't support being so nested...
-        # score = torch.dot(query, key).float()
-        return (query * key).sum().float()
+        return torch.dot(query, key).float()
+        # return (query * key).sum().float()
 
     def masked_val(query, key, value):
         return value.new_zeros(V)
@@ -118,7 +118,7 @@ def process_query_tile_full(
     value: Tensor,  # shape (KV_LEN, Dv)
 ) -> Tuple[Tensor, Tensor]:  # shapes (Dv,), (,)
     outs = value
-    lses = (query * key).sum(dim=-1).float()
+    lses = torch.vmap(torch.dot, in_dims=(0, None))(query, key).float()
 
     out, lse = aggregate_with_lse(outs, lses)
     return out, lse

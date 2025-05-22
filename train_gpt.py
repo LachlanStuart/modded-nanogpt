@@ -454,6 +454,10 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList(
             [Block(model_dim, num_heads, layer_idx, max_seq_len) for layer_idx in range(num_layers)]
         )
+        # restricted oracle
+        self.restricted_oracle_embed = nn.Embedding(vocab_size, 32)
+        self.oracle_to_model = CastedLinear(32, model_dim)
+        nn.init.zeros_(self.oracle_to_model.weight)
         # U-net design by @brendanh0gan
         self.num_encoder_layers = num_layers // 2  # Half of the layers for encoder
         self.num_decoder_layers = num_layers - self.num_encoder_layers  # Remaining for decoder
@@ -476,6 +480,13 @@ class GPT(nn.Module):
         assert len(ve) == len(self.blocks)
         ve_enc, ve_dec = ve[: self.num_encoder_layers], ve[self.num_encoder_layers :]
         assert len(ve_enc) == self.num_encoder_layers and len(ve_dec) == self.num_decoder_layers
+
+        # restricted oracle
+        if self.training:
+            oracle_embed = norm(self.restricted_oracle_embed(target_seq.roll(-1)[None]))
+            token_oracle_threshold = torch.rand_like(target_seq, dtype=torch.bfloat16)[None, :, None]
+            oracle_embed = oracle_embed.masked_fill(torch.rand_like(oracle_embed) > token_oracle_threshold, 0.0)
+            x += self.oracle_to_model(oracle_embed)
 
         # Store outputs for U-Net skip connections
         skip_connections = []

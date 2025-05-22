@@ -484,7 +484,9 @@ class GPT(nn.Module):
         # restricted oracle
         if self.training:
             oracle_embed = norm(self.restricted_oracle_embed(target_seq.roll(-1)[None]))
-            token_oracle_threshold = torch.rand_like(target_seq, dtype=torch.bfloat16)[None, :, None]
+            # Rand * 1.0 (avg 16 channels/token) gave val_loss 5.5260
+            # Rand * 0.1 (avg 1.6 channels/token) gave val_loss 4.0475
+            token_oracle_threshold = torch.rand_like(target_seq, dtype=torch.bfloat16)[None, :, None] * 0.1
             oracle_embed = oracle_embed.masked_fill(torch.rand_like(oracle_embed) > token_oracle_threshold, 0.0)
             x += self.oracle_to_model(oracle_embed)
 
@@ -594,7 +596,7 @@ TEST_HPARAMS = Hyperparameters(
     val_tokens=1048576,
     num_iterations=5000,
     cooldown_frac=0.4,
-    val_loss_every=1000,
+    val_loss_every=125,
     seq_len=32 * 1024,
     val_seq_len=2 * 64 * 1024,
     save_checkpoint=False,

@@ -1,4 +1,5 @@
 from collections import defaultdict
+import math
 import os
 import sys
 
@@ -454,10 +455,10 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList(
             [Block(model_dim, num_heads, layer_idx, max_seq_len) for layer_idx in range(num_layers)]
         )
-        # restricted oracle
-        self.restricted_oracle_embed = nn.Embedding(vocab_size, 32)
-        self.oracle_to_model = CastedLinear(32, model_dim)
-        nn.init.zeros_(self.oracle_to_model.weight)
+        # # restricted oracle
+        self.restricted_oracle_embed = nn.Embedding(vocab_size, 4)
+        self.oracle_to_model = CastedLinear(4, model_dim)
+        self.oracle_to_model.weight.detach().mul_(0.001)
         # U-net design by @brendanh0gan
         self.num_encoder_layers = num_layers // 2  # Half of the layers for encoder
         self.num_decoder_layers = num_layers - self.num_encoder_layers  # Remaining for decoder
@@ -475,7 +476,7 @@ class GPT(nn.Module):
 
         long_bm, short_bm = create_block_masks(input_seq, sliding_window_num_blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None])  # use of norm here by @Grad62304977
+        x = x0 = self.embed(input_seq)[None]
         ve = self.value_embeds(input_seq)
         assert len(ve) == len(self.blocks)
         ve_enc, ve_dec = ve[: self.num_encoder_layers], ve[self.num_encoder_layers :]
@@ -484,11 +485,24 @@ class GPT(nn.Module):
         # restricted oracle
         if self.training:
             oracle_embed = norm(self.restricted_oracle_embed(target_seq.roll(-1)[None]))
-            # Rand * 1.0 (avg 16 channels/token) gave val_loss 5.5260
-            # Rand * 0.1 (avg 1.6 channels/token) gave val_loss 4.0475
-            token_oracle_threshold = torch.rand_like(target_seq, dtype=torch.bfloat16)[None, :, None] * 0.1
-            oracle_embed = oracle_embed.masked_fill(torch.rand_like(oracle_embed) > token_oracle_threshold, 0.0)
-            x += self.oracle_to_model(oracle_embed)
+            # Baseline gave val_loss 4.4944 @ 1000, 4.1834 @ 2000, 4.0607 @ 3000,3.8181 @ 5000
+            # Rand * 1.0 (avg 16 channels/token) gave val_loss 5.5260 @ 5000
+            # Rand * 0.1 (avg 1.6 channels/token) gave val_loss 4.0475 @ 5000
+            # Rand ** log2(32) (median 1 channel) with small init gave 4.4005 @ 2000
+            # Rand ** log2(32) (median 1 channel) with small init post-dropout norm 4.6695 @ 1000, 4.3865 @ 2000
+            # Rand ** log2(32) (median 1 channel) with small init post-add norm 4.6510 @ 1000, 4.3558 @ 2000, 4.2394 @ 3000
+            # Rand ** log2(4) (median 1 channel) with small init mask norm, post-add norm 4.6604 @ 1000, 4.3619 @ 2000, 4.2511 @ 3000
+            # Rand ** log2(4) (median 1 channel) with no mask norm, adam 4.6665 @ 1000, 4.3677 @ 2000, 4.2490 @ 3000, 4.0246 @ 5000
+            # Rand ** log2(4) (median 1 channel) with no scalar opt, lr*1.5 4.6201 @ 1000, 4.3286 @ 2000, 4.2183 @ 3000, 3.9461 @ 5000
+            power = math.log2(4)
+            token_oracle_threshold = torch.rand_like(target_seq, dtype=torch.bfloat16)[None, :, None] ** power
+            oracle_mask = torch.rand_like(oracle_embed) > token_oracle_threshold
+            oracle_embed = oracle_embed.masked_fill(oracle_mask, 0.0)
+            oracle_embed = oracle_embed / ((~oracle_mask).sum(dim=-1, keepdim=True) + 1e-6)
+            oracle_embed = self.oracle_to_model(oracle_embed)
+            x += F.rms_norm(oracle_embed, (oracle_embed.size(-1),), eps=1.0)
+
+        x = x0 = norm(x)  # use of norm here by @Grad62304977
 
         # Store outputs for U-Net skip connections
         skip_connections = []
@@ -692,10 +706,12 @@ def main(args=TEST_HPARAMS):
     print0("Init optimizers")
     # collect the parameters to optimize
     hidden_matrix_params = [
-        p for n, p in model.named_parameters() if p.ndim >= 2 and "embed" not in n and "lm_head" not in n
+        p
+        for n, p in model.named_parameters()
+        if p.ndim >= 2 and "embed" not in n and "lm_head" not in n and "oracle_to" not in n
     ]
     embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2]
+    scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2 or "oracle_to" in n]
     head_params = [model.lm_head.weight]
     params_sets = [hidden_matrix_params, embed_params, scalar_params, head_params]
     assert all(set(a).isdisjoint(b) for a in params_sets for b in params_sets if a is not b)
@@ -706,6 +722,7 @@ def main(args=TEST_HPARAMS):
     lr_mod = (
         args.seq_len / Hyperparameters().seq_len / 8
     ) ** 0.5  # Correct LR based on difference in batch size vs original w/ 8 nodes
+    lr_mod *= 1.5  # For oracle testing
     print(f"{lr_mod=}")
     adam_params = [
         dict(params=head_params, lr=0.008 * lr_mod),

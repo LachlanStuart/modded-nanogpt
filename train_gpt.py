@@ -455,7 +455,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList(
             [Block(model_dim, num_heads, layer_idx, max_seq_len) for layer_idx in range(num_layers)]
         )
-        # # restricted oracle
+        # restricted oracle
         self.restricted_oracle_embed = nn.Embedding(vocab_size, 4)
         self.oracle_to_model = CastedLinear(4, model_dim)
         self.oracle_to_model.weight.detach().mul_(0.001)
@@ -494,10 +494,13 @@ class GPT(nn.Module):
             # Rand ** log2(4) (median 1 channel) with small init mask norm, post-add norm 4.6604 @ 1000, 4.3619 @ 2000, 4.2511 @ 3000
             # Rand ** log2(4) (median 1 channel) with no mask norm, adam 4.6665 @ 1000, 4.3677 @ 2000, 4.2490 @ 3000, 4.0246 @ 5000
             # Rand ** log2(4) (median 1 channel) with no scalar opt, lr*1.5 4.6201 @ 1000, 4.3286 @ 2000, 4.2183 @ 3000, 3.9461 @ 5000
+            # Baseline 30k accidentally left LR at 1.5x.
+
             power = math.log2(4)
             token_oracle_threshold = torch.rand_like(target_seq, dtype=torch.bfloat16)[None, :, None] ** power
             oracle_mask = torch.rand_like(oracle_embed) > token_oracle_threshold
             oracle_embed = oracle_embed.masked_fill(oracle_mask, 0.0)
+            # FIXME: Dropout-style scaling is pointless with the rms_norm below
             oracle_embed = oracle_embed / ((~oracle_mask).sum(dim=-1, keepdim=True) + 1e-6)
             oracle_embed = self.oracle_to_model(oracle_embed)
             x += F.rms_norm(oracle_embed, (oracle_embed.size(-1),), eps=1.0)
@@ -608,7 +611,7 @@ TEST_HPARAMS = Hyperparameters(
     train_files="data/fineweb1B/fineweb_train_*.bin",
     val_files="data/fineweb1B/fineweb_val_*.bin",
     val_tokens=1048576,
-    num_iterations=5000,
+    num_iterations=30000,
     cooldown_frac=0.4,
     val_loss_every=125,
     seq_len=32 * 1024,

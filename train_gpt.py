@@ -318,17 +318,10 @@ def slow_attn(q: Tensor, k: Tensor, v: Tensor, block_mask: BlockMask):
 
 
 def slow_attn_th(q: Tensor, k: Tensor, v: Tensor, PRE_TH: Tensor, POST_TH: Tensor, block_mask: BlockMask):
-    # TH32Heads: 0: 10.8258, 1000: 6.6845, 2000: 6.4735
-    # TH2Heads_LmHeadOpt: 0: 10.8258, 1000: 6.5341, 2000: 6.2341
-    # TH2Heads_EmbedOpt: 0: 10.8258, 1000: 6.5370, 2000: 6.2228
-    # TH16Heads_EmbedOpt: 0: 10.8258, 1000: 6.5287, 2000: 6.2250
-    # TH16Heads_EmbedOpt_LowInit: 0: 10.8258, 1000: 6.5211, 2000: 6.2008
-    # 32Heads: 0: 10.8258, 1000: 6.6854, 2000: 6.4665
-    # 8Heads: 0: 10.8258, 1000: 6.5746, 2000: 6.2459
-    # 4Heads: 0: 10.8258, 1000: 6.5294, 2000: 6.2103
-    # 2Heads: 0: 10.8258, 1000: 6.5435, 2000: 6.2389
+    """PyTorch implementation of a Talking Heads-like attention mechanism."""
     # Bump up batch size
-    # TH, 16 Heads, EmbedOpt
+    # TH, dim256, 32 Heads, EmbedOpt, LowInit: 0: 10.825882911682129, 1000: 6.751516342163086, 2000: 6.557398796081543
+    # NH, dim256, 32 Heads                   : 0: 10.825882911682129, 1000: 6.762735366821289, 2000: 6.584110260009766
     idxs = torch.arange(q.size(1), device=q.device)
     mask = block_mask.mask_mod(0, 0, idxs[None, :, None], idxs[None, None, :])
     logit = torch.einsum("bqhd,bkhd->bhqk", q, k)
@@ -708,8 +701,8 @@ def main(args=TEST_HPARAMS):
     model: nn.Module = GPT(
         vocab_size=50257,
         num_layers=12,
-        num_heads=16,
-        model_dim=512,
+        num_heads=32,
+        model_dim=256,
         max_seq_len=max(args.seq_len, args.val_seq_len),
         th=True,
     ).cuda()
@@ -887,12 +880,18 @@ def main(args=TEST_HPARAMS):
         # logging
         if step < 20 or (step + 1) % 50 == 0:
             approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-            all_pre = torch.stack([p for n, p in model.named_parameters() if "pre_th" in n]).detach()
-            all_post = torch.stack([p for n, p in model.named_parameters() if "post_th" in n]).detach()
-            print0(
-                f"step:{step + 1}/{train_steps} train_loss:{train_loss:.4f} step_avg:{approx_time / timed_steps:.2f}ms train_time:{approx_time / 1000:.0f}s vram={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB {all_pre=} {all_post=}",
-                console=True,
-            )
+            if any("pre_th" in n for n, p in model.named_parameters()):
+                all_pre = torch.stack([p for n, p in model.named_parameters() if "pre_th" in n]).detach()
+                all_post = torch.stack([p for n, p in model.named_parameters() if "post_th" in n]).detach()
+                print0(
+                    f"step:{step + 1}/{train_steps} train_loss:{train_loss:.4f} step_avg:{approx_time / timed_steps:.2f}ms train_time:{approx_time / 1000:.0f}s vram={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB {all_pre=} {all_post=}",
+                    console=True,
+                )
+            else:
+                print0(
+                    f"step:{step + 1}/{train_steps} train_loss:{train_loss:.4f} step_avg:{approx_time / timed_steps:.2f}ms train_time:{approx_time / 1000:.0f}s vram={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB",
+                    console=True,
+                )
 
     print0(f"{train_losses=}")
     print0(f"{val_losses=}")

@@ -11,21 +11,20 @@ from functools import lru_cache, partial
 from pathlib import Path
 import atexit
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 
 torch.empty(1, device="cuda", requires_grad=True).backward()  # prevents a bug on some systems
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint
 from torch.profiler import profile, record_function, ProfilerActivity
 
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 # torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
-import triton
-import triton.language as tl
 
 
 try:
@@ -307,10 +306,44 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 
+def slow_attn(q: Tensor, k: Tensor, v: Tensor, block_mask: BlockMask):
+    idxs = torch.arange(q.size(1), device=q.device)
+    mask = block_mask.mask_mod(0, 0, idxs[None, :, None], idxs[None, None, :])
+    logit = torch.einsum("bqhd,bkhd->bhqk", q, k)
+    # logit = F.linear(logit.transpose(1, 3), PRE_TH).transpose(1, 3)
+    logit = logit.masked_fill(~mask, -float("inf"))
+    attn = F.softmax(logit, dim=-1)
+    # attn = F.linear(attn.transpose(1, 3), POST_TH).transpose(1, 3)
+    return torch.einsum("bhqk,bkhd->bqhd", attn, v)
+
+
+def slow_attn_th(q: Tensor, k: Tensor, v: Tensor, PRE_TH: Tensor, POST_TH: Tensor, block_mask: BlockMask):
+    # TH32Heads: 0: 10.8258, 1000: 6.6845, 2000: 6.4735
+    # TH2Heads_LmHeadOpt: 0: 10.8258, 1000: 6.5341, 2000: 6.2341
+    # TH2Heads_EmbedOpt: 0: 10.8258, 1000: 6.5370, 2000: 6.2228
+    # TH16Heads_EmbedOpt: 0: 10.8258, 1000: 6.5287, 2000: 6.2250
+    # TH16Heads_EmbedOpt_LowInit: 0: 10.8258, 1000: 6.5211, 2000: 6.2008
+    # 32Heads: 0: 10.8258, 1000: 6.6854, 2000: 6.4665
+    # 8Heads: 0: 10.8258, 1000: 6.5746, 2000: 6.2459
+    # 4Heads: 0: 10.8258, 1000: 6.5294, 2000: 6.2103
+    # 2Heads: 0: 10.8258, 1000: 6.5435, 2000: 6.2389
+    # Bump up batch size
+    # TH, 16 Heads, EmbedOpt
+    idxs = torch.arange(q.size(1), device=q.device)
+    mask = block_mask.mask_mod(0, 0, idxs[None, :, None], idxs[None, None, :])
+    logit = torch.einsum("bqhd,bkhd->bhqk", q, k)
+    logit = F.linear(logit.transpose(1, 3), PRE_TH).transpose(1, 3)
+    logit = logit.masked_fill(~mask, -float("inf"))
+    attn = F.softmax(logit, dim=-1)
+    attn = F.linear(attn.transpose(1, 3), POST_TH).transpose(1, 3)
+    return torch.einsum("bhqk,bkhd->bqhd", attn, v)
+
+
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=64):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, th: bool):
         super().__init__()
         self.num_heads = num_heads
+        head_dim = dim // num_heads
         self.head_dim = head_dim
         hdim = num_heads * head_dim
         std = 0.5 * (dim**-0.5)
@@ -325,6 +358,13 @@ class CausalSelfAttention(nn.Module):
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
+        self.th = th
+        if th:
+            self.pre_th = nn.Parameter(torch.rand((num_heads, num_heads)) * 0.01 / num_heads)
+            self.post_th = nn.Parameter(torch.rand((num_heads, num_heads)) * 0.01 / num_heads)
+        else:
+            self.pre_th = None
+            self.post_th = None
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1)  # batch size, sequence length
@@ -340,9 +380,16 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v)  # @KoszarskyB & @Grad62304977
         else:  # skip mid-layers token value embeddings by @YouJiacheng
             v = self.lambdas[0] * v
-        y = flex_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale
-        ).transpose(1, 2)
+        if self.th:
+            pre_th = self.pre_th / self.pre_th.norm(dim=0, keepdim=True)
+            post_th = self.post_th / self.post_th.norm(dim=0, keepdim=True)
+            y = checkpoint(slow_attn_th, q * self.attn_scale, k, v, pre_th, post_th, block_mask, use_reentrant=False)
+            # y = slow_attn_th(q * self.attn_scale, k, v, pre_th, post_th, block_mask)
+        else:
+            y = slow_attn(q * self.attn_scale, k, v, block_mask)
+        # y = flex_attention(
+        #     q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale
+        # ).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)  # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -366,10 +413,10 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, layer_idx: int, max_seq_len: int):
+    def __init__(self, dim: int, num_heads: int, layer_idx: int, max_seq_len: int, th: bool):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
+        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len, th) if layer_idx != 7 else None
         self.mlp = MLP(dim)
         self.lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))
 
@@ -446,13 +493,13 @@ def create_block_masks(input_seq: Tensor, sliding_window_num_blocks: Tensor):
 
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, th: bool):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         self.value_embeds = ValueEmbedding(vocab_size, model_dim, num_layers)
         self.blocks = nn.ModuleList(
-            [Block(model_dim, num_heads, layer_idx, max_seq_len) for layer_idx in range(num_layers)]
+            [Block(model_dim, num_heads, layer_idx, max_seq_len, th) for layer_idx in range(num_layers)]
         )
         # U-net design by @brendanh0gan
         self.num_encoder_layers = num_layers // 2  # Half of the layers for encoder
@@ -581,11 +628,11 @@ TEST_HPARAMS = Hyperparameters(
     train_files="data/fineweb1B/fineweb_train_*.bin",
     val_files="data/fineweb1B/fineweb_val_*.bin",
     val_tokens=1048576,
-    num_iterations=5000,
+    num_iterations=2000,
     cooldown_frac=0.4,
     val_loss_every=1000,
-    seq_len=32 * 1024,
-    val_seq_len=2 * 64 * 1024,
+    seq_len=1 * 1024,
+    val_seq_len=1 * 1024,
     save_checkpoint=False,
     dev=False,
 )
@@ -659,7 +706,12 @@ def main(args=TEST_HPARAMS):
     print0("Init model")
     # REF: model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.seq_len, args.val_seq_len)).cuda()
     model: nn.Module = GPT(
-        vocab_size=50257, num_layers=12, num_heads=6, model_dim=384, max_seq_len=max(args.seq_len, args.val_seq_len)
+        vocab_size=50257,
+        num_layers=12,
+        num_heads=16,
+        model_dim=512,
+        max_seq_len=max(args.seq_len, args.val_seq_len),
+        th=True,
     ).cuda()
     model.bfloat16()
     for m in model.modules():
@@ -678,12 +730,22 @@ def main(args=TEST_HPARAMS):
     torch.cuda.synchronize()
     print0("Init optimizers")
     # collect the parameters to optimize
-    hidden_matrix_params = [
-        p for n, p in model.named_parameters() if p.ndim >= 2 and "embed" not in n and "lm_head" not in n
-    ]
-    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2]
-    head_params = [model.lm_head.weight]
+    hidden_matrix_params = []
+    embed_params = []
+    scalar_params = []
+    head_params = []
+    for n, p in model.named_parameters():
+        if "embed" in n:
+            embed_params.append(p)
+        elif "lm_head.weight" in n:
+            head_params.append(p)
+        elif "pre_th" in n or "post_th" in n:
+            embed_params.append(p)
+        elif p.ndim >= 2:
+            hidden_matrix_params.append(p)
+        else:
+            scalar_params.append(p)
+
     params_sets = [hidden_matrix_params, embed_params, scalar_params, head_params]
     assert all(set(a).isdisjoint(b) for a in params_sets for b in params_sets if a is not b)
 
@@ -825,8 +887,10 @@ def main(args=TEST_HPARAMS):
         # logging
         if step < 20 or (step + 1) % 50 == 0:
             approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+            all_pre = torch.stack([p for n, p in model.named_parameters() if "pre_th" in n]).detach()
+            all_post = torch.stack([p for n, p in model.named_parameters() if "post_th" in n]).detach()
             print0(
-                f"step:{step + 1}/{train_steps} train_loss:{train_loss:.4f} step_avg:{approx_time / timed_steps:.2f}ms train_time:{approx_time / 1000:.0f}s vram={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB",
+                f"step:{step + 1}/{train_steps} train_loss:{train_loss:.4f} step_avg:{approx_time / timed_steps:.2f}ms train_time:{approx_time / 1000:.0f}s vram={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB {all_pre=} {all_post=}",
                 console=True,
             )
 

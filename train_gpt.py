@@ -13,6 +13,8 @@ import atexit
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 torch.empty(1, device="cuda", requires_grad=True).backward()  # prevents a bug on some systems
 from torch import Tensor, nn
@@ -24,6 +26,12 @@ from torch.profiler import profile, record_function, ProfilerActivity
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
+try:
+    from tile_th_attention import fast_talking_heads_attention, fast_talking_heads_attention_backward
+except ImportError:
+    fast_talking_heads_attention = None
+    fast_talking_heads_attention_backward = None
+
 # torch._inductor.config.coordinate_descent_tuning = True # turn this off for a faster compile time (but slightly slower run)
 
 
@@ -33,6 +41,13 @@ try:
     monkey_patch()
 except ImportError:
     pass
+
+
+# -----------------------------------------------------------------------------
+@dataclass
+class AttentionMask:
+    doc_ids: Tensor
+    block_mask: BlockMask | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -306,30 +321,56 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 
-def slow_attn(q: Tensor, k: Tensor, v: Tensor, block_mask: BlockMask):
-    idxs = torch.arange(q.size(1), device=q.device)
-    mask = block_mask.mask_mod(0, 0, idxs[None, :, None], idxs[None, None, :])
+def _document_causal_mask(doc_ids: Tensor, seq_len: int, device: torch.device):
+    assert doc_ids.numel() >= seq_len
+    ids = doc_ids[:seq_len].to(device=device)
+    positions = torch.arange(seq_len, device=device)
+    mask = (positions[:, None] >= positions[None, :]) & (ids[:, None] == ids[None, :])
+    return mask
+
+
+def slow_attn(q: Tensor, k: Tensor, v: Tensor, mask_ctx: AttentionMask):
+    seq_len = q.size(1)
+    dense_mask = _document_causal_mask(mask_ctx.doc_ids, seq_len, q.device)
+    mask = dense_mask[None, None]
     logit = torch.einsum("bqhd,bkhd->bhqk", q, k)
-    # logit = F.linear(logit.transpose(1, 3), PRE_TH).transpose(1, 3)
     logit = logit.masked_fill(~mask, -float("inf"))
     attn = F.softmax(logit, dim=-1)
-    # attn = F.linear(attn.transpose(1, 3), POST_TH).transpose(1, 3)
     return torch.einsum("bhqk,bkhd->bqhd", attn, v)
 
 
-def slow_attn_th(q: Tensor, k: Tensor, v: Tensor, PRE_TH: Tensor, POST_TH: Tensor, block_mask: BlockMask):
+def slow_attn_th(q: Tensor, k: Tensor, v: Tensor, PRE_TH: Tensor, POST_TH: Tensor, mask_ctx: AttentionMask):
     """PyTorch implementation of a Talking Heads-like attention mechanism."""
     # Bump up batch size
     # TH, dim256, 32 Heads, EmbedOpt, LowInit: 0: 10.825882911682129, 1000: 6.751516342163086, 2000: 6.557398796081543
     # NH, dim256, 32 Heads                   : 0: 10.825882911682129, 1000: 6.762735366821289, 2000: 6.584110260009766
-    idxs = torch.arange(q.size(1), device=q.device)
-    mask = block_mask.mask_mod(0, 0, idxs[None, :, None], idxs[None, None, :])
+    seq_len = q.size(1)
+    dense_mask = _document_causal_mask(mask_ctx.doc_ids, seq_len, q.device)
+    mask = dense_mask[None, None]
     logit = torch.einsum("bqhd,bkhd->bhqk", q, k)
     logit = F.linear(logit.transpose(1, 3), PRE_TH).transpose(1, 3)
     logit = logit.masked_fill(~mask, -float("inf"))
     attn = F.softmax(logit, dim=-1)
     attn = F.linear(attn.transpose(1, 3), POST_TH).transpose(1, 3)
     return torch.einsum("bhqk,bkhd->bqhd", attn, v)
+
+
+class TalkingHeadsTileFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q: Tensor, k: Tensor, v: Tensor, pre_th: Tensor, post_th: Tensor, doc_ids: Tensor):
+        if fast_talking_heads_attention is None:
+            raise RuntimeError("TileLang attention requested but tilelang is not installed.")
+        out, lse = fast_talking_heads_attention(q, k, v, pre_th, post_th, doc_ids)
+        ctx.save_for_backward(q, k, v, pre_th, post_th, doc_ids, lse)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        if fast_talking_heads_attention_backward is None:
+            raise RuntimeError("TileLang attention backward requested but tilelang is not installed.")
+        q, k, v, pre_th, post_th, doc_ids, lse = ctx.saved_tensors
+        grads = fast_talking_heads_attention_backward(q, k, v, pre_th, post_th, doc_ids, lse, grad_out)
+        return (*grads, None)
 
 
 class CausalSelfAttention(nn.Module):
@@ -352,6 +393,7 @@ class CausalSelfAttention(nn.Module):
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
         self.th = th
+        self.th_backend = os.environ.get("TH_ATTN_BACKEND", "tilelang").lower()
         if th:
             self.pre_th = nn.Parameter(torch.rand((num_heads, num_heads)) * 0.01 / num_heads)
             self.post_th = nn.Parameter(torch.rand((num_heads, num_heads)) * 0.01 / num_heads)
@@ -359,7 +401,7 @@ class CausalSelfAttention(nn.Module):
             self.pre_th = None
             self.post_th = None
 
-    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
+    def forward(self, x: Tensor, ve: Tensor | None, attn_mask: AttentionMask):
         B, T = x.size(0), x.size(1)  # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q, k, v = (
@@ -376,12 +418,17 @@ class CausalSelfAttention(nn.Module):
         if self.th:
             pre_th = self.pre_th / self.pre_th.norm(dim=0, keepdim=True)
             post_th = self.post_th / self.post_th.norm(dim=0, keepdim=True)
-            y = checkpoint(slow_attn_th, q * self.attn_scale, k, v, pre_th, post_th, block_mask, use_reentrant=False)
-            # y = slow_attn_th(q * self.attn_scale, k, v, pre_th, post_th, block_mask)
+            if self.th_backend == "tilelang" and fast_talking_heads_attention is not None:
+                doc_ids = attn_mask.doc_ids.to(device=q.device, dtype=torch.int32)
+                y = TalkingHeadsTileFunction.apply(q * self.attn_scale, k, v, pre_th, post_th, doc_ids)
+            else:
+                y = checkpoint(
+                    slow_attn_th, q * self.attn_scale, k, v, pre_th, post_th, attn_mask, use_reentrant=False
+                )
         else:
-            y = slow_attn(q * self.attn_scale, k, v, block_mask)
+            y = slow_attn(q * self.attn_scale, k, v, attn_mask)
         # y = flex_attention(
-        #     q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale
+        #     q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=attn_mask.block_mask, scale=self.attn_scale
         # ).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)  # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -413,10 +460,10 @@ class Block(nn.Module):
         self.mlp = MLP(dim)
         self.lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))
 
-    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
+    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, attn_mask: AttentionMask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.attn(norm(x), ve, block_mask)
+            x = x + self.attn(norm(x), ve, attn_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -445,6 +492,7 @@ def next_multiple_of_n(v: float | int, *, n: int):
 def create_block_masks(input_seq: Tensor, sliding_window_num_blocks: Tensor):
     BLOCK_SIZE = 128
     docs = (input_seq == 50256).cumsum(0)
+    doc_ids = docs.to(dtype=torch.int32).contiguous()
 
     def document_causal(b, h, q_idx, kv_idx):
         causal_mask = q_idx >= kv_idx
@@ -471,8 +519,8 @@ def create_block_masks(input_seq: Tensor, sliding_window_num_blocks: Tensor):
     partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(any_bm & ~all_bm)
     full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
 
-    def build_bm(sw_num_blocks: Tensor) -> BlockMask:
-        return BlockMask.from_kv_blocks(
+    def build_mask(sw_num_blocks: Tensor) -> AttentionMask:
+        bm = BlockMask.from_kv_blocks(
             torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(sw_num_blocks - full_kv_num_blocks, 1)),
             partial_kv_indices,
             torch.clamp_max(full_kv_num_blocks, sw_num_blocks - 1),
@@ -480,9 +528,10 @@ def create_block_masks(input_seq: Tensor, sliding_window_num_blocks: Tensor):
             BLOCK_SIZE=BLOCK_SIZE,
             mask_mod=document_causal,
         )
+        return AttentionMask(doc_ids=doc_ids, block_mask=bm)
 
     # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
-    return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
+    return build_mask(sliding_window_num_blocks), build_mask(sliding_window_num_blocks // 2)
 
 
 class GPT(nn.Module):
@@ -509,7 +558,7 @@ class GPT(nn.Module):
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
-        long_bm, short_bm = create_block_masks(input_seq, sliding_window_num_blocks)
+        long_mask, short_mask = create_block_masks(input_seq, sliding_window_num_blocks)
 
         x = x0 = norm(self.embed(input_seq)[None])  # use of norm here by @Grad62304977
         ve = self.value_embeds(input_seq)
@@ -520,17 +569,17 @@ class GPT(nn.Module):
         # Store outputs for U-Net skip connections
         skip_connections = []
         # Encoder pass - process only the first half of the blocks
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
-        assert len(block_masks) == self.num_encoder_layers
+        attn_masks = [long_mask, short_mask, short_mask, short_mask, long_mask, short_mask]
+        assert len(attn_masks) == self.num_encoder_layers
         for i, block in enumerate(self.blocks[: self.num_encoder_layers]):
-            x = block(x, ve_enc[i], x0, block_masks[i])
+            x = block(x, ve_enc[i], x0, attn_masks[i])
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
-        block_masks.reverse()
-        assert len(block_masks) == self.num_decoder_layers
+        attn_masks.reverse()
+        assert len(attn_masks) == self.num_decoder_layers
         for i, block in enumerate(self.blocks[self.num_encoder_layers :]):
             x = x + self.skip_weights[i] * skip_connections.pop()
-            x = block(x, ve_dec[i], x0, block_masks[i])
+            x = block(x, ve_dec[i], x0, attn_masks[i])
         x = norm(x)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)

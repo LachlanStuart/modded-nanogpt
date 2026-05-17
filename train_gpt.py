@@ -39,10 +39,10 @@ from torch import Tensor, nn
 def _select_device() -> torch.device:
     requested = os.environ.get("NANOGPT_DEVICE", "auto").lower()
     if requested == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
         if torch.backends.mps.is_available():
             return torch.device("mps")
+        if torch.cuda.is_available():
+            return torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
         return torch.device("cpu")
     if requested.startswith("cuda"):
         return torch.device(requested)
@@ -52,7 +52,12 @@ def _select_device() -> torch.device:
 device = _select_device()
 IS_CUDA = device.type == "cuda"
 IS_MPS = device.type == "mps"
-COMPILE_ENABLED = os.environ.get("NANOGPT_COMPILE", "1" if IS_CUDA else "0") == "1"
+COMPILE_ENABLED = os.environ.get("NANOGPT_COMPILE", "1") == "1"
+USE_MPS_FLASH_ATTN = IS_MPS and os.environ.get("NANOGPT_MPS_FLASH_ATTN", "0") == "1"
+# mps-flash-attn currently has no cu_seqlens/varlen API. When enabled, the fast
+# path can either ignore document boundaries (default, useful for kernel testing)
+# or preserve them with a dense mask (semantic fallback, but still quadratic).
+MPS_FLASH_ATTN_DOC_MASK = os.environ.get("NANOGPT_MPS_FLASH_ATTN_DOC_MASK", "0") == "1"
 
 if not COMPILE_ENABLED:
     def _compile_noop(fn=None, *args, **kwargs):
@@ -63,6 +68,21 @@ try:
     import triton
 except Exception:
     triton = None
+
+mps_flash_attention = None
+if USE_MPS_FLASH_ATTN:
+    # Prefer an installed package, but also make the checked-out source tree
+    # importable so local kernel fixes can be tested in-situ without publishing.
+    third_party_mfa = Path(__file__).resolve().parent / "third_party" / "mps-flash-attention"
+    if third_party_mfa.exists():
+        sys.path.insert(0, str(third_party_mfa))
+    try:
+        from mps_flash_attn import flash_attention as mps_flash_attention
+    except Exception as e:
+        raise RuntimeError(
+            "NANOGPT_MPS_FLASH_ATTN=1 was set, but mps-flash-attn could not be imported. "
+            "Install/build it first (for source checkouts, build the Swift bridge and the matching _C extension)."
+        ) from e
 
 if IS_CUDA:
     torch.empty(1, device=device, requires_grad=True).backward()  # prevents a bug on some CUDA systems
@@ -1160,7 +1180,7 @@ class Yarn(nn.Module):
 class AttnArgs:
     ve: torch.Tensor
     sa_lambdas: torch.Tensor
-    seqlens: torch.Tensor
+    offsets: torch.Tensor
     bm_size: int
     yarn: Yarn
     key_offset: bool
@@ -1193,6 +1213,52 @@ def build_sdpa_doc_window_mask(T: int, seqlens: Tensor, bm_size: int | None, dev
         seqlens_tuple = (*seqlens_tuple, T)
     return _cached_doc_window_mask(T, seqlens_tuple, bm_size, str(dev))
 
+
+# @dynamo.disable
+def jagged_causal_attention(q: Tensor, k: Tensor, v: Tensor, offsets: Tensor, scale: float) -> Tensor:
+    """Causal SDPA over packed documents without materializing a document mask.
+
+    Args:
+        q: Query values [1, total_tokens, num_heads, head_dim], dtype: float.
+        k: Key values [1, total_tokens, num_heads, head_dim], dtype: float.
+        v: Value values [1, total_tokens, num_heads, head_dim], dtype: float.
+        offsets: cu_seqlens-style document offsets [num_docs + 1], dtype: int64.
+        scale: Softmax scale.
+
+    Returns:
+        Attention output [1, total_tokens, num_heads, head_dim], dtype: q.dtype.
+    """
+    qj = torch.nested.nested_tensor_from_jagged(
+        q[0], offsets=offsets, jagged_dim=1
+    )
+    kj = torch.nested.nested_tensor_from_jagged(
+        k[0], offsets=offsets, jagged_dim=1
+    )
+    vj = torch.nested.nested_tensor_from_jagged(
+        v[0], offsets=offsets, jagged_dim=1
+    )
+    yj = F.scaled_dot_product_attention(qj, kj, vj, is_causal=True, scale=scale)
+    return yj.values().view_as(q)
+
+
+# @dynamo.disable
+def split_offsets_for_window(offsets: Tensor, window_size: int | None) -> Tensor:
+    """Split packed document offsets into non-overlapping local-attention chunks."""
+    if window_size is None or window_size <= 0:
+        return offsets
+
+    bounds = [int(x) for x in offsets.detach().cpu().tolist()]
+    chunked: list[int] = [bounds[0]]
+    for start, end in zip(bounds, bounds[1:]):
+        cur = start
+        while cur + window_size < end:
+            cur += window_size
+            chunked.append(cur)
+        if chunked[-1] != end:
+            chunked.append(end)
+
+    return torch.tensor(chunked, device=offsets.device, dtype=offsets.dtype)
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
         super().__init__()
@@ -1206,12 +1272,13 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
         B, T = x.size(0), x.size(1) # batch size, sequence length
+        input_T = T
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
         # unpack attention args
         yarn = attn_args.yarn
         ve, sa_lambdas, key_offset = attn_args.ve, attn_args.sa_lambdas, attn_args.key_offset
-        seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
+        offsets, bm_size = attn_args.offsets, attn_args.bm_size
         # sparse gated attention to enable context based no-op by @classiclarryd
         # only include gates on layers with value embeds used on forward pass
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
@@ -1252,21 +1319,14 @@ class CausalSelfAttention(nn.Module):
                 ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T * 2, self.num_heads // 2, 1)
                 v = v + ve_gate_out * ve.view_as(v)
 
-            seqlens = 2 * seqlens
+            offsets = 2 * offsets
             max_len = 2 * max_len
 
-        # CUDA uses upstream FlashAttention-3 varlen. MPS uses SDPA with a cached document/window mask.
-        if IS_CUDA:
-            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                            causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
-            y = y.view(B, T, self.num_heads, self.head_dim)
-        else:
-            q_sdpa, k_sdpa, v_sdpa = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            attn_len = q.size(1)
-            attn_mask = build_sdpa_doc_window_mask(attn_len, seqlens, bm_size, q.device)
-            y = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, attn_mask=attn_mask, scale=yarn.attn_scale)
-            y = y.transpose(1, 2).contiguous().view(B, T, self.num_heads, self.head_dim)
+        # Prototype path: preserve packed document boundaries via jagged SDPA,
+        # but intentionally drop sliding-window/block-mask attention.
+        y = jagged_causal_attention(q, k, v, offsets, scale=yarn.attn_scale)
+        if self.paired:
+            y = y.view(B, input_T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
@@ -1285,6 +1345,10 @@ class ForwardScheduleConfig:
     ws_short: int
     ws_long: int
     train_max_seq_len: int
+
+@dynamo.disable
+def graphbreak(x: Tensor) -> Tensor:
+    return x
 
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
@@ -1398,7 +1462,7 @@ class GPT(nn.Module):
         for name, param in self.named_parameters():
             param.label = name.replace('.weight', '')
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, offsets_by_window: dict[int | None, Tensor], bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
         # ---- Schedule and layer topology ----
@@ -1408,6 +1472,7 @@ class GPT(nn.Module):
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
+
 
         # ---- Unbind parameters (avoid select_backward kernels) ----
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
@@ -1435,7 +1500,7 @@ class GPT(nn.Module):
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
-        
+
         x0_bigram = self.bigram_embed(bigram_input_seq)[None]
 
         # Value embeddings - always computed (not precomputed)
@@ -1456,7 +1521,7 @@ class GPT(nn.Module):
         # Layer 0: bigram already injected above, so only x0 component
         x0_inject = (x0 * x0_lambdas[0],) + tuple(x0 * x0_lambdas[i] + x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
         skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
-        
+
         # ---- Transformer layers ----
         x_backout = None
         skip_connection = None
@@ -1465,7 +1530,7 @@ class GPT(nn.Module):
             attn_args = AttnArgs(
                 ve=ve[i],
                 sa_lambdas=sa_lambdas[i],
-                seqlens=seqlens,
+                offsets=offsets_by_window[bm_sizes[i]],
                 bm_size=bm_sizes[i],
                 yarn=yarn,
                 key_offset=key_offset[i],
@@ -1494,6 +1559,8 @@ class GPT(nn.Module):
                 skip_connection = x
             if i == 7:
                 x_backout = x
+            if i % 4 == 3:
+                x = graphbreak(x)
 
         # back out contributions from first 7 layers
         x -= backout_lambda * x_backout
@@ -1652,6 +1719,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _targets = buf[1:]
             end_idxs[-1] -= 1  # last document was too long to account for _targets offset
             cum_lengths = (end_idxs - start_idxs).cumsum(0)
+            offsets = torch.cat([torch.zeros(1, dtype=cum_lengths.dtype), cum_lengths])
 
         else:
             if pos + num_tokens + 1 >= len(tokens):  # should not occur for val data
@@ -1663,6 +1731,11 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             _targets = buf[1:].view(num_tokens_local, )
 
             cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
+            offsets = cum_lengths
+            if offsets.numel() == 0 or int(offsets[0]) != 0:
+                offsets = torch.cat([torch.zeros(1, dtype=offsets.dtype), offsets])
+            if int(offsets[-1]) != num_tokens_local:
+                offsets = torch.cat([offsets, torch.full((1,), num_tokens_local, dtype=offsets.dtype)])
             pos += num_tokens
 
 
@@ -1674,12 +1747,13 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _inputs = _inputs.to(dtype=torch.int32)
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
+        offsets = offsets.to(dtype=torch.int64)
         _bigram_inputs = get_bigram_hash(_inputs)
 
         new_params = yield (
             _inputs.to(device=device, non_blocking=True),
             _targets.to(device=device, non_blocking=True),
-            _cum_lengths.to(device=device, non_blocking=True),
+            offsets.to(device=device, non_blocking=True),
             _bigram_inputs.to(device=device, non_blocking=True),
             _bigram_inputs.numpy(),
         )
@@ -1702,13 +1776,13 @@ class Hyperparameters:
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    val_batch_size: int = 64 * 1024
     # schedule
     num_scheduled_iterations: int = 1440  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
-    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = 10  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
@@ -1716,12 +1790,8 @@ class Hyperparameters:
 
 args = Hyperparameters()
 if not IS_CUDA:
-    args.val_tokens = int(os.environ.get("NANOGPT_VAL_TOKENS", 8192))
-    args.val_batch_size = int(os.environ.get("NANOGPT_VAL_BATCH_SIZE", 2048))
-    args.num_scheduled_iterations = int(os.environ.get("NANOGPT_STEPS", 20))
-    args.num_extension_iterations = int(os.environ.get("NANOGPT_EXTENSION_STEPS", 0))
-    args.val_loss_every = int(os.environ.get("NANOGPT_VAL_LOSS_EVERY", 5))
-    args.bigram_vocab_size = int(os.environ.get("NANOGPT_BIGRAM_VOCAB_SIZE", 50304 * 2))
+    args.num_scheduled_iterations = 100
+    args.num_extension_iterations = 10
 
 @dataclass(slots=True)
 class TrainingStage:
@@ -1790,27 +1860,17 @@ class TrainingSchedule:
 
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
 TRAINING_STAGES = [
-    TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
+    TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=64*1024, window_sizes=(1, 3), lr_mul=1.0,
                   mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
-    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
+    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=64*1024, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
-    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
+    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=64*1024, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
     # extension stage
-    TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
+    TrainingStage(train_max_seq_len=2048, batch_size=64*1024, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
-if not IS_CUDA:
-    # Keep the upstream architecture, but scale token batches to fit single-chip MPS memory.
-    _mps_bs = int(os.environ.get("NANOGPT_BATCH_SIZE", 2048))
-    _mps_seq = int(os.environ.get("NANOGPT_TRAIN_MAX_SEQ_LEN", 896))
-    TRAINING_STAGES = [
-        TrainingStage(duration=1.0, train_max_seq_len=_mps_seq, batch_size=_mps_bs, window_sizes=(1, 3), lr_mul=1.0,
-                      mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
-        TrainingStage(train_max_seq_len=_mps_seq, batch_size=_mps_bs, window_sizes=(1, 3), lr_mul=1.0,
-                      mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
-    ]
 
 # TODO - Confirm.
 training_schedule = TrainingSchedule(
@@ -1818,7 +1878,7 @@ training_schedule = TrainingSchedule(
     args.num_scheduled_iterations,
     args.num_extension_iterations,
     cooldown_frac=0.60,
-    split_embed_stage=0 if not IS_CUDA else 2,
+    split_embed_stage=2,
 )
 #training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
@@ -2015,7 +2075,7 @@ class TrainingManager():
         self.row_update_mask.fill(0)
 
 
-        
+
 
 # -----------------------------------------------------------------------------
 # int main
@@ -2048,8 +2108,8 @@ def nvidia_smi():
 print0(nvidia_smi() if IS_CUDA else "nvidia-smi skipped: non-CUDA device")
 print0("="*100)
 
-_model_dim = int(os.environ.get("NANOGPT_MODEL_DIM", 768))
-_head_dim = int(os.environ.get("NANOGPT_HEAD_DIM", _model_dim // 6))
+_model_dim = int(os.environ.get("NANOGPT_MODEL_DIM", 384))
+_head_dim = int(os.environ.get("NANOGPT_HEAD_DIM", 64))
 model: nn.Module = GPT(
     vocab_size=50257,
     num_layers=11,
@@ -2070,15 +2130,14 @@ for param in model.parameters():
     if dist.is_available() and dist.is_initialized():
         dist.broadcast(param.detach(), 0)
 
-if COMPILE_ENABLED:
-    model: nn.Module = torch.compile(model, dynamic=False, fullgraph=IS_CUDA)
+model: nn.Module = torch.compile(model, dynamic=False, fullgraph=False)
 training_manager = TrainingManager(model)
 
 
 ########################################
 #            Warmup kernels            #
 ########################################
-if os.environ.get("NANOGPT_SKIP_WARMUP", "1" if not IS_CUDA else "0") != "1":
+if os.environ.get("NANOGPT_SKIP_WARMUP", "0") != "1":
     print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
     # Warmup the training kernels, then re-initialize the state so we aren't cheating
     initial_state = dict(model=copy.deepcopy(model.state_dict()),
@@ -2094,14 +2153,34 @@ if os.environ.get("NANOGPT_SKIP_WARMUP", "1" if not IS_CUDA else "0") != "1":
         training_manager.advance_schedule(step)
         model.eval()
         with torch.no_grad():
-            inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-            model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+            inputs, targets, offsets, bigram_inputs, _ = next(val_loader)
+            torch._dynamo.mark_dynamic(offsets, 0)
+            schedule_cfg = training_manager.get_forward_args()
+            ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
+            offsets_by_window = {
+                ws_short: split_offsets_for_window(offsets, ws_short),
+                ws_long: split_offsets_for_window(offsets, ws_long),
+                None: offsets,
+            }
+            for v in offsets_by_window.values():
+                torch._dynamo.mark_dynamic(v, 0)
+            model(inputs, targets, offsets_by_window, bigram_inputs, schedule_cfg).mean()
         model.train()
         for idx in range(grad_accum_steps):
             send_args = training_manager.train_loader_send_args
-            inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
+            inputs, targets, offsets, bigram_inputs, bigram_cpu = train_loader.send(send_args)
+            torch._dynamo.mark_dynamic(offsets, 0)
+            schedule_cfg = training_manager.get_forward_args()
+            ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
+            offsets_by_window = {
+                ws_short: split_offsets_for_window(offsets, ws_short),
+                ws_long: split_offsets_for_window(offsets, ws_long),
+                None: offsets,
+            }
+            for v in offsets_by_window.values():
+                torch._dynamo.mark_dynamic(v, 0)
             training_manager.sparse_index_update(step, bigram_cpu)
-            loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+            loss = model(inputs, targets, offsets_by_window, bigram_inputs, schedule_cfg).sum() * grad_scale
             training_manager.sparse_index_share(step)
             loss.backward()
             del loss
@@ -2143,8 +2222,18 @@ for step in range(train_steps + 1):
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+                inputs, targets, offsets, bigram_inputs, _ = next(val_loader)
+                torch._dynamo.mark_dynamic(offsets, 0)
+                schedule_cfg = training_manager.get_forward_args()
+                ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
+                offsets_by_window = {
+                    ws_short: split_offsets_for_window(offsets, ws_short),
+                    ws_long: split_offsets_for_window(offsets, ws_long),
+                    None: offsets,
+                }
+                for v in offsets_by_window.values():
+                    torch._dynamo.mark_dynamic(v, 0)
+                val_loss += model(inputs, targets, offsets_by_window, bigram_inputs, schedule_cfg).mean()
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG) if dist.is_available() and dist.is_initialized() else None
@@ -2164,9 +2253,19 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
-        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
+        inputs, targets, offsets, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
+        torch._dynamo.mark_dynamic(offsets, 0)
+        schedule_cfg = training_manager.get_forward_args()
+        ws_short, ws_long = schedule_cfg.ws_short, schedule_cfg.ws_long
+        offsets_by_window = {
+            ws_short: split_offsets_for_window(offsets, ws_short),
+            ws_long: split_offsets_for_window(offsets, ws_long),
+            None: offsets,
+        }
+        for v in offsets_by_window.values():
+            torch._dynamo.mark_dynamic(v, 0)
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+        loss = model(inputs, targets, offsets_by_window, bigram_inputs, schedule_cfg).sum() * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
         del loss
@@ -2179,10 +2278,10 @@ for step in range(train_steps + 1):
 if args.run_evals:
     model.eval()
     from evals import hellaswag
-    hellaswag.evaluate(model=model, 
-                       schedule_cfg=training_manager.get_forward_args(), 
+    hellaswag.evaluate(model=model,
+                       schedule_cfg=training_manager.get_forward_args(),
                        seq_len=args.val_batch_size // (grad_accum_steps * world_size),
-                       get_bigram_hash=get_bigram_hash, 
+                       get_bigram_hash=get_bigram_hash,
                        print0=print0)
 
 print0(f"peak memory allocated: {current_memory_allocated() // 1024 // 1024} MiB "

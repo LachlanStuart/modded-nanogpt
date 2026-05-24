@@ -16,6 +16,8 @@ except OSError:
     pass
 
 import copy
+import fcntl
+import tempfile
 import glob
 import math
 import threading
@@ -2079,6 +2081,19 @@ class TrainingManager():
 
 # -----------------------------------------------------------------------------
 # int main
+
+# Acquire a process-level mutex so only one training run executes at a time.
+# fcntl.flock uses an OS advisory lock that is automatically released when the
+# process exits or is killed, so stale locks are never left behind.
+_lock_file = None
+if master_process:
+    _lock_path = os.path.join(tempfile.gettempdir(), ".train_gpt.lock")
+    _lock_file = open(_lock_path, "w")
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Another train_gpt.py process is running. Waiting for it to finish...", flush=True)
+        fcntl.flock(_lock_file, fcntl.LOCK_EX)
 
 # begin logging
 logfile = None

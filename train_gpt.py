@@ -1272,7 +1272,7 @@ class CausalSelfAttention(nn.Module):
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
         # Weights are stored in parameter banks and passed via forward()
 
-    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
+    def forward(self, x: Tensor, attn_args: AttnArgs, qkvr_w: Tensor):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         input_T = T
         assert B == 1, "varlen sequences requires B == 1"
@@ -1286,7 +1286,7 @@ class CausalSelfAttention(nn.Module):
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
         train_max_seq_len = attn_args.train_max_seq_len
 
-        q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k, v = F.linear(x, sa_lambdas[0] * qkvr_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
@@ -1331,8 +1331,12 @@ class CausalSelfAttention(nn.Module):
             y = y.view(B, input_T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
+
+    def project_residual(self, x: Tensor, sa_lambdas: Tensor, qkvr_w: Tensor) -> Tensor:
+        # QKVR ablation: the matrix slot that normally holds attention output O
+        # now holds R, a residual-path projection. Attention output is added raw.
+        return F.linear(x, sa_lambdas[1] * qkvr_w[self.dim * 3:].type_as(x))
 
 
 # -----------------------------------------------------------------------------
@@ -1395,7 +1399,8 @@ class GPT(nn.Module):
         self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, head_dim * 2, model_dim))
         self.qk_bank.reshape = (num_qk_padded, head_dim * 2, model_dim)
 
-        # VO bank: per-layer Muon groups for V and O weights
+        # VR bank: per-layer Muon groups for V and residual-path R weights.
+        # QKVR ablation: R replaces the usual attention-output O projection.
         num_vo_real = num_attn_layers * 2  # 20
         num_vo_padded = next_multiple_of_n(num_vo_real, n=world_size)  # 24
         self.vo_bank = nn.Parameter(torch.empty(num_vo_padded, hdim, hdim))
@@ -1413,6 +1418,10 @@ class GPT(nn.Module):
             self.qk_bank[:num_qk_groups].uniform_(-bound, bound)
             self.qk_bank[num_qk_groups:].zero_()
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
+            # Initialize R matrices near identity so the residual stream starts
+            # well-conditioned despite replacing the direct residual add. Even
+            # slots remain V; odd slots are the residual projection R.
+            self.vo_bank[1:num_vo_real:2].copy_(torch.eye(hdim, dtype=self.vo_bank.dtype, device=self.vo_bank.device))
             self.vo_bank[num_vo_real:].zero_()
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
@@ -1542,7 +1551,7 @@ class GPT(nn.Module):
             )
             # Select weights from banks
             attn_idx = i - (i > 6) if i != 6 else None
-            qkvo_w = attn_weights[attn_idx] if attn_idx is not None else None
+            qkvr_w = attn_weights[attn_idx] if attn_idx is not None else None
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
 
@@ -1554,8 +1563,9 @@ class GPT(nn.Module):
                 x = x + skip_gate_out * skip_connection
             else:
                 attn_in = x_backout if x_backout is not None else x
-                attn_out = attn(norm(attn_in), attn_args, qkvo_w)
-                x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
+                attn_out = attn(norm(attn_in), attn_args, qkvr_w)
+                resid_out = attn.project_residual(resid_lambdas_attn[i] * x, sa_lambdas[i], qkvr_w)
+                x = resid_out + post_lambdas_attn[i] * attn_out + x0_inject[i]
             x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
             if i == 3:
                 skip_connection = x

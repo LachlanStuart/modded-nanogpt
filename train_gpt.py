@@ -1272,7 +1272,7 @@ class CausalSelfAttention(nn.Module):
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
         # Weights are stored in parameter banks and passed via forward()
 
-    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
+    def forward(self, x: Tensor, attn_args: AttnArgs, qkvr_w: Tensor):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         input_T = T
         assert B == 1, "varlen sequences requires B == 1"
@@ -1286,7 +1286,12 @@ class CausalSelfAttention(nn.Module):
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
         train_max_seq_len = attn_args.train_max_seq_len
 
-        q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        # QKVR ablation: compute Q/K/V plus a residual-path projection R in one matmul.
+        # The attention result stays in V-space; the transformer layer adds it to R(x)
+        # instead of applying the usual output projection O to the attention result.
+        q, k, v, r = F.linear(x, qkvr_w.type_as(x)).view(B, T, 4 * self.num_heads, self.head_dim).chunk(4, dim=-2)
+        q, k, v = sa_lambdas[0] * q, sa_lambdas[0] * k, sa_lambdas[0] * v
+        r = (sa_lambdas[1] * r).contiguous().view(B, T, self.num_heads * self.head_dim)
         max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
@@ -1331,8 +1336,7 @@ class CausalSelfAttention(nn.Module):
             y = y.view(B, input_T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
-        return y
+        return r, y
 
 
 # -----------------------------------------------------------------------------
@@ -1395,11 +1399,12 @@ class GPT(nn.Module):
         self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, head_dim * 2, model_dim))
         self.qk_bank.reshape = (num_qk_padded, head_dim * 2, model_dim)
 
-        # VO bank: per-layer Muon groups for V and O weights
-        num_vo_real = num_attn_layers * 2  # 20
-        num_vo_padded = next_multiple_of_n(num_vo_real, n=world_size)  # 24
-        self.vo_bank = nn.Parameter(torch.empty(num_vo_padded, hdim, hdim))
-        self.vo_bank.reshape = (num_vo_padded, hdim, hdim)
+        # VR bank: per-layer Muon groups for V and residual projection R weights.
+        # R replaces the usual attention output projection O in the QKVR ablation.
+        num_vr_real = num_attn_layers * 2  # 20
+        num_vr_padded = next_multiple_of_n(num_vr_real, n=world_size)  # 24
+        self.vo_bank = nn.Parameter(torch.empty(num_vr_padded, hdim, hdim))
+        self.vo_bank.reshape = (num_vr_padded, hdim, hdim)
 
         # MLP bank: stores c_fc and c_proj for all MLP layers
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
@@ -1412,8 +1417,9 @@ class GPT(nn.Module):
         with torch.no_grad():
             self.qk_bank[:num_qk_groups].uniform_(-bound, bound)
             self.qk_bank[num_qk_groups:].zero_()
-            self.vo_bank[:num_vo_real].uniform_(-bound, bound)
-            self.vo_bank[num_vo_real:].zero_()
+            self.vo_bank[:num_vr_real:2].uniform_(-bound, bound)  # V
+            self.vo_bank[1:num_vr_real:2].copy_(torch.eye(hdim, dtype=self.vo_bank.dtype, device=self.vo_bank.device))  # R starts as identity
+            self.vo_bank[num_vr_real:].zero_()
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
@@ -1494,8 +1500,8 @@ class GPT(nn.Module):
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
-        vo_flat = self.vo_bank[:self._num_attn_layers * 2].view(self._num_attn_layers, 2, *self.vo_bank.shape[1:]).flatten(1, 2)
-        attn_weights = torch.cat([qk_all, vo_flat], dim=1).unbind(0)
+        vr_flat = self.vo_bank[:self._num_attn_layers * 2].view(self._num_attn_layers, 2, *self.vo_bank.shape[1:]).flatten(1, 2)
+        attn_weights = torch.cat([qk_all, vr_flat], dim=1).unbind(0)
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
@@ -1542,7 +1548,7 @@ class GPT(nn.Module):
             )
             # Select weights from banks
             attn_idx = i - (i > 6) if i != 6 else None
-            qkvo_w = attn_weights[attn_idx] if attn_idx is not None else None
+            qkvr_w = attn_weights[attn_idx] if attn_idx is not None else None
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
 
@@ -1554,8 +1560,8 @@ class GPT(nn.Module):
                 x = x + skip_gate_out * skip_connection
             else:
                 attn_in = x_backout if x_backout is not None else x
-                attn_out = attn(norm(attn_in), attn_args, qkvo_w)
-                x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
+                resid_proj, attn_out = attn(norm(attn_in), attn_args, qkvr_w)
+                x = resid_lambdas_attn[i] * resid_proj + post_lambdas_attn[i] * attn_out + x0_inject[i]
             x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
             if i == 3:
                 skip_connection = x
